@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.3.0**
+Current release: **v0.3.1**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes activated onchain launches, ranks momentum and risk with inspectable heuristics, surfaces narrative velocity and graduations, emits Telegram-ready alerts, and exports curated notes to an Obsidian-compatible vault.
 
@@ -42,6 +42,8 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 ## Features
 
 - Live/demo launch stream with local SQLite persistence
+- Live-mode startup cleanup that removes legacy synthetic demo rows without touching verified live records or callouts
+- Feed telemetry that distinguishes an open socket from verified mint activity and reports stale or malformed upstream data
 - Mint counters for today, 60 minutes, and 15 minutes
 - Transparent momentum and risk scores—open `src/signals.js` to inspect the formula
 - Mint fingerprints on every row so same-name launches cannot be mistaken for the same contract

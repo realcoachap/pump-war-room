@@ -28,6 +28,28 @@ export class Store {
     this.alertStmt = this.db.prepare("INSERT INTO alerts (level,title,message,mint,created_at) VALUES (?,?,?,?,?)");
     this.calloutStmt = this.db.prepare(`INSERT INTO callouts (external_id,mint,payload,created_at)
       VALUES (?,?,?,?) ON CONFLICT(external_id) DO UPDATE SET payload=excluded.payload`);
+    this.sourceCountStmts = {
+      tokens: this.db.prepare(`SELECT count(*) AS count FROM tokens
+        WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?`),
+      events: this.db.prepare(`SELECT count(*) AS count FROM events
+        WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?`),
+      alerts: this.db.prepare(`SELECT count(*) AS count FROM alerts
+        WHERE mint IN (
+          SELECT mint FROM tokens
+          WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?
+        )`)
+    };
+    this.deleteDemoStmts = {
+      alerts: this.db.prepare(`DELETE FROM alerts
+        WHERE mint IN (
+          SELECT mint FROM tokens
+          WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = 'demo'
+        )`),
+      events: this.db.prepare(`DELETE FROM events
+        WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = 'demo'`),
+      tokens: this.db.prepare(`DELETE FROM tokens
+        WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = 'demo'`)
+    };
   }
   upsertToken(token) {
     const now = new Date().toISOString();
@@ -56,6 +78,34 @@ export class Store {
   }
   callouts(limit = 50) {
     return this.db.prepare("SELECT payload FROM callouts ORDER BY created_at DESC LIMIT ?").all(limit).map((row) => JSON.parse(row.payload));
+  }
+  countBySource(source) {
+    if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");
+    return {
+      tokens: this.sourceCountStmts.tokens.get(source).count,
+      events: this.sourceCountStmts.events.get(source).count,
+      alerts: this.sourceCountStmts.alerts.get(source).count
+    };
+  }
+  purgeDemoData() {
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const removed = {
+        alerts: this.deleteDemoStmts.alerts.run().changes,
+        events: this.deleteDemoStmts.events.run().changes,
+        tokens: this.deleteDemoStmts.tokens.run().changes
+      };
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return removed;
+    } catch (error) {
+      if (transactionStarted) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+      }
+      throw error;
+    }
   }
   calloutCountSince(iso) { return this.db.prepare("SELECT count(*) AS count FROM callouts WHERE created_at >= ?").get(iso).count; }
   count() { return this.db.prepare("SELECT count(*) AS count FROM tokens").get().count; }

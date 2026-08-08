@@ -15,7 +15,8 @@
       <div><strong>PUMP WAR ROOM</strong><span>OPENCAESAR INTELLIGENCE</span></div>
     </div>
     <div class="statusbar">
-      <span class="live-dot"></span><span id="feed-status">CONNECTING</span>
+      <span id="feed-indicator" class="feed-indicator connecting" aria-label="Feed state: CONNECTING"><span class="live-dot"></span><strong id="feed-status">CONNECTING</strong></span>
+      <span class="compact-telemetry">LAST REAL MINT <b id="last-mint-compact">WAITING</b></span>
       <span class="divider"></span><span id="clock">--:--:-- ET</span>
       <button id="export-daily" class="quiet-button">EXPORT BRIEF</button>
     </div>
@@ -31,12 +32,37 @@
       <div class="pulse-orbit" aria-hidden="true"><i></i><b></b><span>PUMP<br>RADAR</span></div>
     </section>
 
+    <section class="feed-console" aria-labelledby="feed-console-title">
+      <div id="feed-state-card" class="feed-overview connecting">
+        <span class="kicker" id="feed-console-title">UPSTREAM TELEMETRY</span>
+        <div class="feed-state-line"><span class="state-lamp" aria-hidden="true"></span><strong id="feed-state">CONNECTING</strong></div>
+        <p id="feed-detail" aria-live="polite">Establishing the feed and waiting for the first real mint.</p>
+      </div>
+      <div class="telemetry-grid">
+        <div class="telemetry-card">
+          <label>LAST REAL MINT</label><strong id="last-mint-age">WAITING</strong><small id="last-mint-time">No real mint observed</small>
+        </div>
+        <div class="telemetry-card">
+          <label>LIVE MINTS</label><strong id="live-mint-count">0</strong><small id="live-mint-note">Confirmed rows in this snapshot</small>
+        </div>
+        <div class="telemetry-card">
+          <label>RECONNECTS</label><strong id="reconnect-count">0</strong><small>Upstream reconnect attempts</small>
+        </div>
+        <div class="telemetry-card">
+          <label>DATA INTEGRITY</label><strong id="demo-purge-state">UNKNOWN</strong><small id="demo-purge-note">Purge telemetry unavailable</small>
+        </div>
+        <div class="telemetry-card">
+          <label>MODE</label><strong id="mode-state">LIVE</strong><small id="mode-note">Read-only production ingest</small>
+        </div>
+      </div>
+    </section>
+
     <section id="stats" class="stats-grid"></section>
 
     <section class="workspace-grid">
       <article class="panel movers-panel">
         <header class="panel-header">
-          <div><span class="kicker">LIVE RANKING</span><h2>What’s moving</h2></div>
+          <div><span class="kicker" id="ranking-kicker">REAL-MINT RANKING</span><h2>What’s moving</h2></div>
           <div class="tabs"><button class="active">Momentum</button><button>Newest</button></div>
         </header>
         <div class="table-head"><span>Asset</span><span>Signal</span><span>5m volume</span><span>Curve</span><span>Risk</span></div>

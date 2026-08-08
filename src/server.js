@@ -15,10 +15,22 @@ const mode = process.env.PUMP_MODE === "live" ? "live" : "demo";
 const dbPath = path.resolve(root, process.env.DB_PATH || "data/pump-war-room.db");
 const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
 const store = new Store(dbPath);
+const cleanup = mode === "live" ? store.purgeDemoData() : { tokens: 0, events: 0, alerts: 0 };
 const clients = new Set();
 let feedStatus = mode === "demo" ? "simulated" : "connecting";
 let calloutStatus = process.env.BARK_API_KEY ? "connecting" : "disabled";
 let lastEventAt = new Date().toISOString();
+let lastMintAt = null;
+let reconnects = 0;
+let feedMessages = 0;
+let feedParseErrors = 0;
+
+function feedHealth() {
+  if (mode === "demo") return "simulated";
+  if (!["live", "connected"].includes(feedStatus)) return feedStatus;
+  if (!lastMintAt) return "awaiting-data";
+  return Date.now() - new Date(lastMintAt).getTime() > 90_000 ? "stale" : "live";
+}
 
 const send = (kind, payload) => {
   lastEventAt = new Date().toISOString();
@@ -80,7 +92,9 @@ function snapshot() {
     return acc;
   }, {})).map((row) => ({ ...row, momentum: Math.round(row.momentum / row.coins) })).sort((a, b) => b.volume - a.volume);
   return {
-    version: appVersion, mode, feedStatus, calloutStatus, lastEventAt,
+    version: appVersion, mode, feedStatus, feedHealth: feedHealth(), calloutStatus, lastEventAt, lastMintAt,
+    liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
+    demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors,
     stats: { indexed: store.count(), mintedToday: store.countSince(start.toISOString()), lastHour: store.countSince(hour), last15m: store.countSince(fifteen), graduations: tokens.filter((t) => t.status === "graduated").length, calloutsLastHour: store.calloutCountSince(hour) },
     tokens, narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
   };
@@ -107,9 +121,15 @@ if (mode === "demo") {
   const ingestor = new PumpPortalIngestor({
     url: process.env.PUMPPORTAL_URL || "wss://pumpportal.fun/api/data",
     watchTrades: process.env.WATCH_TRADES === "true",
-    onToken: upsert,
+    onToken: (token) => { lastMintAt = new Date().toISOString(); upsert(token); },
     onMigration: ({ mint }) => { const token = store.token(mint); if (token) upsert({ ...token, status: "graduated", bondingProgress: 100 }); },
-    onStatus: (status) => { feedStatus = status; send("status", { feedStatus }); }
+    onStatus: (status, telemetry = {}) => {
+      feedStatus = status;
+      reconnects = telemetry.counters?.reconnectsScheduled ?? telemetry.reconnects ?? reconnects;
+      feedMessages = telemetry.counters?.messagesReceived ?? telemetry.messages ?? feedMessages;
+      feedParseErrors = telemetry.counters?.malformedMessages ?? telemetry.parseErrors ?? feedParseErrors;
+      send("status", { feedStatus, feedHealth: feedHealth(), reconnects, feedMessages, feedParseErrors });
+    }
   });
   ingestor.connect();
 }
@@ -118,7 +138,11 @@ const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === "/api/health") return json(res, 200, { ok: true, version: appVersion, mode, feedStatus, calloutStatus, lastEventAt, indexed: store.count() });
+    if (url.pathname === "/api/health") return json(res, 200, {
+      ok: true, version: appVersion, mode, feedStatus, feedHealth: feedHealth(), calloutStatus,
+      lastEventAt, lastMintAt, indexed: store.count(), liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
+      demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors
+    });
     if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
     if (url.pathname === "/api/stream") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -143,4 +167,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 function json(res, status, value) { res.writeHead(status, { "content-type": "application/json; charset=utf-8" }); res.end(JSON.stringify(value)); }
-server.listen(port, "0.0.0.0", () => console.log(`Pump War Room v${appVersion} (${mode}) listening on http://localhost:${port}`));
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Pump War Room v${appVersion} (${mode}) listening on http://localhost:${port}`);
+  if (cleanup.tokens) console.log(`Removed ${cleanup.tokens} legacy demo tokens, ${cleanup.events} events, and ${cleanup.alerts} alerts from the live database`);
+});
