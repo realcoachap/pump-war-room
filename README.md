@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.5.0**
+Current release: **v0.5.1**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes activated onchain launches, ranks momentum and risk with inspectable heuristics, surfaces narrative velocity and graduations, emits Telegram-ready alerts, and exports curated notes to an Obsidian-compatible vault.
 
@@ -13,6 +13,24 @@ This repository is configured for Railway with a health check and Railway-provid
 3. Generate a public domain in the service's **Networking** settings.
 
 Optional variables are documented in `.env.example`. Railway's local filesystem is ephemeral; attach a volume at `/app/data` and set `DB_PATH=/app/data/pump-war-room.db` if you want SQLite history to survive redeploys. Attach another volume and set `VAULT_PATH` if you want server-side Obsidian exports to persist.
+
+## Database backup and restore verification
+
+Create a new, verified backup while the service is running (the output file must not already exist):
+
+```bash
+npm run db:backup -- --source /app/data/pump-war-room.db --output /app/data/backups/pump-war-room-2026-08-08.db
+```
+
+The command opens the live database read-only, uses SQLite's online `VACUUM INTO` snapshot so committed WAL data is included, runs integrity/exact-schema/application-write checks, copies the artifact to a disposable restore location, verifies that copy, and only then publishes the backup with mode `0600`. It refuses same-path and overwrite attempts and prints SHA-256, byte size, schema hash, row counts, and invalid-JSON payload counts as JSON.
+
+Re-run the restore drill on an existing artifact without touching `DB_PATH`:
+
+```bash
+npm run db:restore:verify -- --backup /app/data/backups/pump-war-room-2026-08-08.db
+```
+
+The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
 
 ## Quick look
 
@@ -42,6 +60,9 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 ## Features
 
 - Live/demo launch stream with local SQLite persistence
+- Production uptime, verified-feed staleness, source-scoped counters, structured redacted error telemetry, and runtime mount evidence
+- Railway readiness gating plus deterministic smoke checks run by release automation; both fail closed on stale/degraded feeds, version or mode disagreement, missing mount evidence, unexpected HTTP 5xx telemetry, and unsafe response headers
+- Online-consistent SQLite backups plus a non-destructive disposable restore-verification drill
 - Live-mode startup cleanup that removes legacy synthetic demo rows without touching verified live records or callouts
 - Feed telemetry that distinguishes an open socket from verified mint activity and reports stale or malformed upstream data
 - Caesar Intel, a zero-cost in-app analyst grounded only in the current War Room snapshot, with evidence links and no execution capabilities
@@ -74,7 +95,10 @@ The snapshot includes a versioned `leaderboard` envelope. In live mode it admits
 ```bash
 npm test
 npm run screenshot
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.5.1 --mode live
 ```
+
+Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.
 
 ## Safety boundary
 

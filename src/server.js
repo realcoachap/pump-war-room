@@ -1,5 +1,6 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,7 @@ import { exportCoin, exportDaily } from "./vault.js";
 import { analyzeSnapshot } from "./analyst.js";
 import { createRateLimiter, HttpError, readJsonBody } from "./http.js";
 import { createTop100 } from "./ranking.js";
+import { createRuntimeTelemetry, FEED_STALE_AFTER_MS, observeFeed, observeStorage } from "./observability.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
@@ -18,23 +20,65 @@ const port = Number(process.env.PORT || 4173);
 const mode = process.env.PUMP_MODE === "live" ? "live" : "demo";
 const dbPath = path.resolve(root, process.env.DB_PATH || "data/pump-war-room.db");
 const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
+const startedAt = new Date().toISOString();
+const runtimeTelemetry = createRuntimeTelemetry({ version: appVersion, mode, startedAt });
+process.on("uncaughtExceptionMonitor", (error, origin) => runtimeTelemetry.error("process.uncaught_exception", error, { origin }));
 const store = new Store(dbPath);
+const storage = observeStorage({
+  databasePath: dbPath,
+  canonicalDatabasePath: realpathSync(dbPath),
+  mountInfo: (() => { try { return readFileSync("/proc/self/mountinfo", "utf8"); } catch { return null; } })()
+});
 const cleanup = mode === "live" ? store.purgeDemoData() : { tokens: 0, events: 0, alerts: 0 };
 const clients = new Set();
 const checkAgentRate = createRateLimiter({ limit: 20, windowMs: 60_000 });
 let feedStatus = mode === "demo" ? "simulated" : "connecting";
 let calloutStatus = process.env.BARK_API_KEY ? "connecting" : "disabled";
-let lastEventAt = new Date().toISOString();
+let lastEventAt = null;
 let lastMintAt = null;
+let feedConnectedAt = null;
+let feedLastMessageAt = null;
+let feedLastActivityAt = null;
+let feedLastErrorAt = null;
+let lastLoggedFeedErrorAt = null;
+let lastLoggedFeedStatus = null;
 let reconnects = 0;
 let feedMessages = 0;
 let feedParseErrors = 0;
+let pumpPortalIngestor = null;
+
+function feedObservation() {
+  const telemetry = pumpPortalIngestor?.getStatus?.() || null;
+  const counters = {
+    reconnects: telemetry?.counters?.reconnectsScheduled ?? reconnects,
+    messages: telemetry?.counters?.messagesReceived ?? feedMessages,
+    malformedMessages: telemetry?.counters?.malformedMessages ?? feedParseErrors
+  };
+  return {
+    ...observeFeed({
+      mode,
+      feedStatus: telemetry?.status || feedStatus,
+      lastMintAt: telemetry?.lastTokenAt || lastMintAt,
+      lastActivityAt: telemetry?.lastActivityAt || feedLastActivityAt,
+      lastMessageAt: telemetry?.lastMessageAt || feedLastMessageAt,
+      lastEventAt,
+      observedSince: telemetry?.lastConnectedAt || feedConnectedAt || startedAt,
+      staleAfterMs: FEED_STALE_AFTER_MS
+    }),
+    counters,
+    lastErrorAt: telemetry?.lastErrorAt || feedLastErrorAt
+  };
+}
 
 function feedHealth() {
-  if (mode === "demo") return "simulated";
-  if (!["live", "connected"].includes(feedStatus)) return feedStatus;
-  if (!lastMintAt) return "awaiting-data";
-  return Date.now() - new Date(lastMintAt).getTime() > 90_000 ? "stale" : "live";
+  return feedObservation().state;
+}
+
+function healthStatus(feed = feedObservation()) {
+  if (mode === "live" && !storage.mountPointVerified) return "degraded";
+  if (["live", "simulated"].includes(feed.state)) return "healthy";
+  if (["connecting", "awaiting-data", "idle", "unknown"].includes(feed.state)) return "starting";
+  return "degraded";
 }
 
 const send = (kind, payload) => {
@@ -57,7 +101,7 @@ function alertFor(token, previous) {
   if (alert) {
     const saved = store.addAlert(alert);
     send("alert", saved);
-    maybeSendTelegram(saved).catch(() => {});
+    maybeSendTelegram(saved).catch((error) => runtimeTelemetry.error("telegram.send_failed", error, { mint: saved.mint }));
   }
 }
 
@@ -66,10 +110,11 @@ async function maybeSendTelegram(alert) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return;
   const text = `🏛️ Pump War Room — ${alert.title}\n${alert.message}\nhttps://pump.fun/coin/${alert.mint}`;
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
   });
+  if (!response.ok) throw new Error(`Telegram send failed with HTTP ${response.status}`);
 }
 
 function upsert(token) {
@@ -101,18 +146,30 @@ function snapshot() {
   }, {})).map((row) => ({ ...row, momentum: Math.round(row.momentum / row.coins) })).sort((a, b) => b.volume - a.volume);
   const top100 = createTop100(tokens, { mode });
   const generatedAt = new Date().toISOString();
+  const feed = feedObservation();
+  const source = mode === "live" ? "pumpportal" : null;
+  const countSince = (iso) => source ? store.countSinceBySource(iso, source) : store.countSince(iso);
   return {
-    version: appVersion, mode, feedStatus, feedHealth: feedHealth(), calloutStatus, lastEventAt, lastMintAt,
+    version: appVersion, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage, telemetry: runtimeTelemetry.snapshot(),
+    feedStatus, feedHealth: feed.state, feed, calloutStatus, lastEventAt, lastMintAt,
     liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
-    demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors,
-    stats: { indexed: store.count(), mintedToday: store.countSince(start.toISOString()), lastHour: store.countSince(hour), last15m: store.countSince(fifteen), graduations: tokens.filter((t) => t.status === "graduated").length, calloutsLastHour: store.calloutCountSince(hour) },
+    demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
+    reconnects: feed.counters.reconnects, feedMessages: feed.counters.messages, feedParseErrors: feed.counters.malformedMessages,
+    stats: {
+      indexed: source ? store.countBySource(source).tokens : store.count(),
+      mintedToday: countSince(start.toISOString()),
+      lastHour: countSince(hour),
+      last15m: countSince(fifteen),
+      graduations: tokens.filter((t) => t.status === "graduated").length,
+      calloutsLastHour: store.calloutCountSince(hour)
+    },
     tokens,
     leaderboard: {
       schemaVersion: 1,
       mode,
       generatedAt,
       sourceObservedAt: lastMintAt,
-      freshness: feedHealth(),
+      freshness: feed.state,
       source: mode === "live" ? "pumpportal" : "demo",
       universe: mode === "live" ? "Pump.fun tokens observed by this service" : "simulated tokens observed by this service",
       scope: mode === "live" ? "observed-by-this-war-room" : "simulated-feed",
@@ -130,7 +187,12 @@ if (process.env.BARK_API_KEY) {
     url: process.env.BARK_URL || "wss://news.bark.gg/ws",
     apiKey: process.env.BARK_API_KEY,
     onCallout: addCallout,
-    onStatus: (status) => { calloutStatus = status; send("status", { calloutStatus }); }
+    onStatus: (status, telemetry = {}) => {
+      calloutStatus = status;
+      if (telemetry.error) runtimeTelemetry.error("callout.ingest_error", telemetry.error, { status, reason: telemetry.reason });
+      else if (["error", "failed", "degraded", "reconnecting"].includes(String(status).toLowerCase())) runtimeTelemetry.warn("callout.status", { status, reason: telemetry.reason });
+      send("status", { calloutStatus });
+    }
   });
   calloutIngestor.connect();
 }
@@ -146,32 +208,68 @@ if (mode === "demo") {
   const ingestor = new PumpPortalIngestor({
     url: process.env.PUMPPORTAL_URL || "wss://pumpportal.fun/api/data",
     watchTrades: process.env.WATCH_TRADES === "true",
-    onToken: (token) => { lastMintAt = new Date().toISOString(); upsert(token); },
-    onMigration: ({ mint }) => { const token = store.token(mint); if (token) upsert({ ...token, status: "graduated", bondingProgress: 100 }); },
+    onToken: (token) => {
+      lastMintAt = token.createdAt || new Date().toISOString();
+      feedLastMessageAt = lastMintAt;
+      feedLastActivityAt = lastMintAt;
+      upsert(token);
+    },
+    onMigration: ({ mint, observedAt }) => {
+      feedLastActivityAt = observedAt || new Date().toISOString();
+      feedLastMessageAt = feedLastActivityAt;
+      const token = store.token(mint);
+      if (token) upsert({ ...token, status: "graduated", bondingProgress: 100 });
+    },
     onStatus: (status, telemetry = {}) => {
       feedStatus = status;
+      feedConnectedAt = telemetry.lastConnectedAt || feedConnectedAt;
+      feedLastMessageAt = telemetry.lastMessageAt || feedLastMessageAt;
+      feedLastActivityAt = telemetry.lastActivityAt || feedLastActivityAt;
+      feedLastErrorAt = telemetry.lastErrorAt || feedLastErrorAt;
       reconnects = telemetry.counters?.reconnectsScheduled ?? telemetry.reconnects ?? reconnects;
       feedMessages = telemetry.counters?.messagesReceived ?? telemetry.messages ?? feedMessages;
       feedParseErrors = telemetry.counters?.malformedMessages ?? telemetry.parseErrors ?? feedParseErrors;
-      send("status", { feedStatus, feedHealth: feedHealth(), reconnects, feedMessages, feedParseErrors });
+      if (telemetry.lastErrorAt && telemetry.lastErrorAt !== lastLoggedFeedErrorAt) {
+        lastLoggedFeedErrorAt = telemetry.lastErrorAt;
+        runtimeTelemetry.error("feed.ingest_error", new Error(telemetry.lastError || "Feed ingest error"), { status, reason: telemetry.reason });
+      } else if (status !== lastLoggedFeedStatus) {
+        const method = ["degraded", "error", "failed", "reconnecting"].includes(status) ? "warn" : "info";
+        runtimeTelemetry[method]("feed.status", { status, reason: telemetry.reason, connectionStatus: telemetry.connectionStatus });
+      }
+      lastLoggedFeedStatus = status;
+      const feed = feedObservation();
+      send("status", { feedStatus, feedHealth: feed.state, feed, reconnects, feedMessages, feedParseErrors });
     }
   });
+  pumpPortalIngestor = ingestor;
   ingestor.connect();
 }
 
 const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml" };
 const server = http.createServer(async (req, res) => {
+  const requestId = randomUUID();
+  res.setHeader("x-request-id", requestId);
+  res.once("finish", () => runtimeTelemetry.recordResponse(res.statusCode, {
+    readiness: req.url?.split("?")[0] === "/api/health"
+  }));
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === "/api/health") return json(res, 200, {
-      ok: true, version: appVersion, mode, feedStatus, feedHealth: feedHealth(), calloutStatus,
-      lastEventAt, lastMintAt, indexed: store.count(), liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
-      demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors,
+    if (url.pathname === "/api/health") {
+      const feed = feedObservation();
+      const status = healthStatus(feed);
+      return json(res, status === "healthy" ? 200 : 503, {
+      ok: status === "healthy", status, version: appVersion, mode, requestId,
+      service: runtimeTelemetry.service(), storage, feed, telemetry: runtimeTelemetry.snapshot(), feedStatus, feedHealth: feed.state, calloutStatus,
+      lastEventAt, lastMintAt,
+      indexed: mode === "live" ? store.countBySource("pumpportal").tokens : store.count(),
+      liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
+      demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
+      reconnects: feed.counters.reconnects, feedMessages: feed.counters.messages, feedParseErrors: feed.counters.malformedMessages,
       analyst: { status: "ready", engine: "local-grounded-v1" }
     });
+    }
     if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
     if (url.pathname === "/api/agent/chat") {
-      const requestId = randomUUID();
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
       const rate = checkAgentRate(req.socket.remoteAddress || "unknown");
       if (!rate.allowed) return json(res, 429, { ok: false, error: "Too many analyst requests", requestId }, { "retry-after": String(rate.retryAfter) });
@@ -209,7 +307,8 @@ const server = http.createServer(async (req, res) => {
     target = path.normalize(target).replace(/^(\.\.(\/|\\|$))+/, "");
     const file = path.join(root, "public", target);
     if (!file.startsWith(path.join(root, "public"))) return json(res, 403, { error: "Forbidden" });
-    const body = await readFile(file);
+    let body = await readFile(file);
+    if (target === "/index.html") body = Buffer.from(body.toString("utf8").replaceAll("__APP_VERSION__", appVersion));
     res.writeHead(200, {
       "content-type": types[path.extname(file)] || "application/octet-stream",
       "x-content-type-options": "nosniff",
@@ -217,9 +316,13 @@ const server = http.createServer(async (req, res) => {
     });
     res.end(body);
   } catch (error) {
-    if (error.code === "ENOENT") return json(res, 404, { error: "Not found" });
-    if (error instanceof HttpError) return json(res, error.status, { ok: false, error: error.message });
-    console.error(error); json(res, 500, { error: "Internal error" });
+    if (error?.code === "ENOENT") return json(res, 404, { error: "Not found", requestId });
+    if (error instanceof HttpError) {
+      runtimeTelemetry.warn("http.client_error", { requestId, status: error.status, method: req.method, path: req.url?.split("?")[0] });
+      return json(res, error.status, { ok: false, error: error.message, requestId });
+    }
+    runtimeTelemetry.error("http.unhandled_error", error, { requestId, method: req.method, path: req.url?.split("?")[0] });
+    json(res, 500, { error: "Internal error", requestId });
   }
 });
 
@@ -230,6 +333,17 @@ function json(res, status, value, headers = {}) {
 server.headersTimeout = 5_000;
 server.requestTimeout = 10_000;
 server.listen(port, "0.0.0.0", () => {
-  console.log(`Pump War Room v${appVersion} (${mode}) listening on http://localhost:${port}`);
-  if (cleanup.tokens) console.log(`Removed ${cleanup.tokens} legacy demo tokens, ${cleanup.events} events, and ${cleanup.alerts} alerts from the live database`);
+  runtimeTelemetry.info("service.started", {
+    bind: "0.0.0.0",
+    port,
+    database: {
+      path: dbPath,
+      storageState: storage.state,
+      requiredMountPath: storage.requiredMountPath,
+      mountPointVerified: storage.mountPointVerified,
+      filesystemType: storage.filesystemType
+    },
+    feedStaleAfterSeconds: FEED_STALE_AFTER_MS / 1_000
+  });
+  if (cleanup.tokens) runtimeTelemetry.info("database.demo_cleanup", cleanup);
 });

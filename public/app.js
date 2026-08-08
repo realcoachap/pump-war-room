@@ -4,7 +4,7 @@ let snapshotFailed = false;
 let refreshInFlight = false;
 let caesarRequestPending = false;
 
-const STALE_AFTER_MS = 120_000;
+const LEGACY_STALE_AFTER_MS = 90_000;
 const CAESAR_MAX_QUESTION = 500;
 const CAESAR_MAX_ANSWER = 6_000;
 const CAESAR_TIMEOUT_MS = 30_000;
@@ -47,15 +47,26 @@ const cappedText = (value, limit) => {
 
 function feedTelemetry() {
   const feedHealth = state.feedHealth;
-  const nested = feedHealth && typeof feedHealth === "object" ? feedHealth : {};
+  const nested = state.feed && typeof state.feed === "object" ? state.feed : feedHealth && typeof feedHealth === "object" ? feedHealth : {};
   return {
     rawHealth: typeof feedHealth === "string" ? feedHealth : nested.state || nested.status || nested.health || state.feedStatus || "connecting",
     lastMintAt: state.lastMintAt || nested.lastMintAt || null,
     liveMintCount: hasNumber(state.liveMintCount ?? nested.liveMintCount) ? Number(state.liveMintCount ?? nested.liveMintCount) : null,
     demoPurged: typeof (state.demoPurged ?? nested.demoPurged) === "boolean" ? state.demoPurged ?? nested.demoPurged : null,
     demoPurgedCount: hasNumber(state.demoPurgedCount ?? nested.demoPurgedCount) ? Number(state.demoPurgedCount ?? nested.demoPurgedCount) : 0,
-    reconnects: hasNumber(state.reconnects ?? nested.reconnects) ? Number(state.reconnects ?? nested.reconnects) : 0
+    reconnects: hasNumber(state.reconnects ?? nested.counters?.reconnects ?? nested.reconnects) ? Number(state.reconnects ?? nested.counters?.reconnects ?? nested.reconnects) : 0,
+    staleAfterSeconds: hasNumber(nested.staleAfterSeconds) ? Number(nested.staleAfterSeconds) : LEGACY_STALE_AFTER_MS / 1_000,
+    uptimeSeconds: hasNumber(state.service?.uptimeSeconds) ? Number(state.service.uptimeSeconds) : null
   };
+}
+
+function durationLabel(seconds) {
+  if (!hasNumber(seconds)) return "—";
+  const value = Math.max(0, Math.floor(number(seconds)));
+  if (value < 60) return `${value}s`;
+  if (value < 3_600) return `${Math.floor(value / 60)}m`;
+  if (value < 86_400) return `${Math.floor(value / 3_600)}h ${Math.floor(value % 3_600 / 60)}m`;
+  return `${Math.floor(value / 86_400)}d ${Math.floor(value % 86_400 / 3_600)}h`;
 }
 
 function isSyntheticToken(token = {}) {
@@ -78,9 +89,9 @@ function healthView() {
   else if (["stale", "degraded", "offline", "error", "failed", "disconnected"].some((value) => raw.includes(value))) label = "STALE";
   else if (["live", "healthy", "streaming", "active"].some((value) => raw.includes(value))) label = "LIVE";
   else if (["connected", "open", "ready"].some((value) => raw.includes(value))) label = mintTimestamp || telemetry.liveMintCount > 0 ? "LIVE" : "CONNECTING";
-  else if (mintAge !== null && mintAge > STALE_AFTER_MS) label = "STALE";
+  else if (mintAge !== null && mintAge > telemetry.staleAfterSeconds * 1_000) label = "STALE";
 
-  if (label === "LIVE" && mintAge !== null && mintAge > STALE_AFTER_MS && !["live", "healthy"].includes(raw)) label = "STALE";
+  if (label === "LIVE" && mintAge !== null && mintAge > telemetry.staleAfterSeconds * 1_000 && !["live", "healthy"].includes(raw)) label = "STALE";
   if (state.mode !== "live" && raw === "simulated") label = "CONNECTING";
 
   const details = {
@@ -133,6 +144,8 @@ function renderFeedObservability() {
   $("#demo-purge-note").textContent = integrityDetail;
   $("#mode-state").textContent = String(state.mode || "unknown").toUpperCase();
   $("#mode-note").textContent = state.mode === "live" ? "Read-only production ingest" : "Synthetic environment";
+  $("#service-uptime").textContent = durationLabel(telemetry.uptimeSeconds);
+  $("#freshness-window").textContent = `${telemetry.staleAfterSeconds}s verified-activity window`;
   updateMintAge();
   updateCaesarContextState();
 }

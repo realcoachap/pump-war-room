@@ -60,6 +60,26 @@ test("source operations tolerate malformed legacy JSON without treating it as de
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM events WHERE mint='malformed-mint'").get().count, 1);
 });
 
+test("counts only source-verified token rows since an inclusive timestamp", (t) => {
+  const store = temporaryStore(t);
+  const before = "2026-08-08T11:59:59.999Z";
+  const after = "2026-08-08T12:00:00.001Z";
+  store.upsertToken({ mint: "live-before", source: "pumpportal", createdAt: before });
+  store.upsertToken({ mint: "live-boundary", source: "pumpportal", createdAt });
+  store.upsertToken({ mint: "live-after", source: "pumpportal", createdAt: after });
+  store.upsertToken({ mint: "demo-after", source: "demo", createdAt: after });
+  store.upsertToken({ mint: "unknown-after", createdAt: after });
+  store.db.prepare("INSERT INTO tokens (mint,payload,created_at,updated_at) VALUES (?,?,?,?)")
+    .run("malformed-after", "{not-json", after, after);
+
+  assert.equal(store.countSinceBySource(createdAt, "pumpportal"), 2);
+  assert.equal(store.countSinceBySource(createdAt, "demo"), 1);
+  assert.equal(store.countSinceBySource(createdAt, "unknown"), 0);
+  assert.equal(store.countSinceBySource(after, "pumpportal"), 1);
+  assert.equal(store.countSince(createdAt), 5);
+  assert.throws(() => store.countSinceBySource(createdAt, ""), /non-empty string/);
+});
+
 test("purges only demo tokens, demo events, and alerts tied to demo tokens", (t) => {
   const store = temporaryStore(t);
   seedMixedSources(store);

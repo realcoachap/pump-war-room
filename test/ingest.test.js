@@ -45,9 +45,15 @@ function fakeTimers() {
       return task;
     },
     clearTimeoutFn(task) { task.cleared = true; },
-    run(task) { if (!task.cleared) task.callback(); }
+    run(task) {
+      if (task.cleared) return;
+      task.cleared = true;
+      task.callback();
+    }
   };
 }
+
+const pendingTimers = (timers) => timers.tasks.filter((task) => !task.cleared);
 
 test("new live tokens remain risk-unverified until enrichment arrives", () => {
   let observed;
@@ -153,6 +159,7 @@ test("malformed websocket JSON is counted and the next valid event is processed"
   assert.deepEqual(status.counters, {
     connectionAttempts: 1,
     connectionsOpened: 1,
+    connectionTimeouts: 0,
     reconnectsScheduled: 0,
     socketErrors: 0,
     sendErrors: 0,
@@ -181,17 +188,17 @@ test("unexpected close reconnects once, while explicit close cancels reconnect",
   first.emit("close", { code: 1006 });
   first.emit("close", { code: 1006 });
 
-  assert.equal(timers.tasks.length, 1);
-  assert.equal(timers.tasks[0].delay, 1_000);
+  assert.equal(pendingTimers(timers).length, 1);
+  assert.equal(pendingTimers(timers)[0].delay, 1_000);
   assert.equal(ingestor.getStatus().status, "reconnecting");
   assert.equal(ingestor.getStatus().counters.reconnectsScheduled, 1);
 
-  timers.run(timers.tasks[0]);
+  timers.run(pendingTimers(timers)[0]);
   assert.equal(WebSocketImpl.instances.length, 2);
   const second = WebSocketImpl.instances[1];
   second.emit("open");
   second.emit("close", { code: 1006 });
-  const pending = timers.tasks[1];
+  const pending = pendingTimers(timers)[0];
   assert.equal(pending.delay, 1_000);
 
   ingestor.close();
@@ -219,6 +226,67 @@ test("explicitly closing an open socket never schedules a reconnect", () => {
   ingestor.close();
 
   assert.equal(socket.closed, true);
-  assert.equal(timers.tasks.length, 0);
+  assert.equal(pendingTimers(timers).length, 0);
   assert.equal(ingestor.getStatus().counters.reconnectsScheduled, 0);
+});
+
+test("times out a blackholed websocket handshake and schedules one reconnect", () => {
+  const WebSocketImpl = fakeWebSocketClass();
+  const timers = fakeTimers();
+  const statuses = [];
+  const ingestor = new PumpPortalIngestor({
+    url: "wss://example.invalid",
+    WebSocketImpl,
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+    connectTimeoutMs: 5_000,
+    now: () => FIXED_TIME,
+    onStatus: (status, metadata) => statuses.push({ status, metadata })
+  });
+
+  ingestor.connect();
+  const socket = WebSocketImpl.instances[0];
+  const timeout = pendingTimers(timers)[0];
+  assert.equal(timeout.delay, 5_000);
+  timers.run(timeout);
+
+  assert.equal(socket.closed, true);
+  assert.equal(ingestor.getStatus().status, "reconnecting");
+  assert.equal(ingestor.getStatus().connectionStatus, "reconnecting");
+  assert.equal(ingestor.getStatus().counters.connectionTimeouts, 1);
+  assert.equal(ingestor.getStatus().counters.reconnectsScheduled, 1);
+  assert.match(ingestor.getStatus().lastError, /open timed out/);
+  assert.deepEqual(statuses.slice(-2).map(({ status }) => status), ["degraded", "reconnecting"]);
+  assert.equal(pendingTimers(timers).length, 1);
+  assert.equal(pendingTimers(timers)[0].delay, 1_000);
+});
+
+test("getStatus exposes counters and raw-message age after repeated healthy traffic", () => {
+  const WebSocketImpl = fakeWebSocketClass();
+  const statuses = [];
+  let tick = FIXED_TIME;
+  const ingestor = new PumpPortalIngestor({
+    url: "wss://example.invalid",
+    WebSocketImpl,
+    now: () => tick,
+    onStatus: (status, metadata) => statuses.push({ status, metadata })
+  });
+
+  ingestor.connect();
+  const socket = WebSocketImpl.instances[0];
+  socket.emit("open");
+  socket.emit("message", { data: JSON.stringify({ txType: "create", mint: "MintOne", name: "One", symbol: "ONE" }) });
+  tick += 1_000;
+  socket.emit("message", { data: JSON.stringify({ txType: "create", mint: "MintTwo", name: "Two", symbol: "TWO" }) });
+  tick += 1_000;
+  socket.emit("message", { data: JSON.stringify({ txType: "buy", mint: "MintTwo" }) });
+
+  const live = ingestor.getStatus();
+  assert.equal(live.status, "live");
+  assert.equal(live.lastMessageAt, "2026-08-08T21:00:02.000Z");
+  assert.equal(live.lastActivityAt, "2026-08-08T21:00:01.000Z");
+  assert.equal(live.counters.messagesReceived, 3);
+  assert.equal(live.counters.newTokens, 2);
+  assert.equal(live.counters.ignoredMessages, 1);
+  assert.equal(statuses.at(-1).metadata.counters.messagesReceived, 1);
 });

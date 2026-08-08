@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeBarkCallout } from "../src/callouts.js";
+import { BarkCalloutIngestor, normalizeBarkCallout } from "../src/callouts.js";
 import { Store } from "../src/store.js";
 
 test("normalizes Bark Pump.fun callouts by mint and provenance", () => {
@@ -28,4 +28,33 @@ test("persists callouts once by external event id", () => {
   store.upsertCallout({ ...callout, caller: "updated" });
   assert.equal(store.callouts().length, 1);
   assert.equal(store.callouts()[0].caller, "updated");
+});
+
+test("contains optional Bark construction failures and schedules a bounded reconnect", () => {
+  const statuses = [];
+  const timers = [];
+  class InvalidWebSocket {
+    constructor() { throw new DOMException("Invalid URL"); }
+  }
+  const ingestor = new BarkCalloutIngestor({
+    url: "://invalid",
+    apiKey: "configured",
+    WebSocketImpl: InvalidWebSocket,
+    setTimeoutFn(callback, delay) {
+      const timer = { callback, delay, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn(timer) { timer.cleared = true; },
+    onStatus: (status, metadata) => statuses.push({ status, metadata })
+  });
+
+  assert.doesNotThrow(() => ingestor.connect());
+  assert.deepEqual(statuses.map(({ status }) => status), ["connecting", "degraded", "reconnecting"]);
+  assert.equal(statuses[1].metadata.reason, "connection-failed");
+  assert.ok(statuses[1].metadata.error instanceof Error);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 1_000);
+  ingestor.close();
+  assert.equal(timers[0].cleared, true);
 });

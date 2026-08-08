@@ -4,10 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#090b10">
+  <meta name="application-version" content="__APP_VERSION__">
   <title>Pump War Room — OpenCaesar</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
+<body data-app-version="__APP_VERSION__">
   <div class="noise"></div>
   <header class="topbar">
     <div class="brand">
@@ -53,6 +54,9 @@
         </div>
         <div class="telemetry-card">
           <label>MODE</label><strong id="mode-state">LIVE</strong><small id="mode-note">Read-only production ingest</small>
+        </div>
+        <div class="telemetry-card">
+          <label>SERVICE UPTIME</label><strong id="service-uptime">—</strong><small id="freshness-window">Verified-feed window unavailable</small>
         </div>
       </div>
     </section>

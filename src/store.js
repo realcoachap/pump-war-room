@@ -2,6 +2,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
+export const STORE_SCHEMA_VERSION = 501;
+
 function parsePayloadRows(rows) {
   return rows.flatMap((row) => {
     try { return [JSON.parse(row.payload)]; } catch { return []; }
@@ -27,6 +29,7 @@ export class Store {
         external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS callouts_mint_created ON callouts(mint, created_at DESC);
+      PRAGMA user_version = ${STORE_SCHEMA_VERSION};
     `);
     this.upsertStmt = this.db.prepare(`INSERT INTO tokens (mint,payload,created_at,updated_at)
       VALUES (?,?,?,?) ON CONFLICT(mint) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`);
@@ -45,6 +48,9 @@ export class Store {
           WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?
         )`)
     };
+    this.sourceTokenCountSinceStmt = this.db.prepare(`SELECT count(*) AS count FROM tokens
+      WHERE created_at >= ?
+        AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?`);
     this.deleteDemoStmts = {
       alerts: this.db.prepare(`DELETE FROM alerts
         WHERE mint IN (
@@ -117,4 +123,8 @@ export class Store {
   calloutCountSince(iso) { return this.db.prepare("SELECT count(*) AS count FROM callouts WHERE created_at >= ?").get(iso).count; }
   count() { return this.db.prepare("SELECT count(*) AS count FROM tokens").get().count; }
   countSince(iso) { return this.db.prepare("SELECT count(*) AS count FROM tokens WHERE created_at >= ?").get(iso).count; }
+  countSinceBySource(iso, source) {
+    if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");
+    return this.sourceTokenCountSinceStmt.get(iso, source).count;
+  }
 }

@@ -24,33 +24,87 @@ export function normalizeBarkCallout(message) {
 }
 
 export class BarkCalloutIngestor {
-  constructor({ url = "wss://news.bark.gg/ws", apiKey, onCallout, onStatus }) {
+  constructor({
+    url = "wss://news.bark.gg/ws",
+    apiKey,
+    onCallout,
+    onStatus,
+    WebSocketImpl = globalThis.WebSocket,
+    setTimeoutFn = globalThis.setTimeout,
+    clearTimeoutFn = globalThis.clearTimeout
+  }) {
     Object.assign(this, { url, apiKey, onCallout, onStatus });
+    this.WebSocketImpl = WebSocketImpl;
+    this.setTimeoutFn = setTimeoutFn;
+    this.clearTimeoutFn = clearTimeoutFn;
     this.reconnectMs = 1_000;
+    this.reconnectTimer = null;
+    this.ws = null;
     this.closed = false;
   }
   connect() {
-    if (this.closed || !this.apiKey) return;
+    if (this.closed || !this.apiKey || this.ws) return;
     this.onStatus?.("connecting");
-    this.ws = new WebSocket(this.url);
-    this.ws.addEventListener("open", () => {
+    let socket;
+    try {
+      if (typeof this.WebSocketImpl !== "function") throw new TypeError("WebSocket is not available");
+      socket = new this.WebSocketImpl(this.url);
+    } catch (error) {
+      this.onStatus?.("degraded", { reason: "connection-failed", error });
+      this._scheduleReconnect("connection-failed");
+      return;
+    }
+    this.ws = socket;
+    socket.addEventListener("open", () => {
+      if (this.closed || socket !== this.ws) return;
       this.reconnectMs = 1_000;
-      this.ws.send(`login ${this.apiKey}`);
-      this.onStatus?.("live");
+      try {
+        socket.send(`login ${this.apiKey}`);
+        this.onStatus?.("live");
+      } catch (error) {
+        this.onStatus?.("degraded", { reason: "login-send-failed", error });
+        this.ws = null;
+        try { socket.close(); } catch {}
+        this._scheduleReconnect("login-send-failed");
+      }
     });
-    this.ws.addEventListener("message", (event) => {
+    socket.addEventListener("message", (event) => {
+      if (this.closed || socket !== this.ws) return;
       try {
         const callout = normalizeBarkCallout(JSON.parse(event.data));
         if (callout) this.onCallout?.(callout);
-      } catch { this.onStatus?.("degraded"); }
+      } catch (error) { this.onStatus?.("degraded", { reason: "malformed-message", error }); }
     });
-    this.ws.addEventListener("error", () => this.onStatus?.("degraded"));
-    this.ws.addEventListener("close", () => {
-      if (this.closed) return;
-      this.onStatus?.("reconnecting");
-      setTimeout(() => this.connect(), this.reconnectMs).unref?.();
-      this.reconnectMs = Math.min(30_000, this.reconnectMs * 2);
+    socket.addEventListener("error", (event) => {
+      if (this.closed || socket !== this.ws) return;
+      this.onStatus?.("degraded", { reason: "socket-error", error: event?.error || new Error("Bark websocket error") });
+    });
+    socket.addEventListener("close", () => {
+      if (this.closed || socket !== this.ws) return;
+      this.ws = null;
+      this._scheduleReconnect("socket-close");
     });
   }
-  close() { this.closed = true; this.ws?.close(); }
+  _scheduleReconnect(reason) {
+    if (this.closed || this.reconnectTimer != null) return;
+    const delay = this.reconnectMs;
+    this.reconnectMs = Math.min(30_000, this.reconnectMs * 2);
+    this.onStatus?.("reconnecting", { reason, reconnectInMs: delay });
+    const timer = this.setTimeoutFn(() => {
+      if (this.reconnectTimer !== timer || this.closed) return;
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+    this.reconnectTimer = timer;
+    timer?.unref?.();
+  }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.reconnectTimer != null) this.clearTimeoutFn(this.reconnectTimer);
+    this.reconnectTimer = null;
+    const socket = this.ws;
+    this.ws = null;
+    try { socket?.close(); } catch {}
+  }
 }

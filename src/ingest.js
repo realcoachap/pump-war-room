@@ -41,16 +41,20 @@ export class PumpPortalIngestor {
     WebSocketImpl = globalThis.WebSocket,
     setTimeoutFn = globalThis.setTimeout,
     clearTimeoutFn = globalThis.clearTimeout,
+    connectTimeoutMs = 15_000,
     now = () => Date.now()
   }) {
     Object.assign(this, { url, watchTrades, onToken, onMigration, onStatus });
     this.WebSocketImpl = WebSocketImpl;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
+    if (!Number.isFinite(connectTimeoutMs) || connectTimeoutMs < 1_000) throw new RangeError("connectTimeoutMs must be at least 1000");
+    this.connectTimeoutMs = connectTimeoutMs;
     this.now = now;
     this.reconnectMs = 1_000;
     this.reconnectTimer = null;
     this.reconnectToken = null;
+    this.connectTimer = null;
     this.ws = null;
     this.closed = false;
     this.tradeMints = new Set();
@@ -71,6 +75,7 @@ export class PumpPortalIngestor {
     this.counters = {
       connectionAttempts: 0,
       connectionsOpened: 0,
+      connectionTimeouts: 0,
       reconnectsScheduled: 0,
       socketErrors: 0,
       sendErrors: 0,
@@ -107,6 +112,7 @@ export class PumpPortalIngestor {
     socket.addEventListener("message", (event) => this._onMessage(socket, event));
     socket.addEventListener("error", (event) => this._onError(socket, event));
     socket.addEventListener("close", (event) => this._onClose(socket, event));
+    this._scheduleConnectTimeout(socket);
   }
 
   handle(raw) {
@@ -124,7 +130,7 @@ export class PumpPortalIngestor {
     if (kind === "migration") {
       this.counters.migrations++;
       this.lastMigrationAt = observedAt;
-      const result = this.onMigration?.({ mint, raw });
+      const result = this.onMigration?.({ mint, raw, observedAt });
       this._recordActivity(observedAt, "migration");
       return result;
     }
@@ -189,6 +195,7 @@ export class PumpPortalIngestor {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this._cancelConnectTimeout();
     this._cancelReconnect();
     const socket = this.ws;
     this.ws = null;
@@ -200,6 +207,7 @@ export class PumpPortalIngestor {
 
   _onOpen(socket) {
     if (this.closed || socket !== this.ws) return;
+    this._cancelConnectTimeout();
     this.reconnectMs = 1_000;
     this.connectionStatus = "connected";
     this.activityStatus = "waiting";
@@ -236,14 +244,19 @@ export class PumpPortalIngestor {
 
   _onError(socket, event) {
     if (this.closed || socket !== this.ws) return;
+    this._cancelConnectTimeout();
     this.counters.socketErrors++;
     this.connectionStatus = "degraded";
     this._recordError(event?.error || new Error("PumpPortal websocket error"));
     this._emitStatus("degraded", { reason: "socket-error" });
+    this.ws = null;
+    try { socket.close(); } catch {}
+    this._scheduleReconnect("socket-error");
   }
 
   _onClose(socket, event) {
     if (this.closed || socket !== this.ws) return;
+    this._cancelConnectTimeout();
     this.ws = null;
     const reason = event?.code ? `socket-close-${event.code}` : "socket-close";
     this._scheduleReconnect(reason);
@@ -298,6 +311,29 @@ export class PumpPortalIngestor {
     }, delay);
     this.reconnectTimer = timer;
     timer?.unref?.();
+  }
+
+  _scheduleConnectTimeout(socket) {
+    this._cancelConnectTimeout();
+    const timer = this.setTimeoutFn(() => {
+      if (this.connectTimer !== timer) return;
+      this.connectTimer = null;
+      if (this.closed || socket !== this.ws || this.connectionStatus !== "connecting") return;
+      this.ws = null;
+      this.connectionStatus = "degraded";
+      this.counters.connectionTimeouts++;
+      this._recordError(new Error("PumpPortal websocket open timed out"));
+      this._emitStatus("degraded", { reason: "connection-timeout" });
+      try { socket.close(); } catch {}
+      this._scheduleReconnect("connection-timeout");
+    }, this.connectTimeoutMs);
+    this.connectTimer = timer;
+    timer?.unref?.();
+  }
+
+  _cancelConnectTimeout() {
+    if (this.connectTimer != null) this.clearTimeoutFn(this.connectTimer);
+    this.connectTimer = null;
   }
 
   _cancelReconnect() {
