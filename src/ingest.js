@@ -34,10 +34,11 @@ export class PumpPortalIngestor {
       narrative: classifyNarrative(`${raw.name || ""} ${raw.symbol || ""} ${raw.description || ""}`),
       marketCap: Number(raw.marketCapSol || raw.marketCap || 0) * (Number(process.env.SOL_USD) || 160),
       volume5m: Number(raw.vSolInBondingCurve || raw.solAmount || 0) * (Number(process.env.SOL_USD) || 160),
-      priceChange5m: 0, uniqueBuyers: 1, buyRatio: 1, bondingProgress: 0,
-      devHoldingPct: 0, top10Pct: 0, creatorRisk: false, smartWallets: 0, source: "pumpportal"
+      priceChange5m: 0, uniqueBuyers: 1, buyRatio: null, bondingProgress: 0,
+      devHoldingPct: null, top10Pct: null, creatorRisk: null, smartWallets: 0, source: "pumpportal",
+      riskConfidence: "unverified"
     };
-    token.momentum = momentumScore(token); token.risk = riskScore(token);
+    token.momentum = momentumScore(token); token.risk = null;
     this.onToken?.(token);
     if (this.watchTrades) this.ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mint] }));
   }

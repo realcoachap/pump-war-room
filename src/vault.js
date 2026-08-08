@@ -17,6 +17,7 @@ status: ${yaml(token.status)}
 narrative: ${yaml(token.narrative)}
 momentum_score: ${token.momentum}
 risk_score: ${token.risk}
+risk_confidence: ${yaml(token.riskConfidence || (token.source === "demo" ? "synthetic" : "unverified"))}
 market_cap_usd: ${Math.round(token.marketCap || 0)}
 bonding_progress: ${Math.round(token.bondingProgress || 0)}
 ---
@@ -41,7 +42,7 @@ bonding_progress: ${Math.round(token.bondingProgress || 0)}
 
 **Momentum ${token.momentum}/100:** ${reasons.momentum.join(", ")}.
 
-**Risk ${token.risk}/100:** ${reasons.risk.join(", ")}.
+**Risk ${Number.isFinite(token.risk) ? `${token.risk}/100` : "unverified"} (${reasons.riskConfidence}):** ${reasons.risk.join(", ")}.
 
 ## Research timeline
 

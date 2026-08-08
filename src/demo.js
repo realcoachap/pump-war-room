@@ -26,6 +26,7 @@ export function createDemoToken(index = 0, ageMinutes = 0) {
   };
   token.momentum = momentumScore(token);
   token.risk = riskScore(token);
+  token.riskConfidence = "synthetic";
   return token;
 }
 
@@ -40,5 +41,6 @@ export function tickDemoToken(token) {
   next.marketCap = Math.max(3000, next.marketCap * between(0.96, 1.09));
   next.momentum = momentumScore(next);
   next.risk = riskScore(next);
+  next.riskConfidence = "synthetic";
   return next;
 }

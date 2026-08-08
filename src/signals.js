@@ -16,6 +16,15 @@ export function riskScore(token) {
   return Math.round(clamp(dev * 0.34 + holders * 0.29 + sells * 0.2 + history * 0.17));
 }
 
+export function riskConfidence(token) {
+  if (token.source === "demo") return "synthetic";
+  const verifiedInputs = [token.devHoldingPct, token.top10Pct, token.buyRatio]
+    .filter((value) => Number.isFinite(value)).length + (typeof token.creatorRisk === "boolean" ? 1 : 0);
+  if (verifiedInputs === 4) return "verified";
+  if (verifiedInputs >= 2) return "partial";
+  return "unverified";
+}
+
 export function scoreReasons(token) {
   const momentum = [];
   const risk = [];
@@ -27,9 +36,13 @@ export function scoreReasons(token) {
   if ((token.top10Pct || 0) >= 50) risk.push("holder concentration");
   if ((token.buyRatio || 0) < 0.43) risk.push("sell-side pressure");
   if (token.creatorRisk) risk.push("creator history flag");
+  const confidence = token.riskConfidence || riskConfidence(token);
   return {
     momentum: momentum.length ? momentum : ["early signal—limited history"],
-    risk: risk.length ? risk : ["no major heuristic flags"]
+    risk: confidence === "unverified"
+      ? ["awaiting holder, creator, and trade enrichment"]
+      : risk.length ? risk : ["no major heuristic flags"],
+    riskConfidence: confidence
   };
 }
 

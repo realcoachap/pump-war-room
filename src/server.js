@@ -5,9 +5,11 @@ import { fileURLToPath } from "node:url";
 import { Store } from "./store.js";
 import { createDemoToken, tickDemoToken } from "./demo.js";
 import { PumpPortalIngestor } from "./ingest.js";
+import { BarkCalloutIngestor } from "./callouts.js";
 import { exportCoin, exportDaily } from "./vault.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
 const port = Number(process.env.PORT || 4173);
 const mode = process.env.PUMP_MODE === "live" ? "live" : "demo";
 const dbPath = path.resolve(root, process.env.DB_PATH || "data/pump-war-room.db");
@@ -15,6 +17,7 @@ const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
 const store = new Store(dbPath);
 const clients = new Set();
 let feedStatus = mode === "demo" ? "simulated" : "connecting";
+let calloutStatus = process.env.BARK_API_KEY ? "connecting" : "disabled";
 let lastEventAt = new Date().toISOString();
 
 const send = (kind, payload) => {
@@ -31,7 +34,7 @@ function alertFor(token, previous) {
     alert = { level: "signal", title: "Velocity spike", message: `${token.symbol} momentum crossed ${token.momentum}`, mint: token.mint };
   } else if (token.smartWallets >= 4 && (!previous || previous.smartWallets < 4)) {
     alert = { level: "signal", title: "Wallet convergence", message: `${token.smartWallets} tracked wallets entered ${token.symbol}`, mint: token.mint };
-  } else if (token.risk >= 72 && (!previous || previous.risk < 72)) {
+  } else if (Number.isFinite(token.risk) && token.risk >= 72 && (!previous || !Number.isFinite(previous.risk) || previous.risk < 72)) {
     alert = { level: "risk", title: "Risk escalation", message: `${token.symbol} risk reached ${token.risk}`, mint: token.mint };
   }
   if (alert) {
@@ -58,8 +61,16 @@ function upsert(token) {
   alertFor(token, previous); send(previous ? "token-update" : "new-token", token);
 }
 
+function addCallout(callout) {
+  store.upsertCallout(callout);
+  store.addEvent("callout", callout);
+  send("callout", callout);
+}
+
 function snapshot() {
-  const tokens = store.tokens(120).sort((a, b) => b.momentum - a.momentum);
+  const callouts = store.callouts(200);
+  const calloutCounts = callouts.reduce((counts, callout) => counts.set(callout.mint, (counts.get(callout.mint) || 0) + 1), new Map());
+  const tokens = store.tokens(120).map((token) => ({ ...token, calloutCount: calloutCounts.get(token.mint) || 0 })).sort((a, b) => b.momentum - a.momentum);
   const start = new Date(); start.setHours(0, 0, 0, 0);
   const hour = new Date(Date.now() - 3_600_000).toISOString();
   const fifteen = new Date(Date.now() - 900_000).toISOString();
@@ -69,10 +80,20 @@ function snapshot() {
     return acc;
   }, {})).map((row) => ({ ...row, momentum: Math.round(row.momentum / row.coins) })).sort((a, b) => b.volume - a.volume);
   return {
-    mode, feedStatus, lastEventAt,
-    stats: { indexed: store.count(), mintedToday: store.countSince(start.toISOString()), lastHour: store.countSince(hour), last15m: store.countSince(fifteen), graduations: tokens.filter((t) => t.status === "graduated").length },
-    tokens, narratives, alerts: store.alerts(40)
+    version: appVersion, mode, feedStatus, calloutStatus, lastEventAt,
+    stats: { indexed: store.count(), mintedToday: store.countSince(start.toISOString()), lastHour: store.countSince(hour), last15m: store.countSince(fifteen), graduations: tokens.filter((t) => t.status === "graduated").length, calloutsLastHour: store.calloutCountSince(hour) },
+    tokens, narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
   };
+}
+
+if (process.env.BARK_API_KEY) {
+  const calloutIngestor = new BarkCalloutIngestor({
+    url: process.env.BARK_URL || "wss://news.bark.gg/ws",
+    apiKey: process.env.BARK_API_KEY,
+    onCallout: addCallout,
+    onStatus: (status) => { calloutStatus = status; send("status", { calloutStatus }); }
+  });
+  calloutIngestor.connect();
 }
 
 if (mode === "demo") {
@@ -97,7 +118,7 @@ const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === "/api/health") return json(res, 200, { ok: true, mode, feedStatus, lastEventAt, indexed: store.count() });
+    if (url.pathname === "/api/health") return json(res, 200, { ok: true, version: appVersion, mode, feedStatus, calloutStatus, lastEventAt, indexed: store.count() });
     if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
     if (url.pathname === "/api/stream") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -122,4 +143,4 @@ const server = http.createServer(async (req, res) => {
 });
 
 function json(res, status, value) { res.writeHead(status, { "content-type": "application/json; charset=utf-8" }); res.end(JSON.stringify(value)); }
-server.listen(port, "0.0.0.0", () => console.log(`Pump War Room (${mode}) listening on http://localhost:${port}`));
+server.listen(port, "0.0.0.0", () => console.log(`Pump War Room v${appVersion} (${mode}) listening on http://localhost:${port}`));
