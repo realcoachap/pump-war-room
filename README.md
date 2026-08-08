@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.3.1**
+Current release: **v0.4.0**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes activated onchain launches, ranks momentum and risk with inspectable heuristics, surfaces narrative velocity and graduations, emits Telegram-ready alerts, and exports curated notes to an Obsidian-compatible vault.
 
@@ -44,6 +44,7 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 - Live/demo launch stream with local SQLite persistence
 - Live-mode startup cleanup that removes legacy synthetic demo rows without touching verified live records or callouts
 - Feed telemetry that distinguishes an open socket from verified mint activity and reports stale or malformed upstream data
+- Caesar Intel, a zero-cost in-app analyst grounded only in the current War Room snapshot, with evidence links and no execution capabilities
 - Mint counters for today, 60 minutes, and 15 minutes
 - Transparent momentum and risk scores—open `src/signals.js` to inspect the formula
 - Mint fingerprints on every row so same-name launches cannot be mistaken for the same contract
@@ -61,6 +62,7 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 - `GET /api/health`
 - `GET /api/snapshot`
 - `GET /api/stream` (server-sent events)
+- `POST /api/agent/chat` with JSON `{ "question": "What is moving?" }`
 - `POST /api/export/daily`
 - `POST /api/export/coin/:mint`
 
@@ -73,7 +75,7 @@ npm run screenshot
 
 ## Safety boundary
 
-There is no wallet connection, private-key handling, trade execution, token creation, funding, liquidity, or automated promotion code. Scores are research heuristics—not financial advice or a recommendation to trade.
+There is no wallet connection, private-key handling, trade execution, token creation, funding, liquidity, or automated promotion code. Caesar Intel has no tools or external model access and can only summarize the bounded snapshot supplied by the server. Scores and analyst responses are research heuristics—not financial advice or a recommendation to trade.
 
 ## Known MVP limits
 

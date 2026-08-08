@@ -54,6 +54,8 @@ test("source operations tolerate malformed legacy JSON without treating it as de
 
   assert.deepEqual(store.countBySource("demo"), { tokens: 0, events: 0, alerts: 0 });
   assert.deepEqual(store.purgeDemoData(), { alerts: 0, events: 0, tokens: 0 });
+  assert.deepEqual(store.tokens(), []);
+  assert.equal(store.token("malformed-mint"), null);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM tokens WHERE mint='malformed-mint'").get().count, 1);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM events WHERE mint='malformed-mint'").get().count, 1);
 });

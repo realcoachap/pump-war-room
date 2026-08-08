@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,8 @@ import { createDemoToken, tickDemoToken } from "./demo.js";
 import { PumpPortalIngestor } from "./ingest.js";
 import { BarkCalloutIngestor } from "./callouts.js";
 import { exportCoin, exportDaily } from "./vault.js";
+import { analyzeSnapshot } from "./analyst.js";
+import { createRateLimiter, HttpError, readJsonBody } from "./http.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
@@ -17,6 +20,7 @@ const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
 const store = new Store(dbPath);
 const cleanup = mode === "live" ? store.purgeDemoData() : { tokens: 0, events: 0, alerts: 0 };
 const clients = new Set();
+const checkAgentRate = createRateLimiter({ limit: 20, windowMs: 60_000 });
 let feedStatus = mode === "demo" ? "simulated" : "connecting";
 let calloutStatus = process.env.BARK_API_KEY ? "connecting" : "disabled";
 let lastEventAt = new Date().toISOString();
@@ -82,7 +86,10 @@ function addCallout(callout) {
 function snapshot() {
   const callouts = store.callouts(200);
   const calloutCounts = callouts.reduce((counts, callout) => counts.set(callout.mint, (counts.get(callout.mint) || 0) + 1), new Map());
-  const tokens = store.tokens(120).map((token) => ({ ...token, calloutCount: calloutCounts.get(token.mint) || 0 })).sort((a, b) => b.momentum - a.momentum);
+  const tokens = store.tokens(120)
+    .filter((token) => mode !== "live" || token.source === "pumpportal")
+    .map((token) => ({ ...token, calloutCount: calloutCounts.get(token.mint) || 0 }))
+    .sort((a, b) => b.momentum - a.momentum);
   const start = new Date(); start.setHours(0, 0, 0, 0);
   const hour = new Date(Date.now() - 3_600_000).toISOString();
   const fifteen = new Date(Date.now() - 900_000).toISOString();
@@ -141,32 +148,69 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/health") return json(res, 200, {
       ok: true, version: appVersion, mode, feedStatus, feedHealth: feedHealth(), calloutStatus,
       lastEventAt, lastMintAt, indexed: store.count(), liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
-      demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors
+      demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors,
+      analyst: { status: "ready", engine: "local-grounded-v1" }
     });
     if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
+    if (url.pathname === "/api/agent/chat") {
+      const requestId = randomUUID();
+      if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
+      const rate = checkAgentRate(req.socket.remoteAddress || "unknown");
+      if (!rate.allowed) return json(res, 429, { ok: false, error: "Too many analyst requests", requestId }, { "retry-after": String(rate.retryAfter) });
+      const body = await readJsonBody(req, { maxBytes: 2_048 });
+      if (Object.keys(body).length !== 1 || !("question" in body)) throw new HttpError(400, "Request must contain only question");
+      let analysis;
+      try { analysis = analyzeSnapshot(body.question, snapshot()); }
+      catch (error) {
+        if (error instanceof TypeError || error instanceof RangeError) throw new HttpError(400, error.message);
+        throw error;
+      }
+      const evidence = analysis.evidence.map((item) => ({
+        label: item.detail || item.citation,
+        ...(item.mint ? { mint: item.mint } : {})
+      }));
+      return json(res, 200, {
+        ok: true, schemaVersion: 1, requestId, engine: "local-grounded-v1",
+        answer: analysis.answer, evidence, generatedAt: analysis.generatedAt, mode: analysis.mode,
+        meta: { mode, feedHealth: feedHealth(), lastMintAt, freshness: feedHealth() === "live" ? "fresh" : feedHealth() },
+        disclaimer: "Observational research only; not financial advice."
+      });
+    }
     if (url.pathname === "/api/stream") {
-      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-content-type-options": "nosniff", connection: "keep-alive" });
       res.write(`event: ready\ndata: ${JSON.stringify({ mode, feedStatus })}\n\n`); clients.add(res);
       req.on("close", () => clients.delete(res)); return;
     }
-    if (req.method === "POST" && url.pathname === "/api/export/daily") return json(res, 200, { ok: true, path: await exportDaily(vaultPath, snapshot()) });
+    if (req.method === "POST" && url.pathname === "/api/export/daily") { await exportDaily(vaultPath, snapshot()); return json(res, 200, { ok: true }); }
     if (req.method === "POST" && url.pathname.startsWith("/api/export/coin/")) {
       const mint = decodeURIComponent(url.pathname.split("/").pop()); const token = store.token(mint);
       if (!token) return json(res, 404, { error: "Token not found" });
-      return json(res, 200, { ok: true, path: await exportCoin(vaultPath, token) });
+      await exportCoin(vaultPath, token); return json(res, 200, { ok: true });
     }
     let target = url.pathname === "/" ? "/index.html" : url.pathname;
     target = path.normalize(target).replace(/^(\.\.(\/|\\|$))+/, "");
     const file = path.join(root, "public", target);
     if (!file.startsWith(path.join(root, "public"))) return json(res, 403, { error: "Forbidden" });
-    const body = await readFile(file); res.writeHead(200, { "content-type": types[path.extname(file)] || "application/octet-stream" }); res.end(body);
+    const body = await readFile(file);
+    res.writeHead(200, {
+      "content-type": types[path.extname(file)] || "application/octet-stream",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'self'; connect-src 'self'; img-src 'self' data: https:; style-src 'self' https://fonts.googleapis.com; style-src-attr 'unsafe-inline'; font-src https://fonts.gstatic.com; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    });
+    res.end(body);
   } catch (error) {
     if (error.code === "ENOENT") return json(res, 404, { error: "Not found" });
+    if (error instanceof HttpError) return json(res, error.status, { ok: false, error: error.message });
     console.error(error); json(res, 500, { error: "Internal error" });
   }
 });
 
-function json(res, status, value) { res.writeHead(status, { "content-type": "application/json; charset=utf-8" }); res.end(JSON.stringify(value)); }
+function json(res, status, value, headers = {}) {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers });
+  res.end(JSON.stringify(value));
+}
+server.headersTimeout = 5_000;
+server.requestTimeout = 10_000;
 server.listen(port, "0.0.0.0", () => {
   console.log(`Pump War Room v${appVersion} (${mode}) listening on http://localhost:${port}`);
   if (cleanup.tokens) console.log(`Removed ${cleanup.tokens} legacy demo tokens, ${cleanup.events} events, and ${cleanup.alerts} alerts from the live database`);

@@ -2,6 +2,12 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
+function parsePayloadRows(rows) {
+  return rows.flatMap((row) => {
+    try { return [JSON.parse(row.payload)]; } catch { return []; }
+  });
+}
+
 export class Store {
   constructor(dbPath) {
     mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -67,17 +73,18 @@ export class Store {
     this.calloutStmt.run(callout.externalId, callout.mint, JSON.stringify(callout), callout.createdAt);
   }
   tokens(limit = 100) {
-    return this.db.prepare("SELECT payload FROM tokens ORDER BY updated_at DESC LIMIT ?").all(limit).map((row) => JSON.parse(row.payload));
+    return parsePayloadRows(this.db.prepare("SELECT payload FROM tokens ORDER BY updated_at DESC LIMIT ?").all(limit));
   }
   token(mint) {
     const row = this.db.prepare("SELECT payload FROM tokens WHERE mint=?").get(mint);
-    return row ? JSON.parse(row.payload) : null;
+    if (!row) return null;
+    try { return JSON.parse(row.payload); } catch { return null; }
   }
   alerts(limit = 30) {
     return this.db.prepare("SELECT level,title,message,mint,created_at AS createdAt FROM alerts ORDER BY id DESC LIMIT ?").all(limit);
   }
   callouts(limit = 50) {
-    return this.db.prepare("SELECT payload FROM callouts ORDER BY created_at DESC LIMIT ?").all(limit).map((row) => JSON.parse(row.payload));
+    return parsePayloadRows(this.db.prepare("SELECT payload FROM callouts ORDER BY created_at DESC LIMIT ?").all(limit));
   }
   countBySource(source) {
     if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");

@@ -59,6 +59,77 @@
 
     <section id="stats" class="stats-grid"></section>
 
+    <section class="caesar-intel" aria-labelledby="caesar-intel-title">
+      <header class="caesar-intel-header">
+        <div class="caesar-identity">
+          <div class="caesar-seal" aria-hidden="true"><span>C</span></div>
+          <div>
+            <span class="kicker">IN-APP ANALYST // OBSERVATION ONLY</span>
+            <h2 id="caesar-intel-title">Caesar Intel</h2>
+            <p>Interrogate the current tape. Get a concise read with the observations behind it.</p>
+          </div>
+        </div>
+        <div class="caesar-scope" aria-label="Analyst operating constraints">
+          <span id="caesar-context-state" class="context-badge connecting"><i aria-hidden="true"></i><b>CONNECTING TAPE</b></span>
+          <span class="scope-badge">NO EXECUTION</span>
+        </div>
+      </header>
+
+      <div class="caesar-intel-grid">
+        <div class="caesar-briefing">
+          <div>
+            <span class="intel-label">QUICK BRIEFS</span>
+            <p class="briefing-copy">Choose a briefing lane or ask your own question. Caesar analyzes the War Room snapshot available at request time.</p>
+          </div>
+          <div class="quick-prompts" aria-label="Suggested questions">
+            <button type="button" class="quick-prompt" data-question="Brief the current tape. What matters right now?">
+              <span>01</span><strong>Brief the tape</strong><small>Current pulse and notable movement</small>
+            </button>
+            <button type="button" class="quick-prompt" data-question="Which observed mints have the strongest momentum, and why?">
+              <span>02</span><strong>Read momentum</strong><small>Standouts and supporting signals</small>
+            </button>
+            <button type="button" class="quick-prompt" data-question="What are the clearest risks or data gaps in the current tape?">
+              <span>03</span><strong>Scan risk</strong><small>Flags, gaps, and uncertainty</small>
+            </button>
+            <button type="button" class="quick-prompt" data-question="What narrative clusters are forming in the current tape?">
+              <span>04</span><strong>Map narratives</strong><small>Attention flow across observed mints</small>
+            </button>
+          </div>
+          <div id="caesar-guardrail" class="caesar-guardrail" role="note">
+            <span aria-hidden="true">◎</span>
+            <p><strong>Research channel only.</strong> Analysis is grounded in the current tape, may be incomplete or unverified, and is not financial advice.</p>
+          </div>
+        </div>
+
+        <div class="caesar-console">
+          <div class="console-header">
+            <span><i aria-hidden="true"></i> ANALYST TRANSCRIPT</span>
+            <span id="caesar-agent-mode">LOCAL ANALYST</span>
+          </div>
+          <ol id="caesar-transcript" class="caesar-transcript" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation with Caesar Intel">
+            <li class="intel-message assistant">
+              <div class="message-mark" aria-hidden="true">C</div>
+              <div class="message-body">
+                <div class="message-meta"><strong>CAESAR INTEL</strong><span>READY</span></div>
+                <p>Ask for a tape brief, a momentum read, visible risk flags, or a narrative map. I will cite the observations used and stay inside this War Room’s data.</p>
+              </div>
+            </li>
+          </ol>
+          <form id="caesar-form" class="caesar-form">
+            <label for="caesar-question">Question for Caesar Intel</label>
+            <div class="caesar-composer">
+              <textarea id="caesar-question" name="question" rows="2" maxlength="500" placeholder="Ask Caesar about the current tape…" aria-describedby="caesar-guardrail caesar-input-hint" required></textarea>
+              <button id="caesar-submit" type="submit"><span>ASK CAESAR</span><b aria-hidden="true">↗</b></button>
+            </div>
+            <div class="composer-meta">
+              <span id="caesar-input-hint">Enter to send · Shift+Enter for a new line</span>
+              <span id="caesar-form-status" role="status" aria-live="polite">OBSERVATION-ONLY</span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+
     <section class="workspace-grid">
       <article class="panel movers-panel">
         <header class="panel-header">

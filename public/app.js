@@ -2,8 +2,12 @@ let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, m
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let refreshInFlight = false;
+let caesarRequestPending = false;
 
 const STALE_AFTER_MS = 120_000;
+const CAESAR_MAX_QUESTION = 500;
+const CAESAR_MAX_ANSWER = 6_000;
+const CAESAR_TIMEOUT_MS = 30_000;
 const $ = (selector) => document.querySelector(selector);
 const nf = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 const hasNumber = (value) => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
@@ -36,6 +40,10 @@ const shortMint = (mint = "") => String(mint).length > 12 ? `${String(mint).slic
 const riskConfidence = (token = {}) => token.riskConfidence || (token.source === "demo" ? "synthetic" : "unverified");
 const riskLabel = (token) => riskConfidence(token) === "unverified" || !hasNumber(token.risk) ? "—" : number(token.risk);
 const fomoUrl = (mint) => `https://fomo.family/tokens/solana/${encodeURIComponent(mint)}`;
+const cappedText = (value, limit) => {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text.length > limit ? `${text.slice(0, limit).trimEnd()}… [truncated]` : text;
+};
 
 function feedTelemetry() {
   const feedHealth = state.feedHealth;
@@ -126,6 +134,7 @@ function renderFeedObservability() {
   $("#mode-state").textContent = String(state.mode || "unknown").toUpperCase();
   $("#mode-note").textContent = state.mode === "live" ? "Read-only production ingest" : "Synthetic environment";
   updateMintAge();
+  updateCaesarContextState();
 }
 
 function updateMintAge() {
@@ -219,6 +228,180 @@ function renderCallouts() {
   </a>`).join("") : `<div class="loading">${state.calloutStatus === "disabled" ? "Callout telemetry is not configured." : "Listening for observed callouts…"}</div>`;
 }
 
+function updateCaesarContextState() {
+  const badge = $("#caesar-context-state");
+  if (!badge) return;
+  const feed = healthView().label;
+  const view = state.mode !== "live"
+    ? { label: "SIMULATED TAPE", className: "simulated" }
+    : feed === "LIVE"
+      ? { label: "LIVE TAPE", className: "live" }
+      : feed === "STALE"
+        ? { label: "STALE TAPE", className: "stale" }
+        : { label: "UNVERIFIED TAPE", className: "unverified" };
+  badge.className = `context-badge ${view.className}`;
+  badge.querySelector("b").textContent = view.label;
+  badge.setAttribute("aria-label", `Analyst context: ${view.label}`);
+}
+
+function intelElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function intelTime(value) {
+  const timestamp = parseTime(value) || Date.now();
+  return new Date(timestamp).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false }) + " ET";
+}
+
+function validMint(value) {
+  const mint = typeof value === "string" ? value.trim() : "";
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ? mint : "";
+}
+
+function trimIntelTranscript(transcript) {
+  while (transcript.children.length > 24) transcript.firstElementChild?.remove();
+}
+
+function scrollIntelTranscript() {
+  const transcript = $("#caesar-transcript");
+  requestAnimationFrame(() => { transcript.scrollTop = transcript.scrollHeight; });
+}
+
+function appendIntelMessage({ role, text, evidence = [], generatedAt, error = false }) {
+  const transcript = $("#caesar-transcript");
+  const item = intelElement("li", `intel-message ${role}${error ? " error" : ""}`);
+  const mark = intelElement("div", "message-mark", role === "user" ? "U" : error ? "!" : "C");
+  mark.setAttribute("aria-hidden", "true");
+  const body = intelElement("div", "message-body");
+  const meta = intelElement("div", "message-meta");
+  meta.append(intelElement("strong", "", role === "user" ? "YOU" : error ? "CHANNEL NOTICE" : "CAESAR INTEL"));
+  meta.append(intelElement("span", "", intelTime(generatedAt)));
+  body.append(meta, intelElement("p", "", cappedText(text, role === "user" ? CAESAR_MAX_QUESTION : CAESAR_MAX_ANSWER)));
+
+  if (role === "assistant" && !error) {
+    const grounding = intelElement("div", "message-grounding");
+    grounding.setAttribute("aria-label", "Tape observations cited by Caesar Intel");
+    grounding.append(intelElement("span", "grounding-label", "GROUNDING"));
+    const records = Array.isArray(evidence) ? evidence.slice(0, 8) : [];
+    const validRecords = records.filter((record) => record && typeof record === "object" && typeof record.label === "string" && record.label.trim());
+    if (!validRecords.length) {
+      grounding.append(intelElement("span", "grounding-empty", "NO CITED TAPE OBSERVATIONS"));
+    } else {
+      const chips = intelElement("div", "evidence-chips");
+      for (const record of validRecords) {
+        const chip = intelElement("span", "evidence-chip");
+        chip.append(intelElement("b", "", cappedText(record.label, 100)));
+        const mint = validMint(record.mint);
+        if (mint) chip.append(intelElement("small", "", shortMint(mint)));
+        chips.append(chip);
+      }
+      grounding.append(chips);
+    }
+    body.append(grounding);
+  }
+
+  item.append(mark, body);
+  transcript.append(item);
+  trimIntelTranscript(transcript);
+  scrollIntelTranscript();
+  return item;
+}
+
+function appendIntelLoading() {
+  const transcript = $("#caesar-transcript");
+  const item = intelElement("li", "intel-message assistant pending");
+  item.dataset.state = "loading";
+  const mark = intelElement("div", "message-mark", "C");
+  mark.setAttribute("aria-hidden", "true");
+  const body = intelElement("div", "message-body");
+  const meta = intelElement("div", "message-meta");
+  meta.append(intelElement("strong", "", "CAESAR INTEL"), intelElement("span", "", "ANALYZING"));
+  body.append(meta, intelElement("p", "thinking-line", "Reading the current tape"));
+  item.append(mark, body);
+  transcript.append(item);
+  scrollIntelTranscript();
+  return item;
+}
+
+function setCaesarStatus(message, kind = "") {
+  const status = $("#caesar-form-status");
+  status.textContent = message;
+  status.dataset.state = kind;
+}
+
+function setCaesarBusy(busy) {
+  caesarRequestPending = busy;
+  $("#caesar-form").setAttribute("aria-busy", String(busy));
+  $("#caesar-transcript").setAttribute("aria-busy", String(busy));
+  $("#caesar-question").disabled = busy;
+  $("#caesar-submit").disabled = busy;
+  document.querySelectorAll(".quick-prompt").forEach((button) => { button.disabled = busy; });
+}
+
+function caesarAnswer(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const candidates = [payload.answer, payload.response, payload.message, payload.data?.answer];
+  return cappedText(candidates.find((candidate) => typeof candidate === "string") || "", CAESAR_MAX_ANSWER);
+}
+
+function caesarErrorMessage(status, timedOut) {
+  if (timedOut) return "The briefing timed out before the tape could be analyzed. Try again.";
+  if (status === 400 || status === 422) return "Caesar could not parse that request. Rephrase it and try again.";
+  if (status === 401 || status === 403) return "The analyst channel is not available in this session.";
+  if (status === 429) return "Caesar is handling another briefing. Wait a moment and try again.";
+  if (status >= 500) return "Caesar Intel is temporarily offline. The dashboard remains available; try again shortly.";
+  return "The analyst channel was interrupted. Check your connection and try again.";
+}
+
+async function askCaesar(question) {
+  const submittedQuestion = String(question || "").trim().slice(0, CAESAR_MAX_QUESTION);
+  if (!submittedQuestion || caesarRequestPending) {
+    if (!submittedQuestion) {
+      setCaesarStatus("ENTER A QUESTION", "error");
+      $("#caesar-question").focus();
+    }
+    return;
+  }
+
+  appendIntelMessage({ role: "user", text: submittedQuestion });
+  $("#caesar-question").value = "";
+  setCaesarBusy(true);
+  setCaesarStatus("ANALYZING CURRENT TAPE", "loading");
+  const loadingMessage = appendIntelLoading();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CAESAR_TIMEOUT_MS);
+  let responseStatus = 0;
+
+  try {
+    const response = await fetch("/api/agent/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ question: submittedQuestion }),
+      signal: controller.signal
+    });
+    responseStatus = response.status;
+    const payload = await response.json();
+    const answer = caesarAnswer(payload);
+    if (!response.ok || payload?.ok === false || !answer) throw new Error("request-failed");
+    loadingMessage.remove();
+    appendIntelMessage({ role: "assistant", text: answer, evidence: payload.evidence, generatedAt: payload.generatedAt });
+    $("#caesar-agent-mode").textContent = payload.mode === "local" ? "LOCAL ANALYST" : "ANALYST";
+    setCaesarStatus("BRIEF READY", "ready");
+  } catch (error) {
+    loadingMessage.remove();
+    const timedOut = error?.name === "AbortError";
+    appendIntelMessage({ role: "assistant", text: caesarErrorMessage(responseStatus, timedOut), error: true });
+    setCaesarStatus("CHANNEL INTERRUPTED", "error");
+  } finally {
+    clearTimeout(timeout);
+    setCaesarBusy(false);
+    $("#caesar-question").focus();
+  }
+}
+
 function render() {
   $("#app-version").textContent = `v${state.version || "—"}`;
   renderFeedObservability();
@@ -299,6 +482,24 @@ $("#export-daily").onclick = async () => {
     toast(result.ok ? "Daily brief exported to the vault" : "Export failed");
   } catch { toast("Export failed"); }
 };
+
+$("#caesar-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  askCaesar($("#caesar-question").value);
+});
+$("#caesar-question").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    $("#caesar-form").requestSubmit();
+  }
+});
+$("#caesar-question").addEventListener("input", () => {
+  if (!caesarRequestPending) setCaesarStatus("OBSERVATION-ONLY");
+});
+document.querySelectorAll(".quick-prompt").forEach((button) => button.addEventListener("click", () => {
+  $("#caesar-question").value = String(button.dataset.question || "").slice(0, CAESAR_MAX_QUESTION);
+  $("#caesar-form").requestSubmit();
+}));
 
 function tickClock() {
   $("#clock").textContent = `${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false })} ET`;
