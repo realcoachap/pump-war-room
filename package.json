@@ -1,0 +1,17 @@
+{
+  "name": "opencaesar-pump-war-room",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Pump.fun intelligence radar with live/demo modes and Obsidian exports.",
+  "scripts": {
+    "start": "node src/server.js",
+    "demo": "PUMP_MODE=demo node src/server.js",
+    "live": "PUMP_MODE=live node src/server.js",
+    "test": "node --test",
+    "screenshot": "mkdir -p screenshots && playwright screenshot -b chromium --full-page --viewport-size=1440,1100 --wait-for-selector=.token-row http://127.0.0.1:4173 screenshots/dashboard-desktop.png && playwright screenshot -b chromium --full-page --viewport-size=390,844 --wait-for-selector=.token-row http://127.0.0.1:4173 screenshots/dashboard-mobile.png"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

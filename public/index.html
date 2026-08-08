@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090b10">
+  <title>Pump War Room — OpenCaesar</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <header class="topbar">
+    <div class="brand">
+      <div class="sigil">C</div>
+      <div><strong>PUMP WAR ROOM</strong><span>OPENCAESAR INTELLIGENCE</span></div>
+    </div>
+    <div class="statusbar">
+      <span class="live-dot"></span><span id="feed-status">CONNECTING</span>
+      <span class="divider"></span><span id="clock">--:--:-- ET</span>
+      <button id="export-daily" class="quiet-button">EXPORT BRIEF</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <p class="eyebrow">SOLANA MEMECOIN INTELLIGENCE // READ-ONLY</p>
+        <h1>The tape, without<br><em>the noise.</em></h1>
+        <p class="lede">New launches, velocity, risk, graduations, and narratives—distilled into signals humans can inspect.</p>
+      </div>
+      <div class="pulse-orbit" aria-hidden="true"><i></i><b></b><span>PUMP<br>RADAR</span></div>
+    </section>
+
+    <section id="stats" class="stats-grid"></section>
+
+    <section class="workspace-grid">
+      <article class="panel movers-panel">
+        <header class="panel-header">
+          <div><span class="kicker">LIVE RANKING</span><h2>What’s moving</h2></div>
+          <div class="tabs"><button class="active">Momentum</button><button>Newest</button></div>
+        </header>
+        <div class="table-head"><span>Asset</span><span>Signal</span><span>5m volume</span><span>Curve</span><span>Risk</span></div>
+        <div id="tokens" class="token-list"><div class="loading">Acquiring tape…</div></div>
+      </article>
+
+      <aside class="right-rail">
+        <article class="panel">
+          <header class="panel-header"><div><span class="kicker">ATTENTION FLOW</span><h2>Narrative radar</h2></div></header>
+          <div id="narratives" class="narrative-list"></div>
+        </article>
+        <article class="panel alert-panel">
+          <header class="panel-header"><div><span class="kicker">SIGNAL TAPE</span><h2>Alerts</h2></div><span class="count-badge" id="alert-count">0</span></header>
+          <div id="alerts" class="alert-list"></div>
+        </article>
+      </aside>
+    </section>
+
+    <footer><span>NO WALLET · NO EXECUTION · NO PRICE PROMISES</span><span>Signals are transparent heuristics, not financial advice.</span></footer>
+  </main>
+
+  <dialog id="token-dialog">
+    <button class="dialog-close" aria-label="Close">×</button>
+    <div id="token-detail"></div>
+  </dialog>
+  <div id="toast" role="status"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
