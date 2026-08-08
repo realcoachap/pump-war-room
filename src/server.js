@@ -10,6 +10,7 @@ import { BarkCalloutIngestor } from "./callouts.js";
 import { exportCoin, exportDaily } from "./vault.js";
 import { analyzeSnapshot } from "./analyst.js";
 import { createRateLimiter, HttpError, readJsonBody } from "./http.js";
+import { createTop100 } from "./ranking.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
@@ -98,12 +99,29 @@ function snapshot() {
     row.coins++; row.volume += token.volume5m || 0; row.momentum += token.momentum || 0;
     return acc;
   }, {})).map((row) => ({ ...row, momentum: Math.round(row.momentum / row.coins) })).sort((a, b) => b.volume - a.volume);
+  const top100 = createTop100(tokens, { mode });
+  const generatedAt = new Date().toISOString();
   return {
     version: appVersion, mode, feedStatus, feedHealth: feedHealth(), calloutStatus, lastEventAt, lastMintAt,
     liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
     demoPurged: mode === "live", demoPurgedCount: cleanup.tokens, reconnects, feedMessages, feedParseErrors,
     stats: { indexed: store.count(), mintedToday: store.countSince(start.toISOString()), lastHour: store.countSince(hour), last15m: store.countSince(fifteen), graduations: tokens.filter((t) => t.status === "graduated").length, calloutsLastHour: store.calloutCountSince(hour) },
-    tokens, narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
+    tokens,
+    leaderboard: {
+      schemaVersion: 1,
+      mode,
+      generatedAt,
+      sourceObservedAt: lastMintAt,
+      freshness: feedHealth(),
+      source: mode === "live" ? "pumpportal" : "demo",
+      universe: mode === "live" ? "Pump.fun tokens observed by this service" : "simulated tokens observed by this service",
+      scope: mode === "live" ? "observed-by-this-war-room" : "simulated-feed",
+      rankingBasis: "momentum, curve progress, buyer breadth, freshness, and verified-risk adjustment",
+      ranking: { metric: "radar_score_v1", eligibilityVersion: "observed_feed_v1", eligibleCount: top100.length, limit: 100 },
+      outcomeTracking: "Returns remain unavailable until trusted follow-up price observations exist.",
+      top100
+    },
+    narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
   };
 }
 

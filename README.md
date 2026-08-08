@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.4.0**
+Current release: **v0.5.0**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes activated onchain launches, ranks momentum and risk with inspectable heuristics, surfaces narrative velocity and graduations, emits Telegram-ready alerts, and exports curated notes to an Obsidian-compatible vault.
 
@@ -45,6 +45,7 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 - Live-mode startup cleanup that removes legacy synthetic demo rows without touching verified live records or callouts
 - Feed telemetry that distinguishes an open socket from verified mint activity and reports stale or malformed upstream data
 - Caesar Intel, a zero-cost in-app analyst grounded only in the current War Room snapshot, with evidence links and no execution capabilities
+- Top 100 Radar, scoped to coins observed by this War Room, with searchable ranking lenses, explicit freshness and risk confidence, and honest 5m/15m/1h/6h/24h outcome states
 - Mint counters for today, 60 minutes, and 15 minutes
 - Transparent momentum and risk scores—open `src/signals.js` to inspect the formula
 - Mint fingerprints on every row so same-name launches cannot be mistaken for the same contract
@@ -61,6 +62,8 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 
 - `GET /api/health`
 - `GET /api/snapshot`
+
+The snapshot includes a versioned `leaderboard` envelope. In live mode it admits only validated PumpPortal mints and caps results at 100. Outcome returns remain `unavailable` until verified follow-up price observations exist; the service never substitutes missing prices or inferred returns.
 - `GET /api/stream` (server-sent events)
 - `POST /api/agent/chat` with JSON `{ "question": "What is moving?" }`
 - `POST /api/export/daily`

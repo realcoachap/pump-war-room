@@ -1,4 +1,4 @@
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let refreshInFlight = false;
@@ -190,6 +190,56 @@ function renderTokens() {
     </div>`;
   }).join("");
   document.querySelectorAll(".token-row").forEach((row) => row.addEventListener("click", () => openToken(row.dataset.mint)));
+}
+
+function outcomeCell(entry, window) {
+  const outcome = entry?.outcome?.windows?.[window];
+  if (!outcome || outcome.status !== "observed" || !hasNumber(outcome.returnPct)) return '<span class="outcome-unavailable" title="No verified follow-up price observation">—</span>';
+  const value = number(outcome.returnPct);
+  return `<span class="outcome-value ${value < 0 ? "negative" : "positive"}">${value >= 0 ? "+" : ""}${Math.round(value * 10) / 10}%</span>`;
+}
+
+function leaderboardEntries() {
+  const entries = Array.isArray(state.leaderboard?.top100) ? [...state.leaderboard.top100] : [];
+  const query = String($("#leaderboard-search")?.value || "").trim().toLowerCase();
+  const freshness = $("#leaderboard-freshness")?.value || "all";
+  const risk = $("#leaderboard-risk")?.value || "all";
+  const lens = $("#leaderboard-lens")?.value || "radar";
+  const filtered = entries.filter((entry) => {
+    const token = entry.token || {};
+    const haystack = `${token.name || ""} ${token.symbol || ""} ${token.mint || ""}`.toLowerCase();
+    return (!query || haystack.includes(query)) && (freshness === "all" || entry.freshness?.state === freshness) && (risk === "all" || entry.riskConfidence === risk);
+  });
+  const value = (entry) => lens === "momentum" ? number(entry.token?.momentum, -1) : lens === "newest" ? (parseTime(entry.token?.createdAt) || 0) : lens === "curve" ? number(entry.token?.bondingProgress, -1) : number(entry.score, -1);
+  return filtered.sort((a, b) => value(b) - value(a) || number(a.rank) - number(b.rank));
+}
+
+function renderLeaderboard() {
+  const source = Array.isArray(state.leaderboard?.top100) ? state.leaderboard.top100 : [];
+  const entries = leaderboardEntries();
+  $("#leaderboard-count").textContent = nf.format(source.length);
+  $("#leaderboard-updated").textContent = state.leaderboard?.generatedAt ? `UPDATED ${ageLabel(state.leaderboard.generatedAt)}` : "WAITING FOR TAPE";
+  $("#leaderboard-summary").textContent = source.length
+    ? `${entries.length} visible of ${source.length} ranked observations · ${state.leaderboard.rankingBasis || "inspectable live-feed signals"}.`
+    : "Ranking the live-feed observations we can support—never claiming the entire market.";
+  if (!entries.length) {
+    $("#leaderboard-rows").innerHTML = source.length ? '<div class="leaderboard-empty">No observed coins match these filters.</div>' : emptyTape();
+    return;
+  }
+  $("#leaderboard-rows").innerHTML = entries.map((entry) => {
+    const token = entry.token || {};
+    const symbol = String(token.symbol || "??");
+    const reason = Array.isArray(entry.reasons) ? entry.reasons.slice(0, 2).join(" · ") : "Observed-feed ranking";
+    return `<button type="button" class="leaderboard-row" data-mint="${esc(token.mint)}" aria-label="Open ${esc(token.name || symbol)} details">
+      <span class="leaderboard-rank">${number(entry.rank)}</span>
+      <span class="leaderboard-asset"><i>${esc(symbol.slice(0, 2))}</i><span><b>${esc(token.name || "Unnamed mint")} <em>${esc(symbol)}</em></b><small>${esc(shortMint(token.mint))} · ${esc(reason)}</small></span></span>
+      <span class="leaderboard-score"><b>${number(entry.score).toFixed(1)}</b><small>/100</small></span>
+      <span class="freshness ${esc(entry.freshness?.state || "unverified")}">${esc(entry.freshness?.state || "unverified")}<small>${entry.freshness?.ageSeconds === null ? "—" : ago(entry.freshness?.observedAt)}</small></span>
+      <span class="confidence ${esc(entry.riskConfidence || "unverified")}">${esc(entry.riskConfidence || "unverified")}</span>
+      ${outcomeCell(entry, "5m")}${outcomeCell(entry, "1h")}${outcomeCell(entry, "24h")}
+    </button>`;
+  }).join("");
+  document.querySelectorAll(".leaderboard-row").forEach((row) => row.addEventListener("click", () => openToken(row.dataset.mint)));
 }
 
 function narrativeRows() {
@@ -406,6 +456,7 @@ function render() {
   $("#app-version").textContent = `v${state.version || "—"}`;
   renderFeedObservability();
   renderStats();
+  renderLeaderboard();
   renderTokens();
   renderCallouts();
   renderNarratives();
@@ -426,7 +477,8 @@ async function refresh() {
       alerts: Array.isArray(snapshot.alerts) ? snapshot.alerts : [],
       callouts: Array.isArray(snapshot.callouts) ? snapshot.callouts : [],
       narratives: Array.isArray(snapshot.narratives) ? snapshot.narratives : [],
-      stats: snapshot.stats && typeof snapshot.stats === "object" ? snapshot.stats : {}
+      stats: snapshot.stats && typeof snapshot.stats === "object" ? snapshot.stats : {},
+      leaderboard: snapshot.leaderboard && typeof snapshot.leaderboard === "object" ? snapshot.leaderboard : { top100: [] }
     };
     snapshotFailed = false;
     render();
@@ -500,6 +552,9 @@ document.querySelectorAll(".quick-prompt").forEach((button) => button.addEventLi
   $("#caesar-question").value = String(button.dataset.question || "").slice(0, CAESAR_MAX_QUESTION);
   $("#caesar-form").requestSubmit();
 }));
+for (const id of ["leaderboard-search", "leaderboard-lens", "leaderboard-freshness", "leaderboard-risk"]) {
+  $(`#${id}`).addEventListener(id === "leaderboard-search" ? "input" : "change", renderLeaderboard);
+}
 
 function tickClock() {
   $("#clock").textContent = `${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false })} ET`;

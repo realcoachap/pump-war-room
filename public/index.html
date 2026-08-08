@@ -130,6 +130,28 @@
       </div>
     </section>
 
+    <section class="leaderboard panel" aria-labelledby="leaderboard-title">
+      <header class="leaderboard-header">
+        <div>
+          <span class="kicker">OBSERVED BY THIS WAR ROOM // READ-ONLY</span>
+          <h2 id="leaderboard-title">Top 100 Radar</h2>
+          <p id="leaderboard-summary">Ranking the live-feed observations we can support—never claiming the entire market.</p>
+        </div>
+        <div class="leaderboard-meta"><strong id="leaderboard-count">0</strong><span>OBSERVED COINS</span><small id="leaderboard-updated">WAITING FOR TAPE</small></div>
+      </header>
+      <form id="leaderboard-controls" class="leaderboard-controls" role="search">
+        <label class="radar-search"><span>SEARCH</span><input id="leaderboard-search" type="search" maxlength="80" placeholder="Name, ticker, or mint"></label>
+        <label><span>RANKING LENS</span><select id="leaderboard-lens"><option value="radar">Radar score</option><option value="momentum">Momentum</option><option value="newest">Newest</option><option value="curve">Near graduation</option></select></label>
+        <label><span>FRESHNESS</span><select id="leaderboard-freshness"><option value="all">All observations</option><option value="fresh">Fresh</option><option value="aging">Aging</option><option value="stale">Stale</option></select></label>
+        <label><span>RISK CONFIDENCE</span><select id="leaderboard-risk"><option value="all">All confidence</option><option value="verified">Verified</option><option value="unverified">Unverified</option></select></label>
+      </form>
+      <div class="leaderboard-scope" role="note"><b>Scope:</b> strict observed-feed inventory. Outcome windows show <strong>—</strong> until verified follow-up prices exist; missing data is never interpreted as performance.</div>
+      <div class="leaderboard-table" role="region" aria-label="Top 100 observed coins" tabindex="0">
+        <div class="leaderboard-columns" aria-hidden="true"><span>#</span><span>Asset / rank reason</span><span>Radar</span><span>Freshness</span><span>Risk</span><span>5m</span><span>1h</span><span>24h</span></div>
+        <div id="leaderboard-rows"><div class="loading">Building observed-feed ranking…</div></div>
+      </div>
+    </section>
+
     <section class="workspace-grid">
       <article class="panel movers-panel">
         <header class="panel-header">
