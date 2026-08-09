@@ -28,6 +28,7 @@ import {
   buildCoinComparison,
   buildCoinTimeline,
   buildMeasuredBrief,
+  CLOSED_BRIEF_METHOD_VERSION,
   detectMaterialAlerts,
   sendTelegramAlert,
   telegramAlertStatus,
@@ -456,7 +457,8 @@ function snapshot() {
     const periodEnd = new Date(periodEndMs).toISOString();
     const periodStart = new Date(periodEndMs - durationMs).toISOString();
     const existing = store.briefRun(period);
-    if (existing?.periodStart === periodStart && existing.periodEnd === periodEnd) return existing.model;
+    if (existing?.methodVersion === CLOSED_BRIEF_METHOD_VERSION
+      && existing.periodStart === periodStart && existing.periodEnd === periodEnd) return existing.model;
     const activity = store.periodActivity({
       start: periodStart,
       end: periodEnd,

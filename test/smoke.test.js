@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 
-const version = "0.8.0";
+const version = "0.8.1";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -26,8 +26,8 @@ function measuredBrief(period) {
     cohortDrops: { outcome: null, risk: null, reason: "unavailable" }
   };
   return {
-    schemaVersion: 1, methodVersion: "measured-closed-brief-v1",
-    briefId: `measured-closed-brief-v1:${period}:${start}:${end}:UTC`, period,
+    schemaVersion: 1, methodVersion: "measured-closed-brief-v2",
+    briefId: `measured-closed-brief-v2:${period}:${start}:${end}:UTC`, period,
     generatedAt: "2026-08-08T12:00:00.000Z", windowStart: start, windowEnd: end, timezone: "UTC",
     feedCoverage: "unmeasured", source: "pumpportal observations plus GeckoTerminal completed-candle outcomes",
     universe: "closed-period deployment-local activity", activity,
@@ -130,7 +130,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         source: "geckoterminal", status: "observing", queueDepth: 2,
         lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 30,
         successStaleAfterSeconds: 22_500, lastSuccessIsStale: false,
-        persistence: { attemptCount: 2, successfulStateCount: 1 },
+        successFreshnessBasis: "provider-success-age-while-scheduled-work-is-due",
+        persistence: { attemptCount: 2, successfulStateCount: 1, dueStateCount: 2 },
         counters: { attempts: 2, successes: 1, consecutiveFailures: 0 }
       },
       riskIntelligence: {
@@ -291,7 +292,8 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   });
   assert.deepEqual(result.markers, {
     version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
-    actionableIntelligence: true, parserRevision: true, legalNotices: true
+    actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
+    parserRevision: true, legalNotices: true
   });
 });
 
@@ -304,6 +306,28 @@ test("fails when the current parser revision marker is absent", async (t) => {
   await assert.rejects(
     runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
     (error) => error instanceof SmokeCheckError && error.check === "snapshot" && /parser revision/.test(error.message)
+  );
+});
+
+test("fails when a measured brief retains a legacy alert in its material denominator", async (t) => {
+  const corruptBrief = (body) => {
+    const brief = JSON.parse(body);
+    brief.activity.materialAlerts = 1;
+    brief.activity.materialByKind = { legacy: 1 };
+    brief.activity.telegramDelivery = { "not-queued": 1 };
+    return JSON.stringify(brief);
+  };
+  const baseUrl = await fixture(t, {
+    "/api/briefs/daily": corruptBrief,
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.actionIntelligence.briefs.daily.activity.materialAlerts = 1;
+      snapshot.actionIntelligence.briefs.daily.activity.materialByKind = { legacy: 1 };
+      snapshot.actionIntelligence.briefs.daily.activity.telegramDelivery = { "not-queued": 1 };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && /pre-policy kind/.test(error.message)
   );
 });
 
@@ -483,7 +507,8 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
       source: "geckoterminal", status: "idle", queueDepth: 0,
       lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 3_600,
       successStaleAfterSeconds: 22_500, lastSuccessIsStale: false,
-      persistence: { attemptCount: 7, successfulStateCount: 1 },
+      successFreshnessBasis: "provider-success-age-while-scheduled-work-is-due",
+      persistence: { attemptCount: 7, successfulStateCount: 1, dueStateCount: 0 },
       counters: { attempts: 0, successes: 0, consecutiveFailures: 0 }
     },
     riskIntelligence: {
@@ -510,6 +535,42 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
   const baseUrl = await fixture(t, { "/api/health": JSON.stringify(health) });
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
   assert.equal(result.ok, true);
+});
+
+test("accepts old outcome success evidence while every persisted horizon is scheduled for the future", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => {
+      health.outcomes.status = "idle";
+      health.outcomes.queueDepth = 0;
+      health.outcomes.lastSuccessAgeSeconds = 27_600;
+      health.outcomes.successStaleAfterSeconds = 22_500;
+      health.outcomes.successFreshnessBasis = "provider-success-age-while-scheduled-work-is-due";
+      health.outcomes.lastSuccessIsStale = false;
+      health.outcomes.persistence.dueStateCount = 0;
+      health.outcomes.counters = { attempts: 0, successes: 0, consecutiveFailures: 0 };
+    })
+  });
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
+  assert.equal(result.ok, true);
+});
+
+test("fails when overdue outcome work has only stale provider success evidence", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => {
+      health.outcomes.status = "idle";
+      health.outcomes.queueDepth = 0;
+      health.outcomes.lastSuccessAgeSeconds = 27_600;
+      health.outcomes.successStaleAfterSeconds = 22_500;
+      health.outcomes.successFreshnessBasis = "provider-success-age-while-scheduled-work-is-due";
+      health.outcomes.lastSuccessIsStale = true;
+      health.outcomes.persistence.dueStateCount = 1;
+      health.outcomes.counters = { attempts: 0, successes: 0, consecutiveFailures: 0 };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health" && /success evidence is stale/.test(error.message)
+  );
 });
 
 test("fails when only historical risk successes exist after a process restart", async (t) => {

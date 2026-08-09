@@ -413,6 +413,33 @@ test("restart health reports fresh persisted provider attempts while runtime cou
   assert.equal(status.counters.successes, 0);
 });
 
+test("outcome freshness stays healthy while the next scheduled horizon is in the future and fails once work is overdue", () => {
+  const clock = Date.parse("2026-08-08T20:00:00.000Z");
+  const store = memoryStore();
+  store.upsertEnrichmentState({
+    mint, provider: "geckoterminal", pool, tokenSide: "base", status: "observing",
+    attemptCount: 4, lastAttemptAt: "2026-08-08T12:20:00.000Z",
+    lastSuccessAt: "2026-08-08T12:20:00.000Z", nextAttemptAt: "2026-08-09T12:01:30.000Z"
+  });
+  const ingestor = new VerifiedOutcomeIngestor({
+    store,
+    client: { poolForToken() {}, ohlcv() {} },
+    now: () => clock
+  });
+
+  const scheduled = ingestor.getStatus();
+  assert.equal(scheduled.lastSuccessAgeSeconds, 27_600);
+  assert.equal(scheduled.successStaleAfterSeconds, 22_500);
+  assert.equal(scheduled.successFreshnessBasis, "provider-success-age-while-scheduled-work-is-due");
+  assert.equal(scheduled.persistence.dueStateCount, 0);
+  assert.equal(scheduled.lastSuccessIsStale, false);
+
+  store.states.get(mint).nextAttemptAt = "2026-08-08T19:59:00.000Z";
+  const overdue = ingestor.getStatus();
+  assert.equal(overdue.persistence.dueStateCount, 1);
+  assert.equal(overdue.lastSuccessIsStale, true);
+});
+
 test("schedules the next outcome maturity and validates queue inputs", () => {
   assert.equal(nextOutcomeAttemptAt("2026-08-08T12:00:00Z", NOW), "2026-08-08T13:01:30.000Z");
   const store = memoryStore();

@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
 
-export const STORE_SCHEMA_VERSION = 800;
+export const STORE_SCHEMA_VERSION = 801;
 
 const MAX_ENRICHMENT_QUERY = 200;
 const MAX_EVIDENCE_BYTES = 64 * 1_024;
@@ -59,6 +59,26 @@ const GECKOTERMINAL_MISSING_REASONS = new Set([
   ...OUTCOME_REASONS
 ]);
 const RISK_IDENTITY_STATUSES = new Set(["queued", "available", "unavailable", "degraded", "rate-limited", "invalid-response"]);
+const MATERIAL_ALERT_KINDS = Object.freeze([
+  "score-rise", "score-drop", "risk-concentration", "risk-developer-holding",
+  "risk-identity-reuse", "risk-creator-history", "migration-observed"
+]);
+const RFC3339_MILLIS_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z";
+const canonicalTimestampSql = (column) => `(${column} GLOB '${RFC3339_MILLIS_GLOB}'
+  AND strftime('%Y-%m-%dT%H:%M:%fZ',${column})=${column})`;
+const TELEGRAM_NEXT_ATTEMPT_IS_CANONICAL_SQL = canonicalTimestampSql("telegram_next_attempt_at");
+const TELEGRAM_OUTBOX_CHECK_SQL = `CHECK (
+  (telegram_status IS NULL AND telegram_attempted_at IS NULL AND telegram_message_id IS NULL
+    AND telegram_attempt_count=0 AND telegram_next_attempt_at IS NULL AND telegram_last_error_code IS NULL)
+  OR (telegram_status='pending' AND telegram_attempted_at IS NULL AND telegram_message_id IS NULL
+    AND telegram_attempt_count=0 AND coalesce(${TELEGRAM_NEXT_ATTEMPT_IS_CANONICAL_SQL},0)=1 AND telegram_last_error_code IS NULL)
+  OR (telegram_status='retrying' AND telegram_attempted_at IS NOT NULL AND telegram_message_id IS NULL
+    AND telegram_attempt_count>=1 AND coalesce(${TELEGRAM_NEXT_ATTEMPT_IS_CANONICAL_SQL},0)=1 AND telegram_last_error_code IS NOT NULL)
+  OR (telegram_status='sent' AND telegram_attempted_at IS NOT NULL AND telegram_message_id IS NOT NULL
+    AND telegram_attempt_count>=1 AND telegram_next_attempt_at IS NULL AND telegram_last_error_code IS NULL)
+  OR (telegram_status='dead-letter' AND telegram_attempted_at IS NOT NULL AND telegram_message_id IS NULL
+    AND telegram_attempt_count>=1 AND telegram_next_attempt_at IS NULL AND telegram_last_error_code IS NOT NULL)
+)`;
 
 function scalarEvidenceKey(schema) {
   if (typeof schema !== "string" || !schema.startsWith("scalar:")) return null;
@@ -541,7 +561,8 @@ export class Store {
         kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
         dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
         telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        ${TELEGRAM_OUTBOX_CHECK_SQL}
       );
       CREATE TABLE IF NOT EXISTS callouts (
         external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
@@ -615,13 +636,20 @@ export class Store {
           kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
           dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
           telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
-          created_at TEXT NOT NULL
+          created_at TEXT NOT NULL,
+          ${TELEGRAM_OUTBOX_CHECK_SQL}
         );
         INSERT INTO alerts
           (id,level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,telegram_attempted_at,
            telegram_message_id,telegram_attempt_count,telegram_next_attempt_at,telegram_last_error_code,created_at)
           SELECT id,level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,telegram_attempted_at,
-                 telegram_message_id,telegram_attempt_count,telegram_next_attempt_at,telegram_last_error_code,created_at
+                 telegram_message_id,telegram_attempt_count,
+                 CASE WHEN telegram_status IN ('pending','retrying')
+                   AND NOT coalesce(${TELEGRAM_NEXT_ATTEMPT_IS_CANONICAL_SQL},0)
+                   THEN CASE WHEN ${canonicalTimestampSql("created_at")} THEN created_at
+                     ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END
+                   ELSE telegram_next_attempt_at END,
+                 telegram_last_error_code,created_at
           FROM alerts_schema_legacy;
         DROP TABLE alerts_schema_legacy;
         `);
@@ -678,7 +706,8 @@ export class Store {
       (brief_key,kind,period_start,period_end,timezone,method_version,provider,data_cutoff,model,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?)`);
     this.briefByKeyStmt = this.db.prepare("SELECT * FROM brief_runs WHERE brief_key=?");
-    this.briefLatestStmt = this.db.prepare("SELECT * FROM brief_runs WHERE kind=? ORDER BY period_end DESC LIMIT 1");
+    this.briefLatestStmt = this.db.prepare(`SELECT * FROM brief_runs WHERE kind=?
+      ORDER BY period_end DESC,created_at DESC,brief_key DESC LIMIT 1`);
     this.enrichmentSelectStmt = this.db.prepare("SELECT * FROM outcome_enrichment WHERE mint=?");
     this.enrichmentInsertStmt = this.db.prepare(`INSERT INTO outcome_enrichment
       (mint,provider,pool,token_side,dex,source_url,evidence,status,missing_reason,error_code,attempt_count,last_attempt_at,next_attempt_at,last_success_at,updated_at)
@@ -888,12 +917,15 @@ export class Store {
     const normalizedAttemptedAt = timestamp(attemptedAt, "Telegram attemptedAt");
     const normalizedMessageId = messageId == null ? null : boundedInteger(messageId, "Telegram message id", { min: 1 });
     if (normalizedStatus === "sent" && normalizedMessageId === null) throw new TypeError("sent Telegram delivery requires a message id");
+    if (normalizedStatus !== "sent" && normalizedMessageId !== null) throw new TypeError("unsent Telegram delivery must not retain a message id");
     const normalizedNextAttemptAt = nextAttemptAt == null ? null : timestamp(nextAttemptAt, "Telegram nextAttemptAt");
     const normalizedErrorCode = text(errorCode, "Telegram error code", { max: 64, optional: true, code: true })?.toLowerCase() ?? null;
     if (normalizedStatus === "retrying" && (normalizedNextAttemptAt === null || normalizedErrorCode === null)) {
       throw new TypeError("retrying Telegram delivery requires nextAttemptAt and errorCode");
     }
-    if (normalizedStatus === "dead-letter" && normalizedErrorCode === null) throw new TypeError("dead-letter Telegram delivery requires errorCode");
+    if (normalizedStatus === "dead-letter" && (normalizedNextAttemptAt !== null || normalizedErrorCode === null)) {
+      throw new TypeError("dead-letter Telegram delivery requires errorCode and no nextAttemptAt");
+    }
     if (normalizedStatus === "sent" && (normalizedNextAttemptAt !== null || normalizedErrorCode !== null)) {
       throw new TypeError("sent Telegram delivery must not retain retry evidence");
     }
@@ -909,8 +941,10 @@ export class Store {
     return this.alertDeliveryDueStmt.all(normalizedNow, normalizedLimit);
   }
   telegramDeliveryCoverage() {
+    const materialKindPlaceholders = MATERIAL_ALERT_KINDS.map(() => "?").join(",");
     const rows = this.db.prepare(`SELECT coalesce(telegram_status,'not-queued') AS status,count(*) AS count
-      FROM alerts GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`).all();
+      FROM alerts WHERE kind IN (${materialKindPlaceholders})
+      GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`).all(...MATERIAL_ALERT_KINDS);
     return { total: rows.reduce((total, row) => total + Number(row.count), 0), statusCounts: Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])) };
   }
   upsertCallout(callout) {
@@ -1171,7 +1205,9 @@ export class Store {
     if (normalizedCutoff < normalizedEnd) throw new RangeError("brief dataCutoff must not precede periodEnd");
     if (timezone !== "UTC") throw new TypeError("brief timezone must be UTC");
     const normalizedMethod = text(methodVersion, "brief methodVersion", { max: 64, code: true });
-    if (normalizedMethod !== "measured-closed-brief-v1") throw new TypeError("brief methodVersion is unsupported");
+    if (!["measured-closed-brief-v1", "measured-closed-brief-v2"].includes(normalizedMethod)) {
+      throw new TypeError("brief methodVersion is unsupported");
+    }
     const normalizedProvider = text(provider, "brief provider", { max: 64, code: true }).toLowerCase();
     validateBriefModel(model);
     const encoded = JSON.stringify(model);
@@ -1201,20 +1237,23 @@ export class Store {
     const migrationObservations = Number(this.db.prepare(`SELECT count(DISTINCT mint) AS count FROM events
       WHERE created_at>=? AND created_at<? AND json_valid(payload) AND json_extract(payload,'$.source')=?
         AND json_extract(payload,'$.status')='migration-observed'`).get(...bindings).count);
+    const materialKindPlaceholders = MATERIAL_ALERT_KINDS.map(() => "?").join(",");
+    const materialBindings = [normalizedStart, normalizedEnd, ...MATERIAL_ALERT_KINDS, normalizedSource];
+    const materialPredicate = `created_at>=? AND created_at<? AND kind IN (${materialKindPlaceholders}) AND mint IN (
+      SELECT mint FROM tokens WHERE json_valid(payload) AND json_extract(payload,'$.source')=?)`;
     const materialAlerts = Number(this.db.prepare(`SELECT count(*) AS count FROM alerts
-      WHERE created_at>=? AND created_at<? AND mint IN (
-        SELECT mint FROM tokens WHERE json_valid(payload) AND json_extract(payload,'$.source')=?)`).get(...bindings).count);
+      WHERE ${materialPredicate}`).get(...materialBindings).count);
     const thirdPartyCallouts = Number(this.db.prepare(`SELECT count(*) AS count FROM callouts
       WHERE created_at>=? AND created_at<?`).get(normalizedStart, normalizedEnd).count);
     const materialByKind = Object.fromEntries(this.db.prepare(`SELECT kind,count(*) AS count FROM alerts
-      WHERE created_at>=? AND created_at<? GROUP BY kind ORDER BY kind`).all(normalizedStart, normalizedEnd)
+      WHERE ${materialPredicate} GROUP BY kind ORDER BY kind`).all(...materialBindings)
       .map(({ kind, count }) => [kind, Number(count)]));
     const factorEventsByEvidenceClass = Object.fromEntries(this.db.prepare(`SELECT evidence_class,count(*) AS count FROM events
       WHERE created_at>=? AND created_at<? AND kind='risk-evidence' GROUP BY evidence_class ORDER BY evidence_class`)
       .all(normalizedStart, normalizedEnd).map(({ evidence_class: evidenceClass, count }) => [evidenceClass, Number(count)]));
     const telegramDelivery = Object.fromEntries(this.db.prepare(`SELECT coalesce(telegram_status,'not-queued') AS status,count(*) AS count
-      FROM alerts WHERE created_at>=? AND created_at<? GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`)
-      .all(normalizedStart, normalizedEnd).map(({ status, count }) => [status, Number(count)]));
+      FROM alerts WHERE ${materialPredicate} GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`)
+      .all(...materialBindings).map(({ status, count }) => [status, Number(count)]));
     const outcomeCohortAdmissions = Number(this.db.prepare(`SELECT count(*) AS count FROM outcome_enrichment
       JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?`).get(normalizedStart, normalizedEnd).count);
     const riskCohortAdmissions = Number(this.db.prepare(`SELECT count(*) AS count FROM risk_identity_enrichment

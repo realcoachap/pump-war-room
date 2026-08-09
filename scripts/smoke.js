@@ -12,6 +12,11 @@ const RISK_COHORT_LIMIT = 120;
 const RISK_PARSER_AUDIT_SAMPLE_LIMIT = 16;
 const RISK_MINIMUM_SUCCESS_COVERAGE_RATIO = 0.5;
 const RISK_MAXIMUM_INVALID_RESPONSE_RATIO = 0.25;
+const MATERIAL_ALERT_KINDS = new Set([
+  "score-rise", "score-drop", "risk-concentration", "risk-developer-holding",
+  "risk-identity-reuse", "risk-creator-history", "migration-observed"
+]);
+const TELEGRAM_DELIVERY_STATES = new Set(["not-queued", "pending", "retrying", "sent", "dead-letter"]);
 
 const PUBLIC_RISK_IDENTITY_KEYS = new Set([
   "schemaVersion", "methodVersion", "parserRevision", "parserAuditRevision", "parserAuditAt",
@@ -137,14 +142,30 @@ function parseJson(result, check) {
 }
 
 function validateMeasuredBrief(brief, period, check) {
-  requireValue(brief?.schemaVersion === 1 && brief.methodVersion === "measured-closed-brief-v1" && brief.period === period,
+  requireValue(brief?.schemaVersion === 1 && brief.methodVersion === "measured-closed-brief-v2" && brief.period === period,
     check, `${period} frozen brief contract was missing`);
   requireValue(brief.timezone === "UTC" && brief.feedCoverage === "unmeasured"
     && brief.rawProviderPayloadsIncluded === false, check, `${period} brief truthfulness boundary was missing`);
   requireValue(Number.isFinite(Date.parse(brief.windowStart)) && Number.isFinite(Date.parse(brief.windowEnd))
     && Date.parse(brief.windowStart) < Date.parse(brief.windowEnd), check, `${period} brief closed interval was invalid`);
-  requireValue(brief.activity && Number.isSafeInteger(brief.activity.launchesObserved)
-    && Number.isSafeInteger(brief.activity.materialAlerts), check, `${period} brief activity denominators were missing`);
+  const validateActivity = (activity, path) => {
+    requireValue(activity && Number.isSafeInteger(activity.launchesObserved)
+      && Number.isSafeInteger(activity.materialAlerts), check, `${path} activity denominators were missing`);
+    const materialByKind = activity.materialByKind;
+    const telegramDelivery = activity.telegramDelivery;
+    requireValue(materialByKind && typeof materialByKind === "object" && !Array.isArray(materialByKind)
+      && Object.entries(materialByKind).every(([kind, count]) => MATERIAL_ALERT_KINDS.has(kind)
+        && Number.isSafeInteger(count) && count >= 0)
+      && Object.values(materialByKind).reduce((total, count) => total + count, 0) === activity.materialAlerts,
+    check, `${path} material-event denominator was inconsistent or included a pre-policy kind`);
+    requireValue(telegramDelivery && typeof telegramDelivery === "object" && !Array.isArray(telegramDelivery)
+      && Object.entries(telegramDelivery).every(([status, count]) => TELEGRAM_DELIVERY_STATES.has(status)
+        && Number.isSafeInteger(count) && count >= 0)
+      && Object.values(telegramDelivery).reduce((total, count) => total + count, 0) === activity.materialAlerts,
+    check, `${path} Telegram denominator was inconsistent with material events`);
+  };
+  validateActivity(brief.activity, `${period} brief`);
+  validateActivity(brief.priorPeriod?.activity, `${period} prior-period brief`);
   requireValue(brief.priorPeriod?.windowEnd === brief.windowStart, check, `${period} prior-period comparison boundary was missing`);
   for (const windowName of ["5m", "15m", "1h", "6h", "24h"]) {
     const metric = brief.outcomes?.windows?.[windowName];
@@ -284,8 +305,18 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     requireValue(attemptedInRuntime || attemptedPersistently, "health", "outcome provider was never attempted in runtime or persisted state");
     requireValue(succeededInRuntime || succeededPersistently, "health", "outcome provider has no successful runtime or persisted refresh");
     requireValue(typeof health.outcomes?.lastSuccessAt === "string", "health", "outcome provider has no successful timestamp");
+    const dueStateCount = health.outcomes?.persistence?.dueStateCount;
+    requireValue(Number.isSafeInteger(dueStateCount) && dueStateCount >= 0,
+      "health", "outcome provider due-work telemetry is missing or invalid");
+    requireValue(health.outcomes?.successFreshnessBasis === "provider-success-age-while-scheduled-work-is-due",
+      "health", "outcome provider demand-aware freshness basis is missing");
+    const providerWorkDue = dueStateCount > 0 || health.outcomes.queueDepth > 0 || health.outcomes.status === "enriching";
+    const expectedStale = health.outcomes.lastSuccessAgeSeconds < 0
+      || (providerWorkDue && health.outcomes.lastSuccessAgeSeconds > health.outcomes.successStaleAfterSeconds);
     requireValue(Number.isFinite(health.outcomes?.lastSuccessAgeSeconds) && Number.isFinite(health.outcomes?.successStaleAfterSeconds)
-      && health.outcomes.lastSuccessIsStale === false, "health", "outcome provider success evidence is stale or missing");
+      && health.outcomes.lastSuccessIsStale === expectedStale,
+    "health", "outcome provider demand-aware freshness telemetry was inconsistent");
+    requireValue(health.outcomes.lastSuccessIsStale === false, "health", "outcome provider success evidence is stale or missing");
     requireValue(Number(health.outcomes?.counters?.consecutiveFailures) <= 3, "health", "outcome provider has repeated consecutive failures");
   }
   requireValue(health.riskIntelligence?.source === "geckoterminal", "health", "risk identity provider identity was missing");
@@ -568,7 +599,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     },
     markers: {
       version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
-      actionableIntelligence: true, parserRevision: true, legalNotices: true
+      actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
+      parserRevision: true, legalNotices: true
     }
   };
 }

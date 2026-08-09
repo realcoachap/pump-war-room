@@ -23,7 +23,7 @@ import {
   inspectDatabaseFile,
   verifyRestorableBackup
 } from "../src/database-backup.js";
-import { Store } from "../src/store.js";
+import { Store, STORE_SCHEMA_VERSION } from "../src/store.js";
 import { parseGeckoTerminalTokenInfo } from "../src/risk-identity.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
@@ -86,7 +86,9 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   assert.equal(report.backup.path, destination);
   assert.equal(report.backup.integrityCheck, "ok");
   assert.equal(report.disposableRestore.verified, true);
-  assert.deepEqual(report.disposableRestore.applicationWriteProbe, { verified: true, rolledBack: true });
+  assert.deepEqual(report.disposableRestore.applicationWriteProbe, {
+    verified: true, rolledBack: true, telegramOutboxDue: true, invalidPendingRejected: true
+  });
   assert.deepEqual(report.backup.rowCounts, {
     tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
@@ -178,7 +180,7 @@ test("verifies an exact v0.5.1 artifact by migrating only the disposable restore
 
   assert.equal(report.artifact.userVersion, 501);
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 501);
-  assert.equal(report.disposableRestore.userVersion, 800);
+  assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
   assert.equal(report.disposableRestore.rowCounts.tokens, 1);
   assert.equal(report.disposableRestore.rowCounts.outcome_enrichment, 0);
   assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
@@ -220,7 +222,7 @@ test("verifies an exact v0.6.0 artifact by migrating only the disposable restore
   assert.equal(report.artifact.userVersion, 600);
   assert.equal(report.artifact.rowCounts.outcome_enrichment, 0);
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 600);
-  assert.equal(report.disposableRestore.userVersion, 800);
+  assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
   assert.equal(report.disposableRestore.rowCounts.tokens, 1);
   assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
   assert.equal(report.disposableRestore.rowCounts.brief_runs, 0);
@@ -331,7 +333,7 @@ test("verifies an exact v0.7 artifact and migrates only the disposable restore c
     tokens: 1, events: 1, alerts: 1, callouts: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 700);
-  assert.equal(report.disposableRestore.userVersion, 800);
+  assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
   assert.deepEqual(report.disposableRestore.rowCounts, {
     tokens: 1, events: 1, alerts: 1, callouts: 0, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
@@ -341,7 +343,7 @@ test("verifies an exact v0.7 artifact and migrates only the disposable restore c
   assert.equal(digest(disposableMigrationPath), before.hash);
   const migrated = new Store(disposableMigrationPath);
   try {
-    assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 800);
+    assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, STORE_SCHEMA_VERSION);
     assert.equal(migrated.db.prepare("SELECT id FROM events WHERE mint=?").get(riskMint).id, migrationEvent.id);
     assert.deepEqual(migrated.eventsForMint(riskMint), [{
       kind: migrationEvent.kind, mint: migrationEvent.mint, payload: migrationEvent.payload,
@@ -361,6 +363,75 @@ test("verifies an exact v0.7 artifact and migrates only the disposable restore c
   assert.equal(digest(riskPath), before.hash);
   assert.equal(statSync(riskPath).mtime.toISOString(), before.modifiedAt);
   assert.equal(inspectDatabaseFile(riskPath, { allowLegacy: true }).userVersion, 700);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
+test("verifies schema 800 and repairs a pending outbox row only in the disposable restore", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const actionPath = path.join(directory, "v0.8.0-backup.db");
+  const actionStore = new Store(actionPath);
+  actionStore.upsertToken({ mint: "LegacyActionMint", source: "pumpportal", createdAt });
+  actionStore.db.exec(`
+    DROP INDEX alerts_dedupe_key;
+    DROP INDEX alerts_mint_created;
+    ALTER TABLE alerts RENAME TO alerts_schema_801;
+    CREATE TABLE alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT,
+      kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
+      dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
+      telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO alerts
+      (level,title,message,mint,kind,evidence_class,dedupe_key,telegram_status,created_at)
+      VALUES ('signal','Legacy pending','Must become due','LegacyActionMint','score-rise','locally-derived',
+        'legacy-pending','pending','${createdAt}');
+    INSERT INTO alerts
+      (level,title,message,mint,kind,evidence_class,dedupe_key,telegram_status,telegram_next_attempt_at,created_at)
+      VALUES ('signal','Malformed pending','Must become due','LegacyActionMint','score-rise','locally-derived',
+        'legacy-malformed-pending','pending','zzzz','${createdAt}');
+    DROP TABLE alerts_schema_801;
+    CREATE UNIQUE INDEX alerts_dedupe_key ON alerts(dedupe_key) WHERE dedupe_key IS NOT NULL;
+    CREATE INDEX alerts_mint_created ON alerts(mint, created_at DESC);
+    PRAGMA user_version = 800;
+  `);
+  actionStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+  actionStore.db.close();
+  const before = { hash: digest(actionPath), modifiedAt: statSync(actionPath).mtime.toISOString() };
+  assert.equal(inspectDatabaseFile(actionPath, { allowLegacy: true }).userVersion, 800);
+
+  const report = verifyRestorableBackup(actionPath, { scratchRoot: scratchDirectory });
+  assert.equal(report.artifact.userVersion, 800);
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, 800);
+  assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
+  assert.equal(report.disposableRestore.applicationWriteProbe.telegramOutboxDue, true);
+
+  const migratedPath = path.join(directory, "v0.8.0-disposable-migration.db");
+  copyFileSync(actionPath, migratedPath);
+  const migrated = new Store(migratedPath);
+  try {
+    const repaired = migrated.db.prepare(`SELECT dedupe_key AS dedupeKey,telegram_next_attempt_at AS nextAttemptAt
+      FROM alerts ORDER BY dedupe_key`).all().map((row) => ({ ...row }));
+    assert.deepEqual(repaired, [
+      { dedupeKey: "legacy-malformed-pending", nextAttemptAt: createdAt },
+      { dedupeKey: "legacy-pending", nextAttemptAt: createdAt }
+    ]);
+    assert.equal(migrated.dueTelegramAlerts({ now: createdAt }).length, 2);
+    assert.throws(
+      () => migrated.db.prepare("UPDATE alerts SET telegram_next_attempt_at=NULL WHERE dedupe_key='legacy-pending'").run(),
+      /constraint/i
+    );
+    assert.throws(
+      () => migrated.db.prepare("UPDATE alerts SET telegram_next_attempt_at='zzzz' WHERE dedupe_key='legacy-pending'").run(),
+      /constraint/i
+    );
+  } finally {
+    migrated.db.close();
+  }
+
+  assert.equal(digest(actionPath), before.hash);
+  assert.equal(statSync(actionPath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 

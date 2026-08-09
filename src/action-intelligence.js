@@ -3,6 +3,9 @@ const OUTCOME_WINDOWS = Object.freeze(["5m", "15m", "1h", "6h", "24h"]);
 const PERIODS = Object.freeze({ daily: 86_400_000, weekly: 7 * 86_400_000 });
 const MAX_TIMELINE_ROWS = 200;
 const DEFAULT_TIMELINE_ROWS = 50;
+const TELEGRAM_CHAT_DESTINATION = /^(?:-?\d{1,24}|@[A-Za-z0-9_]{1,32})$/;
+
+export const CLOSED_BRIEF_METHOD_VERSION = "measured-closed-brief-v2";
 
 const finite = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
 const integer = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -95,7 +98,7 @@ export function detectMaterialAlerts({ current, previous = null, currentScore = 
         level: "signal",
         title: delta > 0 ? "Evidence score increased" : "Evidence score decreased",
         message: `${symbol}'s observational radar score changed from ${priorScore} to ${score} (${delta > 0 ? "+" : ""}${delta}); it is not a price forecast.`,
-        token: current, evidenceAt: at, fingerprint: `material-score-v1:${priorScore}->${score}:${at.slice(0, 13)}`
+        token: current, evidenceAt: at, fingerprint: `material-score-v2:${priorScore}->${score}:${at}`
       }));
     }
   }
@@ -418,7 +421,7 @@ export function buildMeasuredBrief({
   const start = closed ? timestamp(windowStart, "windowStart") : new Date(Date.parse(end) - PERIODS[period]).toISOString();
   if (Date.parse(end) - Date.parse(start) !== PERIODS[period]) throw new RangeError(`${period} brief window has an invalid duration`);
   if (end > cutoff) throw new RangeError("brief windowEnd must not be after the data cutoff");
-  const methodVersion = closed ? "measured-closed-brief-v1" : "measured-rolling-brief-v1";
+  const methodVersion = closed ? CLOSED_BRIEF_METHOD_VERSION : "measured-rolling-brief-v1";
   const countRecord = (value, label) => {
     if (value === undefined) return {};
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
@@ -512,8 +515,10 @@ export function buildMeasuredBrief({
 }
 
 export function telegramAlertStatus(env = process.env) {
-  const tokenConfigured = typeof env.TELEGRAM_BOT_TOKEN === "string" && env.TELEGRAM_BOT_TOKEN.length > 0;
-  const chatConfigured = typeof env.TELEGRAM_CHAT_ID === "string" && env.TELEGRAM_CHAT_ID.length > 0;
+  const tokenConfigured = typeof env.TELEGRAM_BOT_TOKEN === "string"
+    && env.TELEGRAM_BOT_TOKEN.length >= 20 && !/\s/.test(env.TELEGRAM_BOT_TOKEN);
+  const chatConfigured = typeof env.TELEGRAM_CHAT_ID === "string"
+    && TELEGRAM_CHAT_DESTINATION.test(env.TELEGRAM_CHAT_ID);
   return {
     status: tokenConfigured && chatConfigured ? "configured" : "not-configured",
     tokenConfigured,
@@ -561,7 +566,7 @@ export async function sendTelegramAlert(alertValue, { token, chatId, baseUrl, fe
   if (!alertValue || typeof alertValue !== "object" || !alertValue.mint) throw new TypeError("alert is required");
   mint(alertValue.mint, "alert.mint");
   if (typeof token !== "string" || token.length < 20 || /\s/.test(token)) throw new TypeError("Telegram bot token is not configured");
-  if (typeof chatId !== "string" || !/^-?\d{1,24}$/.test(chatId)) throw new TypeError("Telegram chat id is not configured");
+  if (typeof chatId !== "string" || !TELEGRAM_CHAT_DESTINATION.test(chatId)) throw new TypeError("Telegram chat id is not configured");
   if (typeof baseUrl !== "string" || !/^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(baseUrl)) throw new TypeError("baseUrl must be an HTTPS origin");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30_000) throw new RangeError("timeoutMs must be between 1000 and 30000");
   const message = [

@@ -96,7 +96,7 @@ function metricOrUnavailable(value, suffix = "") {
 
 export function measuredBriefMarkdown(brief) {
   if (!brief || typeof brief !== "object" || !["daily", "weekly"].includes(brief.period)
-    || brief.methodVersion !== "measured-closed-brief-v1") {
+    || brief.methodVersion !== "measured-closed-brief-v2") {
     throw new TypeError("a frozen measured daily or weekly brief is required");
   }
   const oneHour = brief.outcomes?.windows?.["1h"] || {};

@@ -34,7 +34,7 @@ test("measured brief export preserves closed-period denominators and suppression
     hitRatePct: null, medianReturnPct: null, maximumDrawdownPct: null
   };
   const markdown = measuredBriefMarkdown({
-    period: "daily", methodVersion: "measured-closed-brief-v1",
+    period: "daily", methodVersion: "measured-closed-brief-v2",
     windowStart: "2026-08-08T00:00:00.000Z", windowEnd: "2026-08-09T00:00:00.000Z",
     generatedAt: "2026-08-09T00:05:00.000Z", source: "pumpportal observations plus GeckoTerminal completed-candle outcomes",
     activity: { launchesObserved: 4, migrationObservations: 1, materialAlerts: 2, telegramDelivery: { sent: 1 } },
@@ -46,4 +46,6 @@ test("measured brief export preserves closed-period denominators and suppression
   assert.match(markdown, /suppressed for insufficient evidence/);
   assert.match(markdown, /feed coverage: \*\*unmeasured\*\*/i);
   assert.doesNotMatch(markdown, /finalized migration/i);
+  assert.throws(() => measuredBriefMarkdown({ period: "daily", methodVersion: "measured-closed-brief-v1" }),
+    /frozen measured daily or weekly brief/);
 });

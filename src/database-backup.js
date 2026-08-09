@@ -24,6 +24,7 @@ import { Store, STORE_SCHEMA_VERSION } from "./store.js";
 const LEGACY_SCHEMA_VERSION = 501;
 const OUTCOME_SCHEMA_VERSION = 600;
 const RISK_SCHEMA_VERSION = 700;
+const ACTION_SCHEMA_VERSION = 800;
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
@@ -169,7 +170,21 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
       kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
       dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
       telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      CHECK (
+        (telegram_status IS NULL AND telegram_attempted_at IS NULL AND telegram_message_id IS NULL
+          AND telegram_attempt_count=0 AND telegram_next_attempt_at IS NULL AND telegram_last_error_code IS NULL)
+        OR (telegram_status='pending' AND telegram_attempted_at IS NULL AND telegram_message_id IS NULL
+          AND telegram_attempt_count=0 AND coalesce((telegram_next_attempt_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+          AND strftime('%Y-%m-%dT%H:%M:%fZ',telegram_next_attempt_at)=telegram_next_attempt_at),0)=1 AND telegram_last_error_code IS NULL)
+        OR (telegram_status='retrying' AND telegram_attempted_at IS NOT NULL AND telegram_message_id IS NULL
+          AND telegram_attempt_count>=1 AND coalesce((telegram_next_attempt_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'
+          AND strftime('%Y-%m-%dT%H:%M:%fZ',telegram_next_attempt_at)=telegram_next_attempt_at),0)=1 AND telegram_last_error_code IS NOT NULL)
+        OR (telegram_status='sent' AND telegram_attempted_at IS NOT NULL AND telegram_message_id IS NOT NULL
+          AND telegram_attempt_count>=1 AND telegram_next_attempt_at IS NULL AND telegram_last_error_code IS NULL)
+        OR (telegram_status='dead-letter' AND telegram_attempted_at IS NOT NULL AND telegram_message_id IS NULL
+          AND telegram_attempt_count>=1 AND telegram_next_attempt_at IS NULL AND telegram_last_error_code IS NOT NULL)
+      )
     )`
   }),
   Object.freeze({
@@ -229,6 +244,22 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     sql: "CREATE TABLE tokens (mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
   })
 ]);
+
+const ACTION_SCHEMA_ALERT_OBJECT = Object.freeze({
+  type: "table",
+  name: "alerts",
+  tableName: "alerts",
+  sql: `CREATE TABLE alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT,
+    kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
+    dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
+    telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
+    created_at TEXT NOT NULL
+  )`
+});
+const ACTION_SCHEMA_OBJECTS = Object.freeze(EXPECTED_SCHEMA_OBJECTS.map((entry) => (
+  entry.type === "table" && entry.name === "alerts" ? ACTION_SCHEMA_ALERT_OBJECT : entry
+)));
 
 const RISK_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
@@ -345,6 +376,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const legacy = allowLegacy && userVersion === LEGACY_SCHEMA_VERSION;
   const outcomeOnly = allowLegacy && userVersion === OUTCOME_SCHEMA_VERSION;
   const riskOnly = allowLegacy && userVersion === RISK_SCHEMA_VERSION;
+  const actionOnly = allowLegacy && userVersion === ACTION_SCHEMA_VERSION;
   const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA
     : outcomeOnly ? OUTCOME_DATABASE_SCHEMA
       : riskOnly ? RISK_DATABASE_SCHEMA
@@ -352,7 +384,8 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS
     : outcomeOnly ? OUTCOME_SCHEMA_OBJECTS
       : riskOnly ? RISK_SCHEMA_OBJECTS
-        : EXPECTED_SCHEMA_OBJECTS;
+        : actionOnly ? ACTION_SCHEMA_OBJECTS
+          : EXPECTED_SCHEMA_OBJECTS;
   const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(({ name }) => name);
   const rowCounts = {};
   for (const [table, requiredColumns] of Object.entries(requiredSchema)) {
@@ -397,7 +430,8 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   if (JSON.stringify(normalizedSchema) !== JSON.stringify(normalizedExpectedSchema)) {
     fail("Database schema objects do not exactly match the supported Pump War Room schema");
   }
-  if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION].includes(userVersion))) {
+  if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy
+    && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION].includes(userVersion))) {
     fail(`Database schema version ${userVersion} does not match required version ${STORE_SCHEMA_VERSION}`);
   }
   const jsonColumns = {
@@ -465,11 +499,35 @@ function verifyApplicationWrites(databasePath) {
     database.prepare(`INSERT INTO events
       (kind,mint,payload,event_key,evidence_class,occurred_at,created_at) VALUES (?,?,?,?,?,?,?)`)
       .run("restore-verification", mint, payload, `restore-event-${suffix}`, "unavailable", createdAt, createdAt);
+    const restoreAlertKey = `restore-alert-${suffix}`;
     database.prepare(`INSERT INTO alerts
-      (level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      (level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,telegram_next_attempt_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
       .run("verification", "Restore probe", "Disposable write check", mint, "restore-verification", "unavailable",
-        createdAt, `restore-alert-${suffix}`, "pending", createdAt);
+        createdAt, restoreAlertKey, "pending", createdAt, createdAt);
+    const dueAlertCount = Number(database.prepare(`SELECT count(*) AS count FROM alerts
+      WHERE dedupe_key=? AND telegram_status='pending' AND telegram_next_attempt_at<=?`).get(restoreAlertKey, createdAt).count);
+    if (dueAlertCount !== 1) fail("Database application write probe could not recover its pending Telegram outbox row");
+    try {
+      database.prepare(`INSERT INTO alerts
+        (level,title,message,mint,kind,evidence_class,dedupe_key,telegram_status,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run("verification", "Invalid outbox probe", "Must be rejected", mint, "restore-verification", "unavailable",
+          `restore-invalid-alert-${suffix}`, "pending", createdAt);
+      fail("Database application write probe accepted an undeliverable pending Telegram outbox row");
+    } catch (error) {
+      if (error instanceof DatabaseVerificationError) throw error;
+    }
+    try {
+      database.prepare(`INSERT INTO alerts
+        (level,title,message,mint,kind,evidence_class,dedupe_key,telegram_status,telegram_next_attempt_at,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run("verification", "Malformed outbox probe", "Must be rejected", mint, "restore-verification", "unavailable",
+          `restore-malformed-alert-${suffix}`, "pending", "zzzz", createdAt);
+      fail("Database application write probe accepted a malformed pending Telegram due time");
+    } catch (error) {
+      if (error instanceof DatabaseVerificationError) throw error;
+    }
     database.prepare(`INSERT INTO callouts (external_id,mint,payload,created_at)
       VALUES (?,?,?,?) ON CONFLICT(external_id) DO UPDATE SET payload=excluded.payload`)
       .run(externalId, mint, payload, createdAt);
@@ -492,7 +550,7 @@ function verifyApplicationWrites(databasePath) {
     if (inserted !== 1) fail("Database application write probe could not read its disposable token row");
     database.exec("ROLLBACK");
     transactionStarted = false;
-    return { verified: true, rolledBack: true };
+    return { verified: true, rolledBack: true, telegramOutboxDue: true, invalidPendingRejected: true };
   } catch (error) {
     if (transactionStarted) {
       try { database?.exec("ROLLBACK"); } catch {}
@@ -554,7 +612,7 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
     chmodSync(restoredPath, 0o600);
     let restored = inspectDatabaseFile(restoredPath, { allowLegacy: true });
     assertSameRestore(artifact, restored);
-    const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION].includes(restored.userVersion)
+    const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION].includes(restored.userVersion)
       ? restored.userVersion
       : null;
     if (migratedFromSchemaVersion !== null) {

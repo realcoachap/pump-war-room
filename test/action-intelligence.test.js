@@ -43,16 +43,18 @@ test("material alerts label processed migration evidence without claiming finali
   assert.doesNotMatch(alerts[0].title + alerts[0].message, /graduated|finalized/i);
 });
 
-test("score alerts require two numeric observations and use a versioned hourly dedupe bucket", () => {
+test("score alerts require two numeric observations and dedupe only an exact occurrence replay", () => {
   assert.deepEqual(detectMaterialAlerts({ current: token(), previous: token(), currentScore: null, previousScore: 20, observedAt: now }), []);
   assert.deepEqual(detectMaterialAlerts({ current: token(), previous: null, currentScore: 80, previousScore: 20, observedAt: now }), []);
   assert.deepEqual(detectMaterialAlerts({ current: token(), previous: token(), currentScore: 34.9, previousScore: 20, observedAt: now }), []);
   const first = detectMaterialAlerts({ current: token(), previous: token(), currentScore: 35, previousScore: 20, observedAt: now })[0];
-  const repeat = detectMaterialAlerts({ current: token(), previous: token(), currentScore: 35, previousScore: 20, observedAt: "2026-08-09T12:45:00.000Z" })[0];
+  const replay = detectMaterialAlerts({ current: token(), previous: token(), currentScore: 35, previousScore: 20, observedAt: now })[0];
+  const recurrence = detectMaterialAlerts({ current: token(), previous: token(), currentScore: 35, previousScore: 20, observedAt: "2026-08-09T12:45:00.000Z" })[0];
   const later = detectMaterialAlerts({ current: token(), previous: token(), currentScore: 35, previousScore: 20, observedAt: "2026-08-09T13:00:00.000Z" })[0];
   assert.equal(first.kind, "score-rise");
-  assert.match(first.dedupeKey, /material-score-v1/);
-  assert.equal(first.dedupeKey, repeat.dedupeKey);
+  assert.match(first.dedupeKey, /material-score-v2/);
+  assert.equal(first.dedupeKey, replay.dedupeKey);
+  assert.notEqual(first.dedupeKey, recurrence.dedupeKey);
   assert.notEqual(first.dedupeKey, later.dedupeKey);
   assert.match(first.message, /not a price forecast/);
 });
@@ -182,23 +184,32 @@ test("measured briefs use closed-open period denominators and withhold sparse me
   assert.equal(brief.outcomes.windows["1h"].coverageRatio, null, "an empty denominator is unavailable, not 0% coverage");
   assert.equal(brief.feedCoverage, "unmeasured");
   assert.equal(brief.priorPeriod.windowEnd, brief.windowStart);
+  const closed = buildMeasuredBrief({
+    period: "daily", now,
+    windowStart: "2026-08-08T00:00:00.000Z", windowEnd: "2026-08-09T00:00:00.000Z",
+    activity: {}, priorActivity: {}, outcomes
+  });
+  assert.equal(closed.methodVersion, "measured-closed-brief-v2");
+  assert.match(closed.briefId, /^measured-closed-brief-v2:/);
   assert.throws(() => buildMeasuredBrief({ period: "daily", now, activity: { launchesObserved: -1 } }), /non-negative integer/);
 });
 
 test("Telegram configuration exposes only booleans and official send contract handles success and 429", async () => {
-  const config = telegramAlertStatus({ TELEGRAM_BOT_TOKEN: "top-secret-token", TELEGRAM_CHAT_ID: "123" });
+  const configuredToken = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const config = telegramAlertStatus({ TELEGRAM_BOT_TOKEN: configuredToken, TELEGRAM_CHAT_ID: "@pumpwarroom" });
   assert.deepEqual(config, {
     status: "configured", tokenConfigured: true, chatConfigured: true,
     delivery: "restart-safe-bounded-at-least-once-material-alerts-only", paidBroadcastsRequired: false
   });
-  assert.doesNotMatch(JSON.stringify(config), /top-secret-token|"123"/);
+  assert.doesNotMatch(JSON.stringify(config), /123456789|pumpwarroom/);
+  assert.equal(telegramAlertStatus({ TELEGRAM_BOT_TOKEN: configuredToken, TELEGRAM_CHAT_ID: "invalid channel" }).status, "not-configured");
   let request;
   const sent = await sendTelegramAlert({
     id: 42,
     mint: mintA, title: "Migration feed observation", message: "Finalization is not verified.",
     evidenceClass: "feed-observed-processed", evidenceAt: now
   }, {
-    token: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ", chatId: "123", baseUrl: "https://war-room.example",
+    token: configuredToken, chatId: "@pumpwarroom", baseUrl: "https://war-room.example",
     fetchImpl: async (url, options) => {
       request = { url, options };
       return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 77 } }; } };
@@ -206,6 +217,7 @@ test("Telegram configuration exposes only booleans and official send contract ha
   });
   assert.deepEqual(sent, { ok: true, messageId: 77 });
   const body = JSON.parse(request.options.body);
+  assert.equal(body.chat_id, "@pumpwarroom");
   assert.deepEqual(body.link_preview_options, { is_disabled: true });
   assert.equal(body.disable_web_page_preview, undefined);
   assert.doesNotMatch(body.text, /pump\.fun/);

@@ -143,7 +143,11 @@ export class VerifiedOutcomeIngestor {
     const persistedLastSuccessAt = newestTimestamp(persistedStates.map((state) => state.lastSuccessAt));
     const lastAttemptAt = newestTimestamp([this.lastAttemptAt, persistedLastAttemptAt]);
     const lastSuccessAt = newestTimestamp([this.lastSuccessAt, persistedLastSuccessAt]);
-    const lastSuccessAgeSeconds = lastSuccessAt === null ? null : Math.floor((this.now() - timestamp(lastSuccessAt)) / 1_000);
+    const statusAt = this.now();
+    const lastSuccessAgeSeconds = lastSuccessAt === null ? null : Math.floor((statusAt - timestamp(lastSuccessAt)) / 1_000);
+    const dueStateCount = persistedStates.filter((state) => timestamp(state.nextAttemptAt) !== null
+      && timestamp(state.nextAttemptAt) <= statusAt).length;
+    const providerWorkDue = dueStateCount > 0 || this.queue.length > 0 || this.running;
     return {
       schemaVersion: 1,
       source: GECKOTERMINAL_PROVIDER.id,
@@ -153,7 +157,9 @@ export class VerifiedOutcomeIngestor {
       lastSuccessAt,
       lastSuccessAgeSeconds,
       successStaleAfterSeconds: PROVIDER_SUCCESS_STALE_AFTER_MS / 1_000,
-      lastSuccessIsStale: lastSuccessAt === null ? null : lastSuccessAgeSeconds < 0 || lastSuccessAgeSeconds > PROVIDER_SUCCESS_STALE_AFTER_MS / 1_000,
+      successFreshnessBasis: "provider-success-age-while-scheduled-work-is-due",
+      lastSuccessIsStale: lastSuccessAt === null ? null : lastSuccessAgeSeconds < 0
+        || (providerWorkDue && lastSuccessAgeSeconds > PROVIDER_SUCCESS_STALE_AFTER_MS / 1_000),
       lastErrorAt: this.lastErrorAt,
       lastErrorCode: this.lastErrorCode,
       rateLimit: { callsPerMinute: 10, enforcedMinimumIntervalMs: this.client.minIntervalMs ?? null },
@@ -162,7 +168,7 @@ export class VerifiedOutcomeIngestor {
         stateCount: persistedStates.length,
         attemptCount: persistedStates.reduce((total, state) => total + (Number.isSafeInteger(state.attemptCount) ? state.attemptCount : 0), 0),
         successfulStateCount: persistedStates.filter((state) => state.lastSuccessAt !== null && state.lastSuccessAt !== undefined).length,
-        dueStateCount: persistedStates.filter((state) => timestamp(state.nextAttemptAt) !== null && timestamp(state.nextAttemptAt) <= this.now()).length,
+        dueStateCount,
         lastAttemptAt: persistedLastAttemptAt,
         lastSuccessAt: persistedLastSuccessAt
       },

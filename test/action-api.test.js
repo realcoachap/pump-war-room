@@ -62,7 +62,7 @@ async function json(baseUrl, pathname, options) {
 test("action intelligence API enforces strict methods, bounds, and public contracts", async (t) => {
   const baseUrl = await startDemoServer(t);
   const { body: snapshot } = await json(baseUrl, "/api/snapshot");
-  assert.equal(snapshot.version, "0.8.0");
+  assert.equal(snapshot.version, "0.8.1");
   assert.equal(snapshot.actionIntelligence.watchlists.persistence, "browser-local");
   assert.equal(snapshot.actionIntelligence.alerts.telegram.status, "not-configured");
   assert.equal(snapshot.actionIntelligence.alerts.persistence, "atomic-event-alert-outbox-with-durable-baseline");
@@ -99,7 +99,7 @@ test("action intelligence API enforces strict methods, bounds, and public contra
     const brief = await json(baseUrl, `/api/briefs/${period}`);
     assert.equal(brief.response.status, 200);
     assert.equal(brief.body.period, period);
-    assert.equal(brief.body.methodVersion, "measured-closed-brief-v1");
+    assert.equal(brief.body.methodVersion, "measured-closed-brief-v2");
     assert.equal(brief.body.feedCoverage, "unmeasured");
     assert.equal(brief.body.priorPeriod.windowEnd, brief.body.windowStart);
   }

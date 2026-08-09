@@ -636,7 +636,21 @@ test("persists deduplicated intelligence, restart-safe Telegram delivery, and fr
   });
   assert.equal(frozen.written, false);
   assert.equal(frozen.run.model.feedCoverage, "unmeasured");
-  assert.equal(store.db.prepare("PRAGMA user_version").get().user_version, 800);
+  const correctedKey = briefKey.replace("measured-closed-brief-v1", "measured-closed-brief-v2");
+  const correctedModel = {
+    ...model,
+    briefId: correctedKey,
+    methodVersion: "measured-closed-brief-v2",
+    activity: { launchesObserved: 0, materialAlerts: 0, materialByKind: {} }
+  };
+  assert.equal(store.saveBriefRun({
+    briefKey: correctedKey, kind: "daily", periodStart: correctedModel.windowStart, periodEnd: correctedModel.windowEnd,
+    methodVersion: correctedModel.methodVersion, provider: "geckoterminal",
+    dataCutoff: correctedModel.generatedAt, model: correctedModel
+  }).written, true);
+  assert.equal(store.briefRun("daily").methodVersion, "measured-closed-brief-v2");
+  assert.equal(store.briefRun("daily").model.activity.materialAlerts, 0);
+  assert.equal(store.db.prepare("PRAGMA user_version").get().user_version, STORE_SCHEMA_VERSION);
   for (const index of ["alerts_dedupe_key", "events_event_key", "brief_runs_kind_period_end"]) {
     assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name=?").get(index).count, 1);
   }
