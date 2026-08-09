@@ -198,7 +198,7 @@ export class GeckoTerminalClient {
     minIntervalMs = DEFAULT_MIN_INTERVAL_MS,
     now = () => Date.now(),
     sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-    userAgent = "PumpWarRoom/0.7.0 (+https://pump-war-room-production.up.railway.app)"
+    userAgent = "PumpWarRoom (+https://pump-war-room-production.up.railway.app)"
   } = {}) {
     if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
     if (!Number.isFinite(timeoutMs) || timeoutMs < 100) throw new RangeError("timeoutMs must be at least 100");

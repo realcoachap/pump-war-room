@@ -160,10 +160,21 @@ function nameSymbolFingerprint(name, symbol) {
 
 function normalizeHandle(value, platform) {
   if (value === null || value === undefined || value === "") return null;
-  let handle = boundedString(value, `${platform} handle`, 64);
-  if (handle.startsWith("@")) handle = handle.slice(1);
+  const declared = boundedString(value, `${platform} handle`, 128);
   const maximum = platform === "x" ? 15 : 32;
-  if (!new RegExp(`^[A-Za-z0-9_]{1,${maximum}}$`).test(handle)) {
+  const direct = declared.match(new RegExp(`^@?([A-Za-z0-9_]{1,${maximum}})$`));
+  const officialUrl = platform === "x"
+    ? declared.match(new RegExp(`^(?:https?://)?(?:www\\.)?(?:x\\.com|twitter\\.com)/@?([A-Za-z0-9_]{1,${maximum}})(?:/status/[0-9]+)?/?$`, "i"))
+    : declared.match(new RegExp(`^(?:https?://)?(?:www\\.)?(?:t\\.me|telegram\\.me)/@?([A-Za-z0-9_]{1,${maximum}})/?$`, "i"));
+  const providerPostPath = platform === "x"
+    ? declared.match(new RegExp(`^@?([A-Za-z0-9_]{1,${maximum}})/status/[0-9]+$`, "i"))
+    : null;
+  const routeHandle = officialUrl?.[1] || providerPostPath?.[1] || null;
+  const reservedRoutes = platform === "x"
+    ? new Set(["compose", "explore", "hashtag", "home", "i", "intent", "login", "messages", "notifications", "privacy", "search", "settings", "share", "signup", "tos"])
+    : new Set(["addstickers", "blog", "faq", "iv", "joinchat", "login", "proxy", "share", "socks"]);
+  const handle = direct?.[1] || (routeHandle && !reservedRoutes.has(routeHandle.toLowerCase()) ? routeHandle : null);
+  if (!handle) {
     fail("invalid-response", `${platform} handle is not a conservative provider-declared handle`);
   }
   return handle.toLowerCase();
@@ -275,7 +286,7 @@ export function parseGeckoTerminalTokenInfo(payload, {
   const count = holderCount(holders?.count);
   const top10 = percentage(distribution?.top_10, "top-10 holder distribution", { stringAllowed: true });
   const lastUpdated = optionalTimestamp(holders?.last_updated, "holders.last_updated");
-  const developerHolding = percentage(attributes.developer_holding_percentage, "developer holding percentage");
+  const developerHolding = percentage(attributes.developer_holding_percentage, "developer holding percentage", { stringAllowed: true });
   const developerAddress = attributes.developer_address === null || attributes.developer_address === undefined || attributes.developer_address === ""
     ? null
     : addressFingerprint(attributes.developer_address);

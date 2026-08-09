@@ -91,6 +91,50 @@ test("parses the documented token-info fields into a strict persistence allowlis
   assert.doesNotMatch(JSON.stringify(result), /RAW_DESCRIPTION_MARKER|raw-image|99\.99|open_caesar|opencaesar|bcher|example\/a|Caf/i);
 });
 
+test("accepts the provider's observed decimal-string developer percentage drift", () => {
+  const result = parse(firstMint, { developer_holding_percentage: "4.500" });
+  assert.deepEqual(result.factors.developerHoldingPercentage, {
+    value: 4.5,
+    evidenceClass: "provider-observed",
+    sourceField: "data.attributes.developer_holding_percentage"
+  });
+});
+
+test("bounds decimal-string percentages without accepting alternate numeric syntaxes", () => {
+  assert.equal(parse(firstMint, { developer_holding_percentage: "0" }).factors.developerHoldingPercentage.value, 0);
+  assert.equal(parse(firstMint, { developer_holding_percentage: "100.000" }).factors.developerHoldingPercentage.value, 100);
+  assert.equal(parse(firstMint, { developer_holding_percentage: " 4.5 " }).factors.developerHoldingPercentage.value, 4.5);
+  for (const value of ["00", "04.5", ".5", "4.", "+4.5", "4.5e0", "NaN", "Infinity", "100.001"]) {
+    assert.throws(
+      () => parse(firstMint, { developer_holding_percentage: value }),
+      (error) => error instanceof RiskIdentityError && error.code === "invalid-response",
+      `expected decimal representation to be rejected: ${value}`
+    );
+  }
+});
+
+test("normalizes provider-declared official social URLs and X post paths to exact handles", () => {
+  const direct = parse(firstMint, { twitter_handle: "@Open_Caesar", telegram_handle: "OpenCaesar" });
+  const providerPaths = parse(firstMint, {
+    twitter_handle: "Open_Caesar/status/1954128765432109876",
+    telegram_handle: "https://t.me/OpenCaesar"
+  });
+  const officialUrls = parse(firstMint, {
+    twitter_handle: "https://x.com/Open_Caesar/status/1954128765432109876",
+    telegram_handle: "telegram.me/OpenCaesar"
+  });
+  const alternateOfficialUrls = parse(firstMint, {
+    twitter_handle: "https://www.twitter.com/@Open_Caesar/",
+    telegram_handle: "https://www.telegram.me/@OpenCaesar/"
+  });
+  assert.equal(providerPaths.fingerprints.xHandle.fingerprint, direct.fingerprints.xHandle.fingerprint);
+  assert.equal(officialUrls.fingerprints.xHandle.fingerprint, direct.fingerprints.xHandle.fingerprint);
+  assert.equal(providerPaths.fingerprints.telegramHandle.fingerprint, direct.fingerprints.telegramHandle.fingerprint);
+  assert.equal(officialUrls.fingerprints.telegramHandle.fingerprint, direct.fingerprints.telegramHandle.fingerprint);
+  assert.equal(alternateOfficialUrls.fingerprints.xHandle.fingerprint, direct.fingerprints.xHandle.fingerprint);
+  assert.equal(alternateOfficialUrls.fingerprints.telegramHandle.fingerprint, direct.fingerprints.telegramHandle.fingerprint);
+});
+
 test("missing provider fields remain explicit unavailable evidence", () => {
   const result = parse(firstMint, {
     name: null,
@@ -125,8 +169,21 @@ test("rejects malformed bounded factors, timestamps, handles, and websites", () 
     { holders: { last_updated: "yesterday" } },
     { holders: { last_updated: "2026-02-30T12:00:00Z" } },
     { developer_holding_percentage: -0.01 },
-    { developer_holding_percentage: "4.5" },
-    { twitter_handle: "https://x.com/not-a-handle" },
+    { developer_holding_percentage: "4.5%" },
+    { twitter_handle: "https://example.com/not-a-handle" },
+    { twitter_handle: "not_a_handle/status/not-a-number" },
+    { twitter_handle: "https://x.com/home" },
+    { twitter_handle: "https://x.com/i/status/123" },
+    { twitter_handle: "https://twitter.com/intent" },
+    { twitter_handle: "https://x.com/not_a_handle?ref=provider" },
+    { twitter_handle: "https://x.com/not_a_handle#profile" },
+    { twitter_handle: "https://x.com/not_a_handle/followers" },
+    { twitter_handle: "https://x.com@evil.example/not_a_handle" },
+    { twitter_handle: "https://x.com%2fevil.example/not_a_handle" },
+    { telegram_handle: "https://t.me/share" },
+    { telegram_handle: "https://t.me/joinchat" },
+    { telegram_handle: "https://t.me/not_a_handle?start=secret" },
+    { telegram_handle: "https://t.me/not_a_handle/extra" },
     { telegram_handle: "unicode-\u2603" },
     { websites: ["javascript:alert(1)"] },
     { websites: ["https://user:secret@example.com/"] }

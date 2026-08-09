@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.7.0**
+Current release: **v0.7.1**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, and exposes holder, liquidity, lifecycle, creator/deployer, and exact identity-reuse evidence without presenting an uncalibrated risk probability.
 
@@ -79,6 +79,8 @@ npm run outcomes:purge -- --provider geckoterminal --confirm DELETE-geckotermina
 
 v0.7.0 reuses the same singleton, conservatively paced GeckoTerminal client but maintains an independent fixed prospective risk cohort of at most 120 launches. It does not reuse or backfill the already-full v0.6 outcome cohort: new PumpPortal observations are durably admitted while the v0.7 worker is active, with a 20-minute replay-age ceiling, and the dashboard keeps those cohort rows inspectable after they leave the latest-token tape. Token info is attempted no earlier than 15 minutes after launch. Missing or stale evidence gets at most one retry about one hour later; a weaker retry cannot erase stronger earlier factors. This is bounded one-time acquisition, not an ongoing freshness promise, so each factor's fetch/observation timestamp is authoritative. The provider contract is pinned to API version `20230203`. GeckoTerminal describes this public-beta data as not vetted by CoinGecko, so the UI says **provider observed**, never on-chain verified.
 
+v0.7.1 hardens that parser against provider-observed representation drift without broadening the retained data contract. Decimal-string developer-holding percentages are normalized with the same finite 0–100 bounds as numeric percentages, and declared X/Telegram identifiers may use exact official profile URLs or X post paths. Only the normalized exact handle is fingerprinted; off-domain URLs, reserved routes, malformed paths, raw profiles, and unrecognized fields remain rejected.
+
 The separate `risk_identity_enrichment` table retains only allowlisted scalars, minimal pool provenance, and domain-separated SHA-256 digests: holder count, GeckoTerminal-reported top-10 distribution, provider-reported developer holding, provider update/fetch times, a current provider-ranked page-1 pool reserve snapshot, and digests derived from normalized declared X, Telegram, registrable website-domain, and name/symbol values. The reserve is timestamped when fetched—never presented as launch-time liquidity—and is not locked-liquidity evidence. The normalized identifiers themselves are not retained. The ingestion parser rejects raw responses, descriptions, images, provider prices/volumes, opaque provider scores, honeypot labels, and unrecognized fields. Public snapshot rows expose factor values, bounded acquisition failure states, and duplicate counts, not stored digests, raw errors, or raw provider profiles. Provider purge removes both outcome and risk/identity rows before verified secure deletion and vacuuming.
 
 Exact matching is deliberately narrow: X and Telegram handles are case-folded; URLs use the WHATWG parser, IDNA normalization, and the open-source `tldts` public/private suffix list (`allowPrivateDomains: true`) to compare registrable domains; names and symbols use NFKC/case-fold normalization. The headline identity-reuse count includes only exact declared X, Telegram, or registrable-domain matches. Name/symbol collisions are disclosed separately as low-confidence content warnings. Equality proves identifier or registrable-domain reuse only, not duplicate content. It does **not** establish a shared controller, fraud, maliciousness, or safety. Creator/deployer-user history counts only launches observed prospectively in the fixed cohort by this deployment and identifies which role was counted; it is not an all-time chain history. A provider developer address contributes only when it exactly matches an observed creator/deployer identity. Provider-reported developer holding is not verified creator identity. Top-10 methodology and custody exclusions are unpublished and may include curve or liquidity custody. GeckoTerminal pool reserve is shown as provider-observed reserve, not locked liquidity.
@@ -129,7 +131,7 @@ The snapshot includes versioned `leaderboard`, `outcomes`, and `riskIntelligence
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.7.0 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.7.1 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.
