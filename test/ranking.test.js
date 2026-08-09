@@ -140,3 +140,25 @@ test("uncalibrated risk evidence never changes ranking score or order", () => {
   assert.equal(rows[0].token.mint, mint(1), "deterministic mint tie-break remains authoritative");
   assert.match(rows[1].reasons.at(-1), /excluded from rank/);
 });
+
+test("early-actor observations are byte-invariant to ranking inputs and output", () => {
+  const baselineTokens = [
+    token(mint(1), { momentum: 81, uniqueBuyers: 11 }),
+    token(mint(2), { momentum: 42, uniqueBuyers: 4 })
+  ];
+  const actorDecoratedTokens = baselineTokens.map((row, index) => ({
+    ...row,
+    earlyActor: {
+      coverage: { state: "available", uniqueActorCount: index + 3, eventCount: 9 },
+      metrics: { concentration: { largestObservedActivitySharePct: 99 - index } },
+      actors: ["Actor 7", "Actor 8"]
+    },
+    actorObservations: [{ actor: "Actor 7", side: "buy", amount: 999_999 }]
+  }));
+
+  const baseline = createTop100(baselineTokens, { now, mode: "live" });
+  const actorDecorated = createTop100(actorDecoratedTokens, { now, mode: "live" });
+  assert.deepEqual(actorDecorated, baseline);
+  assert.equal(JSON.stringify(actorDecorated), JSON.stringify(baseline));
+  assert.equal(JSON.stringify(actorDecorated).includes("Actor 7"), false);
+});

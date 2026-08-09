@@ -94,6 +94,42 @@ test("risk alerts require explicit provider evidence and named operational thres
   assert.ok(detectMaterialAlerts({ current: changed, previous, observedAt: now }).slice(2).every(({ evidenceClass }) => evidenceClass === "locally-derived"));
 });
 
+test("early-actor evidence cannot alter risk alerts or Telegram delivery text", async () => {
+  const previous = token({ riskIdentity: { factors: {
+    concentration: { evidenceClass: "provider-observed", top10Percentage: 35, providerUpdatedAt: "2026-08-09T11:00:00Z" }
+  } } });
+  const current = token({ riskIdentity: { factors: {
+    concentration: { evidenceClass: "provider-observed", top10Percentage: 52, providerUpdatedAt: now }
+  } } });
+  const actorSummary = {
+    coverage: { state: "available", uniqueActorCount: 8, eventCount: 21 },
+    metrics: { concentration: { largestObservedActivitySharePct: 95 } },
+    actors: ["Actor 700", "Actor 701"]
+  };
+  const baselineAlerts = detectMaterialAlerts({ previous, current, observedAt: now });
+  const actorDecoratedAlerts = detectMaterialAlerts({
+    previous: { ...previous, earlyActor: actorSummary },
+    current: { ...current, earlyActor: actorSummary, actorObservations: [{ actor: "Actor 700", side: "buy" }] },
+    observedAt: now
+  });
+  assert.deepEqual(actorDecoratedAlerts, baselineAlerts);
+
+  const requestBodies = [];
+  const send = (alert) => sendTelegramAlert(alert, {
+    token: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    chatId: "123",
+    baseUrl: "https://war-room.example",
+    fetchImpl: async (_url, options) => {
+      requestBodies.push(options.body);
+      return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: requestBodies.length } }; } };
+    }
+  });
+  await send(baselineAlerts[0]);
+  await send({ ...baselineAlerts[0], earlyActor: actorSummary, actorObservations: [{ actor: "Actor 700" }] });
+  assert.equal(requestBodies[1], requestBodies[0]);
+  assert.doesNotMatch(requestBodies[1], /Actor 700|earlyActor|actorObservations/);
+});
+
 test("coin timeline merges only sanitized, typed, bounded evidence", () => {
   const result = buildCoinTimeline({
     mint: mintA,

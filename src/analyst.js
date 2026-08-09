@@ -296,15 +296,15 @@ function calloutAnswer(snapshot) {
   }
 
   const labels = recent.map(({ callout }) => {
-    const caller = cleanText(callout.caller, 48) || "unknown caller";
-    return `@${caller} on ${cleanText(callout.symbol, 16) || safeMint(callout.mint)}`;
+    const caller = cleanText(callout.sourceActor, 48) || "anonymous source actor";
+    return `${caller} on ${cleanText(callout.symbol, 16) || safeMint(callout.mint)}`;
   });
   return {
     answer: `Most recent supplied callouts: ${labels.join(", ")}. Callouts are third-party observations, not validation or trade advice.`,
     evidence: recent.map(({ callout, createdAt }) => {
       const multiple = finiteNumber(callout.multiple);
       const detail = [
-        `Caller: ${cleanText(callout.caller, 48) || "unknown"}`,
+        `Source actor: ${cleanText(callout.sourceActor, 48) || "anonymous"}`,
         `mint: ${safeMint(callout.mint)}`,
         createdAt ? `createdAt: ${createdAt.toISOString()}` : null,
         multiple !== null ? `reported multiple: ${numberLabel(multiple)}x` : null

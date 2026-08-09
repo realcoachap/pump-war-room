@@ -98,7 +98,10 @@ test("purges only demo tokens, demo events, and alerts tied to demo tokens", (t)
 
   assert.deepEqual(store.tokens().map((token) => token.mint).sort(), ["live-mint", "unknown-mint"]);
   assert.deepEqual(store.alerts().map((alert) => alert.title).sort(), ["Live alert", "Orphan alert"]);
-  assert.deepEqual(store.callouts().map((callout) => callout.externalId).sort(), ["demo-named-callout", "live-callout"]);
+  assert.deepEqual(
+    store.db.prepare("SELECT external_id AS externalId FROM callouts ORDER BY external_id").all().map((row) => row.externalId),
+    ["demo-named-callout", "live-callout"]
+  );
 
   const remainingEvents = store.db.prepare("SELECT payload FROM events ORDER BY id").all().map((row) => JSON.parse(row.payload));
   assert.deepEqual(remainingEvents.map((event) => event.mint), ["live-mint", "unknown-mint"]);

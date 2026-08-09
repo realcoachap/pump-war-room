@@ -47,7 +47,7 @@ function publicToken(token) {
   const result = Object.fromEntries([
     "ingestSchemaVersion", "mint", "name", "symbol", "createdAt", "status", "narrative", "marketCap", "volume5m",
     "priceChange5m", "uniqueBuyers", "buyRatio", "bondingProgress", "momentum", "risk", "source",
-    "creator", "deployer", "marketCapSol", "marketCapEvidence", "curveSol", "launchSolAmount", "migrationEvidence", "riskIdentity"
+    "creatorActor", "deployerActor", "marketCapSol", "marketCapEvidence", "curveSol", "launchSolAmount", "migrationEvidence", "riskIdentity"
   ].filter((key) => token[key] !== undefined).map((key) => [key, token[key]]));
   for (const key of ["marketCap", "volume5m", "uniqueBuyers", "bondingProgress", "momentum", "risk"]) {
     const value = finite(result[key]);

@@ -1,10 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Store } from "../src/store.js";
+
+const expectedVersion = JSON.parse(readFileSync(path.resolve("package.json"), "utf8")).version;
+const rawDeployer = "So11111111111111111111111111111111111111112";
+const rawCaller = "@privacy-contract-caller";
+const forbiddenIdentityKeys = new Set(["creator", "deployer", "caller", "traderPublicKey", "actorAddress"]);
 
 async function availablePort() {
   const server = http.createServer();
@@ -17,13 +23,14 @@ async function availablePort() {
 async function startDemoServer(t) {
   const directory = mkdtempSync(path.join(tmpdir(), "pump-war-room-action-api-"));
   const port = await availablePort();
+  const dbPath = path.join(directory, "war-room.db");
   const child = spawn(process.execPath, [path.resolve("src/server.js")], {
     cwd: path.resolve("."),
     env: {
       ...process.env,
       PORT: String(port),
       PUMP_MODE: "demo",
-      DB_PATH: path.join(directory, "war-room.db"),
+      DB_PATH: dbPath,
       VAULT_PATH: path.join(directory, "vault"),
       TELEGRAM_BOT_TOKEN: "",
       TELEGRAM_CHAT_ID: ""
@@ -46,11 +53,55 @@ async function startDemoServer(t) {
     if (child.exitCode !== null) throw new Error(`demo server exited before readiness: ${diagnostics}`);
     try {
       const response = await fetch(`${baseUrl}/api/health`);
-      if (response.ok) return baseUrl;
+      if (response.ok) return { baseUrl, dbPath };
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`demo server did not become ready: ${diagnostics}`);
+}
+
+function assertNoRawIdentityKeys(value, label) {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const entry of value) assertNoRawIdentityKeys(entry, label);
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    assert.equal(forbiddenIdentityKeys.has(key), false, `${label} exposed forbidden identity key ${key}`);
+    assertNoRawIdentityKeys(entry, label);
+  }
+}
+
+async function nextTokenStreamEvent(baseUrl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 7_000);
+  try {
+    const response = await fetch(`${baseUrl}/api/stream`, { signal: controller.signal });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /^text\/event-stream/);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error("SSE stream closed before a token event");
+      pending += decoder.decode(value, { stream: true });
+      let boundary;
+      while ((boundary = pending.indexOf("\n\n")) !== -1) {
+        const block = pending.slice(0, boundary);
+        pending = pending.slice(boundary + 2);
+        const event = block.split("\n").find((line) => line.startsWith("event: "))?.slice(7);
+        const data = block.split("\n").filter((line) => line.startsWith("data: ")).map((line) => line.slice(6)).join("\n");
+        if (["new-token", "token-update"].includes(event) && data) {
+          await reader.cancel();
+          return { event, data: JSON.parse(data) };
+        }
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
 }
 
 async function json(baseUrl, pathname, options) {
@@ -60,9 +111,33 @@ async function json(baseUrl, pathname, options) {
 }
 
 test("action intelligence API enforces strict methods, bounds, and public contracts", async (t) => {
-  const baseUrl = await startDemoServer(t);
+  const { baseUrl, dbPath } = await startDemoServer(t);
+  const privateStore = new Store(dbPath);
+  const privateToken = privateStore.tokens(1)[0];
+  assert.ok(privateToken?.creator, "demo fixture must retain a private creator for projection coverage");
+  privateStore.upsertToken({ ...privateToken, deployer: rawDeployer });
+  const privateCallout = {
+    externalId: "privacy-contract-event",
+    mint: privateToken.mint,
+    symbol: privateToken.symbol,
+    source: "bark",
+    caller: rawCaller,
+    multiple: 2,
+    createdAt: new Date().toISOString()
+  };
+  privateStore.upsertCallout(privateCallout);
+  privateStore.addEvent("callout", privateCallout);
+  privateStore.db.close();
+
   const { body: snapshot } = await json(baseUrl, "/api/snapshot");
-  assert.equal(snapshot.version, "0.8.1");
+  assert.equal(snapshot.version, expectedVersion);
+  assertNoRawIdentityKeys(snapshot, "snapshot");
+  assert.doesNotMatch(JSON.stringify(snapshot), new RegExp([privateToken.creator, rawDeployer, rawCaller].join("|")));
+  const projectedToken = snapshot.tokens.find(({ mint }) => mint === privateToken.mint);
+  assert.match(projectedToken.creatorActor, /^Actor [1-9]\d*$/);
+  assert.match(projectedToken.deployerActor, /^Actor [1-9]\d*$/);
+  const projectedCallout = snapshot.callouts.find(({ mint }) => mint === privateToken.mint);
+  assert.match(projectedCallout.sourceActor, /^Actor [1-9]\d*$/);
   assert.equal(snapshot.actionIntelligence.watchlists.persistence, "browser-local");
   assert.equal(snapshot.actionIntelligence.alerts.telegram.status, "not-configured");
   assert.equal(snapshot.actionIntelligence.alerts.persistence, "atomic-event-alert-outbox-with-durable-baseline");
@@ -70,21 +145,39 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   assert.doesNotMatch(JSON.stringify(snapshot.actionIntelligence), /TELEGRAM_(?:BOT_TOKEN|CHAT_ID)|bot\d*:/i);
   assert.doesNotMatch(JSON.stringify(snapshot.alerts || []), /telegram|dedupeKey/i,
     "public alerts must not expose per-delivery or dedupe metadata");
+  assert.equal(snapshot.earlyActorIntelligence.engine.status, "simulation-disabled");
+  assert.equal(snapshot.earlyActorIntelligence.cohort.admittedCount, 0);
+  assert.equal(snapshot.earlyActorIntelligence.privacy.rawWalletsPublic, false);
+  assert.equal(snapshot.earlyActorIntelligence.privacy.rawProfilesPublic, false);
+  assert.equal(snapshot.earlyActorIntelligence.privacy.actorLookupEndpoint, false);
+  assert.equal(snapshot.earlyActorIntelligence.downstream.status, "withheld");
+  assert.equal(snapshot.earlyActorIntelligence.downstream.labeledHoldoutCalibrationPassed, false);
+  assert.deepEqual({
+    ranking: snapshot.earlyActorIntelligence.downstream.rankingImpact,
+    risk: snapshot.earlyActorIntelligence.downstream.riskProbabilityImpact,
+    telegram: snapshot.earlyActorIntelligence.downstream.telegramAlertImpact,
+    recommendation: snapshot.earlyActorIntelligence.downstream.recommendationImpact
+  }, { ranking: "none", risk: "none", telegram: "none", recommendation: "none" });
   const mints = snapshot.tokens.slice(0, 2).map(({ mint }) => mint);
   assert.equal(mints.length, 2);
 
-  const dossier = await json(baseUrl, `/api/coins/${mints[0]}`);
+  const dossier = await json(baseUrl, `/api/coins/${privateToken.mint}`);
   assert.equal(dossier.response.status, 200);
-  assert.equal(dossier.body.token.mint, mints[0]);
-  assert.deepEqual(Object.keys(dossier.body).sort(), ["disclaimer", "generatedAt", "outcome", "radar", "schemaVersion", "scope", "timeline", "token"]);
+  assert.equal(dossier.body.token.mint, privateToken.mint);
+  assert.deepEqual(Object.keys(dossier.body).sort(), ["disclaimer", "earlyActor", "generatedAt", "outcome", "radar", "schemaVersion", "scope", "timeline", "token"]);
+  assert.equal(dossier.body.earlyActor, null);
+  assertNoRawIdentityKeys(dossier.body, "dossier");
+  assert.doesNotMatch(JSON.stringify(dossier.body), new RegExp([privateToken.creator, rawDeployer, rawCaller].join("|")));
 
-  const firstPage = await json(baseUrl, `/api/coins/${mints[0]}/timeline?limit=1`);
+  const firstPage = await json(baseUrl, `/api/coins/${privateToken.mint}/timeline?limit=1`);
   assert.equal(firstPage.response.status, 200);
   assert.equal(firstPage.body.limit, 1);
   assert.equal(firstPage.body.entries.length, 1);
   assert.equal(firstPage.body.rawProviderPayloadsIncluded, false);
+  assertNoRawIdentityKeys(firstPage.body, "timeline");
+  assert.doesNotMatch(JSON.stringify(firstPage.body), new RegExp([privateToken.creator, rawDeployer, rawCaller].join("|")));
   if (firstPage.body.nextBefore) {
-    const secondPage = await json(baseUrl, `/api/coins/${mints[0]}/timeline?limit=1&before=${encodeURIComponent(firstPage.body.nextBefore)}`);
+    const secondPage = await json(baseUrl, `/api/coins/${privateToken.mint}/timeline?limit=1&before=${encodeURIComponent(firstPage.body.nextBefore)}`);
     assert.equal(secondPage.response.status, 200);
     assert.notDeepEqual(secondPage.body.entries, firstPage.body.entries);
   }
@@ -124,4 +217,9 @@ test("action intelligence API enforces strict methods, bounds, and public contra
     assert.equal(response.headers.get("allow"), "GET");
   }
   assert.equal((await fetch(`${baseUrl}/api/export/weekly`)).status, 405);
+
+  const streamed = await nextTokenStreamEvent(baseUrl);
+  assert.ok(["new-token", "token-update"].includes(streamed.event));
+  assertNoRawIdentityKeys(streamed.data, "SSE token event");
+  assert.doesNotMatch(JSON.stringify(streamed.data), new RegExp([privateToken.creator, rawDeployer, rawCaller].join("|")));
 });

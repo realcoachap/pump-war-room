@@ -221,7 +221,7 @@ function timelineCallout(row, expectedMint) {
   if (!row || typeof row !== "object" || row.mint !== expectedMint || row.source !== "bark") return null;
   const at = evidenceTime(row.createdAt);
   if (!at) return null;
-  const caller = text(row.caller, "unknown source", 80);
+  const caller = text(row.sourceActor, "anonymous source actor", 80);
   return {
     kind: "third-party-callout", at, evidenceClass: "third-party",
     title: "Third-party callout observed",

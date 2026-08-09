@@ -27,6 +27,23 @@ import { Store, STORE_SCHEMA_VERSION } from "../src/store.js";
 import { parseGeckoTerminalTokenInfo } from "../src/risk-identity.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
+const actorMint = "So11111111111111111111111111111111111111112";
+
+function actorObservation(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    mint: actorMint,
+    actor: "Actor 42",
+    side: "buy",
+    amounts: { native: null, token: 2.5 },
+    source: { name: "solana-mainnet-rpc", evidenceClass: "on-chain-finalized" },
+    timestamps: { source: { state: "available", value: createdAt }, observedAt: createdAt },
+    transactionProvenance: {
+      state: "internal-only", evidenceClass: "locally-derived", slot: { state: "available", value: 42 }
+    },
+    ...overrides
+  };
+}
 
 function temporaryWorkspace(t) {
   const directory = mkdtempSync(path.join(tmpdir(), "pump-war-room-backup-test-"));
@@ -66,6 +83,27 @@ function seededStore(directory) {
     status: "available", missingReason: null, errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
     nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
   });
+  store.admitActorMint({
+    mint: actorMint,
+    launchObservedAt: createdAt,
+    admittedAt: createdAt,
+    nextAttemptAt: createdAt,
+    limit: 16
+  });
+  store.saveActorObservation({
+    eventKey: "seeded-actor-observation",
+    mint: actorMint,
+    event: actorObservation(),
+    sourceAt: createdAt,
+    observedAt: createdAt,
+    retainedUntil: "2026-08-10T12:00:00.000Z"
+  });
+  store.saveActorSummary(actorMint, {
+    schemaVersion: 1,
+    mint: actorMint,
+    coverage: { state: "insufficient-sample", eventCount: 1, uniqueActorCount: 1 },
+    metrics: null
+  });
   return { store, databasePath };
 }
 
@@ -78,6 +116,7 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   t.after(() => store.db.close());
 
   assert.equal(lstatSync(`${databasePath}-wal`).isFile(), true);
+  const actorSecretBefore = store.actorPrivacySecret().toString("hex");
   const sourceBefore = digest(databasePath);
   const walBefore = digest(`${databasePath}-wal`);
   const report = createVerifiedBackup(databasePath, destination, { scratchRoot: scratchDirectory });
@@ -87,14 +126,32 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   assert.equal(report.backup.integrityCheck, "ok");
   assert.equal(report.disposableRestore.verified, true);
   assert.deepEqual(report.disposableRestore.applicationWriteProbe, {
-    verified: true, rolledBack: true, telegramOutboxDue: true, invalidPendingRejected: true
+    verified: true,
+    rolledBack: true,
+    telegramOutboxDue: true,
+    invalidPendingRejected: true,
+    actor: {
+      installationSecretStable: true,
+      admissionWritten: true,
+      observationWritten: true,
+      duplicateSuppressed: true,
+      conflictRejected: true,
+      summaryWritten: true,
+      retentionEnforced: true,
+      rawIdentityRejected: true,
+      rawIdentityViolations: 0
+    }
   });
   assert.deepEqual(report.backup.rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1,
+    actor_installation: 1, actor_cohort: 1, actor_observations: 1, actor_summaries: 1
   });
   assert.deepEqual(report.backup.invalidJsonPayloads, {
-    tokens: 0, events: 0, callouts: 0, brief_runs: 0, outcome_enrichment: 0, risk_identity_enrichment: 0
+    tokens: 0, events: 0, callouts: 0, brief_runs: 0, outcome_enrichment: 0, risk_identity_enrichment: 0,
+    actor_observations: 0, actor_summaries: 0
   });
+  assert.equal(report.backup.actorInstallationSecretValid, true);
+  assert.equal(report.backup.actorPrivacyViolations, 0);
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(digest(databasePath), sourceBefore);
   assert.equal(digest(`${databasePath}-wal`), walBefore);
@@ -134,6 +191,9 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
     outcome: { baseline: { nonempty: true, observedAt: createdAt }, windows: { "5m": { maximumDrawdownPct: 2, returnPct: 10 } } }
   });
   assert.equal(JSON.parse(restored.prepare("SELECT evidence FROM risk_identity_enrichment").get().evidence).provider, "geckoterminal");
+  assert.equal(Buffer.from(restored.prepare("SELECT secret FROM actor_installation WHERE id=1").get().secret).toString("hex"), actorSecretBefore);
+  assert.equal(JSON.parse(restored.prepare("SELECT event FROM actor_observations").get().event).actor, "Actor 42");
+  assert.equal(JSON.parse(restored.prepare("SELECT summary FROM actor_summaries").get().summary).mint, actorMint);
   assert.equal(restored.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name='price_observations'").get().count, 0);
   assert.equal(store.token("LiveMintPump").symbol, "LIVE");
 });
@@ -155,7 +215,8 @@ test("standalone restore verification is read-only and removes its disposable co
   assert.equal(statSync(destination).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
   assert.deepEqual(inspectDatabaseFile(destination).rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1,
+    actor_installation: 1, actor_cohort: 1, actor_observations: 1, actor_summaries: 1
   });
 });
 
@@ -185,6 +246,10 @@ test("verifies an exact v0.5.1 artifact by migrating only the disposable restore
   assert.equal(report.disposableRestore.rowCounts.outcome_enrichment, 0);
   assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
   assert.equal(report.disposableRestore.rowCounts.brief_runs, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_installation, 1);
+  assert.equal(report.disposableRestore.rowCounts.actor_cohort, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_observations, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_summaries, 0);
   assert.equal(digest(legacyPath), before.hash);
   assert.equal(statSync(legacyPath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
@@ -226,6 +291,10 @@ test("verifies an exact v0.6.0 artifact by migrating only the disposable restore
   assert.equal(report.disposableRestore.rowCounts.tokens, 1);
   assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
   assert.equal(report.disposableRestore.rowCounts.brief_runs, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_installation, 1);
+  assert.equal(report.disposableRestore.rowCounts.actor_cohort, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_observations, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_summaries, 0);
   assert.equal(digest(outcomePath), before.hash);
   assert.equal(statSync(outcomePath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
@@ -335,7 +404,8 @@ test("verifies an exact v0.7 artifact and migrates only the disposable restore c
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 700);
   assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
   assert.deepEqual(report.disposableRestore.rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 0, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 0, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1,
+    actor_installation: 1, actor_cohort: 0, actor_observations: 0, actor_summaries: 0
   });
 
   const disposableMigrationPath = path.join(directory, "v0.7-disposable-migration.db");
@@ -394,6 +464,10 @@ test("verifies schema 800 and repairs a pending outbox row only in the disposabl
     DROP TABLE alerts_schema_801;
     CREATE UNIQUE INDEX alerts_dedupe_key ON alerts(dedupe_key) WHERE dedupe_key IS NOT NULL;
     CREATE INDEX alerts_mint_created ON alerts(mint, created_at DESC);
+    DROP TABLE actor_summaries;
+    DROP TABLE actor_observations;
+    DROP TABLE actor_cohort;
+    DROP TABLE actor_installation;
     PRAGMA user_version = 800;
   `);
   actionStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
@@ -432,6 +506,41 @@ test("verifies schema 800 and repairs a pending outbox row only in the disposabl
 
   assert.equal(digest(actionPath), before.hash);
   assert.equal(statSync(actionPath).mtime.toISOString(), before.modifiedAt);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
+test("verifies an exact schema 801 artifact and adds actor storage only to the disposable restore", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const { store, databasePath } = seededStore(directory);
+  store.db.exec(`
+    DROP TABLE actor_summaries;
+    DROP TABLE actor_observations;
+    DROP TABLE actor_cohort;
+    DROP TABLE actor_installation;
+    PRAGMA user_version = 801;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA journal_mode = DELETE;
+  `);
+  store.db.close();
+  const before = { hash: digest(databasePath), modifiedAt: statSync(databasePath).mtime.toISOString() };
+
+  const artifact = inspectDatabaseFile(databasePath, { allowLegacy: true });
+  assert.equal(artifact.userVersion, 801);
+  assert.equal(Object.hasOwn(artifact.rowCounts, "actor_installation"), false);
+
+  const report = verifyRestorableBackup(databasePath, { scratchRoot: scratchDirectory });
+  assert.equal(report.artifact.userVersion, 801);
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, 801);
+  assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
+  assert.equal(report.disposableRestore.rowCounts.actor_installation, 1);
+  assert.equal(report.disposableRestore.rowCounts.actor_cohort, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_observations, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_summaries, 0);
+  assert.equal(report.disposableRestore.actorInstallationSecretValid, true);
+  assert.equal(report.disposableRestore.actorPrivacyViolations, 0);
+  assert.equal(digest(databasePath), before.hash);
+  assert.equal(statSync(databasePath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 
@@ -507,6 +616,35 @@ test("requires the outcome-enrichment lookup index before creating a backup", (t
     (error) => error instanceof DatabaseVerificationError && /schema objects do not exactly match/.test(error.message)
   );
   assert.equal(readdirSync(directory).includes("must-not-publish.db"), false);
+});
+
+test("requires actor retention schema and rejects persisted raw actor identities", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+
+  const missingIndexDirectory = path.join(directory, "missing-index");
+  const { store: indexStore, databasePath: missingIndexPath } = seededStore(missingIndexDirectory);
+  indexStore.db.exec("DROP INDEX actor_observations_retention");
+  assert.throws(
+    () => createVerifiedBackup(missingIndexPath, path.join(directory, "actor-index-missing.db"), {
+      scratchRoot: scratchDirectory
+    }),
+    (error) => error instanceof DatabaseVerificationError && /schema objects do not exactly match/.test(error.message)
+  );
+  indexStore.db.close();
+  assert.equal(readdirSync(directory).includes("actor-index-missing.db"), false);
+
+  const leakedDirectory = path.join(directory, "identity-leak");
+  const { store: leakedStore, databasePath: leakedPath } = seededStore(leakedDirectory);
+  leakedStore.db.prepare("UPDATE actor_observations SET event=? WHERE event_key='seeded-actor-observation'")
+    .run(JSON.stringify({ ...actorObservation(), actorAddress: "So11111111111111111111111111111111111111112" }));
+  leakedStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+  leakedStore.db.close();
+  assert.throws(
+    () => verifyRestorableBackup(leakedPath, { scratchRoot: scratchDirectory }),
+    (error) => error instanceof DatabaseVerificationError && /raw identity or hidden mapping field/.test(error.message)
+  );
+  assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 
 test("rejects corrupt, truncated, and wrong-schema artifacts and cleans scratch space", (t) => {

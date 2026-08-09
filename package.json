@@ -1,9 +1,9 @@
 {
   "name": "opencaesar-pump-war-room",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "private": true,
   "type": "module",
-  "description": "Read-only Pump.fun intelligence radar with auditable outcome, risk, and identity evidence.",
+  "description": "Read-only Pump.fun intelligence radar with auditable outcomes, risk evidence, and anonymous early-actor observations.",
   "scripts": {
     "start": "node src/server.js",
     "demo": "PUMP_MODE=demo node src/server.js",

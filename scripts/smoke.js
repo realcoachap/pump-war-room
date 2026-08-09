@@ -12,6 +12,9 @@ const RISK_COHORT_LIMIT = 120;
 const RISK_PARSER_AUDIT_SAMPLE_LIMIT = 16;
 const RISK_MINIMUM_SUCCESS_COVERAGE_RATIO = 0.5;
 const RISK_MAXIMUM_INVALID_RESPONSE_RATIO = 0.25;
+const ACTOR_COHORT_LIMIT = 32;
+const ACTOR_MINIMUM_ELIGIBLE_MINTS = 20;
+const ACTOR_MINIMUM_ACQUISITION_COVERAGE = 0.6;
 const MATERIAL_ALERT_KINDS = new Set([
   "score-rise", "score-drop", "risk-concentration", "risk-developer-holding",
   "risk-identity-reuse", "risk-creator-history", "migration-observed"
@@ -48,6 +51,15 @@ const PUBLIC_RISK_SUMMARY_KEYS = new Set([
   "identityHistoryCount", "liquidityEvidenceCount", "curveEvidenceCount", "migrationObservationCount"
 ]);
 const RAW_PROFILE_VALUE = /^(?:@[A-Za-z0-9_]{1,32}|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s]+)$/i;
+const RAW_PUBLIC_IDENTITY_KEYS = new Set([
+  "creator", "deployer", "caller", "actoraddress", "traderpublickey", "signature", "transactionid"
+]);
+const HIDDEN_PUBLIC_MATERIAL_KEYS = new Set([
+  "secret", "installationsecret", "actorsecret", "key", "privatekey", "hmackey", "keymaterial",
+  "mapping", "mappingmaterial", "hiddenmappingmaterial", "actormapping", "addressmapping",
+  "digest", "provenance", "transactionprovenance", "provenancekey", "provenancedigest",
+  "eventkey", "dedupekey", "integritykey"
+]);
 
 export class SmokeCheckError extends Error {
   constructor(check, message) {
@@ -81,6 +93,119 @@ function rejectRawIdentityValues(value, path) {
   for (const [key, entry] of Object.entries(value)) {
     rejectRawIdentityValues(entry, `${path}.${key}`);
   }
+}
+
+function normalizedPublicKey(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function rejectPublicIdentityLeaks(value, path, check) {
+  if (typeof value === "string") {
+    requireValue(!RAW_PROFILE_VALUE.test(value), check, `${path} exposed a raw social profile value`);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => rejectPublicIdentityLeaks(entry, `${path}[${index}]`, check));
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = normalizedPublicKey(key);
+    const boundaryDeclaration = entry === false && /(?:public|persisted|included)$/.test(normalized);
+    const rawIdentityKey = RAW_PUBLIC_IDENTITY_KEYS.has(normalized)
+      || /^(?:creator|deployer|caller)(?:address|wallet|publickey|profile|handle|id)$/.test(normalized)
+      || normalized.endsWith("signature");
+    const hiddenMaterial = !boundaryDeclaration && (HIDDEN_PUBLIC_MATERIAL_KEYS.has(normalized)
+      || normalized.includes("provenance") || normalized.includes("mapping")
+      || normalized.endsWith("digest") || normalized.endsWith("secret") || normalized.endsWith("key")
+      || normalized === "hmac");
+    requireValue(!rawIdentityKey, check, `${path}.${key} exposed a raw public identity key`);
+    requireValue(!hiddenMaterial, check, `${path}.${key} exposed hidden mapping, key, digest, or provenance material`);
+    rejectPublicIdentityLeaks(entry, `${path}.${key}`, check);
+  }
+}
+
+function validateActorDownstreamGate(gate, path, check) {
+  requireValue(gate && typeof gate === "object" && !Array.isArray(gate), check, `${path} was missing`);
+  requireValue(["withheld", "review-required"].includes(gate.status)
+    && gate.minimumEligibleMints === ACTOR_MINIMUM_ELIGIBLE_MINTS
+    && gate.minimumAcquisitionCoverage === ACTOR_MINIMUM_ACQUISITION_COVERAGE,
+  check, `${path} minimum-sample or coverage gate was invalid`);
+  requireValue(Number.isSafeInteger(gate.eligibleMintCount) && gate.eligibleMintCount >= 0
+    && (gate.acquisitionCoverage === null || (Number.isFinite(gate.acquisitionCoverage)
+      && gate.acquisitionCoverage >= 0 && gate.acquisitionCoverage <= 1)),
+  check, `${path} evidence denominators were invalid`);
+  requireValue(gate.labeledHoldoutCalibrationPassed === false
+    && gate.rankingImpact === "none" && gate.riskProbabilityImpact === "none"
+    && gate.telegramAlertImpact === "none" && gate.recommendationImpact === "none",
+  check, `${path} did not keep every downstream use withheld pending separately reviewed calibration`);
+}
+
+function validateActorSummary(summary, mint, path, check) {
+  requireValue(summary && typeof summary === "object" && !Array.isArray(summary) && summary.mint === mint,
+    check, `${path} did not identify the exact mint`);
+  const coverage = summary.coverage;
+  requireValue(coverage && ["missing", "insufficient-sample", "available"].includes(coverage.state)
+    && Number.isSafeInteger(coverage.eventCount) && coverage.eventCount >= 0
+    && Number.isSafeInteger(coverage.uniqueActorCount) && coverage.uniqueActorCount >= 0
+    && coverage.uniqueActorCount <= coverage.eventCount,
+  check, `${path}.coverage was invalid`);
+  requireValue(coverage.launchObservedAt && ["available", "missing"].includes(coverage.launchObservedAt.state)
+    && (coverage.launchObservedAt.state === "available"
+      ? Number.isFinite(Date.parse(coverage.launchObservedAt.value))
+      : coverage.launchObservedAt.value === null),
+  check, `${path}.coverage launch-observed timestamp evidence was invalid`);
+  const sourceTimestamps = coverage.sourceTimestamps;
+  requireValue(sourceTimestamps && ["available", "partial", "missing"].includes(sourceTimestamps.state)
+    && Number.isSafeInteger(sourceTimestamps.availableCount) && sourceTimestamps.availableCount >= 0
+    && Number.isSafeInteger(sourceTimestamps.missingCount) && sourceTimestamps.missingCount >= 0
+    && sourceTimestamps.availableCount + sourceTimestamps.missingCount === coverage.eventCount
+    && Number.isFinite(sourceTimestamps.ratio) && sourceTimestamps.ratio >= 0 && sourceTimestamps.ratio <= 1,
+  check, `${path}.coverage source-timestamp evidence was invalid`);
+  const gate = coverage.gate;
+  requireValue(gate && Number.isSafeInteger(gate.minimumEventCount) && gate.minimumEventCount > 0
+    && Number.isSafeInteger(gate.minimumActorCount) && gate.minimumActorCount > 0
+    && gate.minimumSourceTimestampRatio === 1
+    && [gate.eventCountMet, gate.actorCountMet, gate.sourceTimestampRatioMet].every((value) => typeof value === "boolean"),
+  check, `${path}.coverage eligibility gate was invalid`);
+  requireValue(coverage.state === "available" ? summary.metrics && typeof summary.metrics === "object" : summary.metrics === null,
+    check, `${path} presented metrics outside the explicit per-coin evidence gate`);
+  if (summary.metrics) {
+    requireValue(["available", "missing"].includes(summary.metrics.timing?.state)
+      && summary.metrics.timing?.basis === "source-timestamp-minus-launch-observed-at"
+      && Number.isFinite(Date.parse(summary.metrics.timing?.launchObservedAt))
+      && summary.metrics.uniqueActors?.state === "available"
+      && summary.metrics.uniqueActors?.count === coverage.uniqueActorCount
+      && summary.metrics.repeatActivity?.state === "available"
+      && ["available", "missing"].includes(summary.metrics.holdingDurationEvidence?.state)
+      && summary.metrics.holdingDurationEvidence?.basis === "validated-buy-to-subsequent-sell"
+      && summary.metrics.holdingDurationEvidence?.timestampBasis === "source-timestamp"
+      && ["available", "missing"].includes(summary.metrics.amountConcentration?.state)
+      && summary.metrics.amountConcentration?.basis === "observed-token-amount-not-holdings"
+      && ["available", "missing"].includes(summary.metrics.activityBurst?.state)
+      && summary.metrics.activityBurst?.timestampBasis === "source-timestamp",
+    check, `${path}.metrics lacked launch-relative timing, duration, concentration, or burst evidence`);
+  }
+}
+
+function validateActorEngine(engine, path, check, expectedMode) {
+  const allowedStates = expectedMode === "live"
+    ? ["awaiting-prospective-admission", "queued", "acquiring", "observing", "complete", "unavailable", "rate-limited", "degraded", "invalid-response"]
+    : ["simulation-disabled"];
+  requireValue(engine?.schemaVersion === 1 && engine.source === "solana-mainnet-rpc"
+    && allowedStates.includes(engine.status) && Number.isSafeInteger(engine.queueDepth) && engine.queueDepth >= 0,
+  check, `${path} early-actor engine contract was missing`);
+  if (expectedMode !== "live") return;
+  requireValue(engine.started === true, check, `${path} was not started`);
+  requireValue(engine.cohort?.limit === ACTOR_COHORT_LIMIT
+    && Number.isSafeInteger(engine.cohort?.admittedCount) && engine.cohort.admittedCount >= 0
+    && engine.cohort.admittedCount <= ACTOR_COHORT_LIMIT
+    && Number.isSafeInteger(engine.cohort?.evidenceMintCount) && engine.cohort.evidenceMintCount >= 0
+    && Number.isSafeInteger(engine.cohort?.eligibleMintCount) && engine.cohort.eligibleMintCount >= 0
+    && engine.cohort.eligibleMintCount <= engine.cohort.evidenceMintCount
+    && engine.cohort.evidenceMintCount <= engine.cohort.admittedCount,
+  check, `${path} cohort coverage was invalid`);
+  validateActorDownstreamGate(engine.correlationGate, `${path}.correlationGate`, check);
 }
 
 function validatePublicRiskIdentity(identity, path) {
@@ -247,6 +372,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
 
   requireValue(dossier?.schemaVersion === 1 && dossier?.token?.mint === endpointMints[0]
     && dossier?.radar && dossier?.timeline === `/api/coins/${endpointMints[0]}/timeline`, "dossier", "strict public dossier contract was missing");
+  requireValue(Object.hasOwn(dossier, "earlyActor"), "dossier", "early-actor evidence field was missing");
+  if (dossier.earlyActor !== null) validateActorSummary(dossier.earlyActor, endpointMints[0], "dossier.earlyActor", "dossier");
   requireValue(timeline?.schemaVersion === 1 && timeline?.mint === endpointMints[0] && timeline?.limit === 2
     && Array.isArray(timeline.entries) && timeline.rawProviderPayloadsIncluded === false
     && (timeline.nextBefore === null || typeof timeline.nextBefore === "string"), "timeline", "typed paginated timeline contract was missing");
@@ -363,6 +490,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     requireValue(health.riskIntelligence?.ongoingFreshnessRequired === false
       && health.riskIntelligence?.evidenceAcquisition === "bounded-one-time-15m-with-one-missing-or-stale-retry", "health", "risk identity bounded acquisition policy was missing");
   }
+  validateActorEngine(health.earlyActors, "health.earlyActors", "health", expectedMode);
 
   requireValue(snapshot.version === expectedVersion, "snapshot", `version ${snapshot.version ?? "missing"} did not match ${expectedVersion}`);
   requireValue(snapshot.mode === expectedMode, "snapshot", `mode ${snapshot.mode ?? "missing"} did not match ${expectedMode}`);
@@ -541,6 +669,70 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     tokens: snapshot.tokens,
     leaderboard: snapshot.leaderboard?.top100
   });
+  const actorIntelligence = snapshot.earlyActorIntelligence;
+  requireValue(actorIntelligence?.schemaVersion === 1, "snapshot", "early-actor intelligence schema was missing");
+  requireValue(actorIntelligence.source?.id === "solana-mainnet-rpc"
+    && actorIntelligence.source?.evidenceClass === "on-chain-finalized"
+    && actorIntelligence.source?.endpointClass === "documented-rate-limited-public-rpc"
+    && actorIntelligence.source?.attributionUrl === "https://solana.com/docs/references/clusters"
+    && actorIntelligence.source?.pumpProgramDocs === "https://github.com/pump-fun/pump-public-docs"
+    && actorIntelligence.source?.completeness === "partial-and-unmeasured"
+    && typeof actorIntelligence.source?.scope === "string"
+    && actorIntelligence.source.scope.includes("newest")
+    && actorIntelligence.source.scope.includes("in-window")
+    && typeof actorIntelligence.source?.productionSuitability === "string"
+    && actorIntelligence.source.productionSuitability.includes("best-effort"),
+  "snapshot", "bounded finalized public-RPC source contract was missing");
+  requireValue(actorIntelligence.sampling?.policy === "prospective-fixed-admission-v1"
+    && actorIntelligence.sampling?.cohortLimit === ACTOR_COHORT_LIMIT
+    && actorIntelligence.sampling?.earlyWindowSeconds === 1_800
+    && JSON.stringify(actorIntelligence.sampling?.attemptsAtSeconds) === JSON.stringify([120, 600, 1800])
+    && actorIntelligence.sampling?.signaturePageLimit === 16
+    && actorIntelligence.sampling?.transactionLimitPerAttempt === 8
+    && actorIntelligence.sampling?.rawSourcePayloadsPersisted === false
+    && actorIntelligence.sampling?.rawWalletsPersisted === false
+    && actorIntelligence.sampling?.rawTransactionIdsPersisted === false
+    && actorIntelligence.sampling?.normalizedObservationRetentionSeconds === 72 * 60 * 60
+    && actorIntelligence.sampling?.aggregateSummariesPersisted === true,
+  "snapshot", "prospective bounded early-actor sampling and retention contract was missing");
+  requireValue(actorIntelligence.privacy?.labels === "per-installation keyed Actor numbers"
+    && actorIntelligence.privacy?.rawWalletsPublic === false
+    && actorIntelligence.privacy?.rawProfilesPublic === false
+    && actorIntelligence.privacy?.actorLookupEndpoint === false
+    && actorIntelligence.privacy?.hiddenMappingMaterialPublic === false,
+  "snapshot", "early-actor public privacy boundary was missing");
+  validateActorEngine(actorIntelligence.engine, "snapshot.earlyActorIntelligence.engine", "snapshot", expectedMode);
+  validateActorDownstreamGate(actorIntelligence.downstream, "snapshot.earlyActorIntelligence.downstream", "snapshot");
+  requireValue(JSON.stringify(actorIntelligence.downstream) === JSON.stringify(actorIntelligence.engine.correlationGate),
+    "snapshot", "early-actor engine and public downstream gates disagreed");
+  requireValue(actorIntelligence.cohort?.limit === ACTOR_COHORT_LIMIT
+    && Number.isSafeInteger(actorIntelligence.cohort?.admittedCount)
+    && actorIntelligence.cohort.admittedCount === actorIntelligence.engine.cohort.admittedCount
+    && Array.isArray(actorIntelligence.cohort?.observations)
+    && actorIntelligence.cohort.observations.length === actorIntelligence.cohort.admittedCount,
+  "snapshot", "inspectable early-actor cohort contract was missing or inconsistent");
+  const actorObservationMints = new Set();
+  for (const [index, observation] of actorIntelligence.cohort.observations.entries()) {
+    const path = `snapshot.earlyActorIntelligence.cohort.observations[${index}]`;
+    requireValue(observation && typeof observation.mint === "string" && !actorObservationMints.has(observation.mint)
+      && typeof observation.name === "string" && typeof observation.symbol === "string"
+      && Number.isFinite(Date.parse(observation.launchObservedAt))
+      && observation.acquisition && typeof observation.acquisition.status === "string"
+      && Number.isSafeInteger(observation.acquisition.attemptCount) && observation.acquisition.attemptCount >= 0,
+    "snapshot", `${path} acquisition evidence was invalid`);
+    actorObservationMints.add(observation.mint);
+    if (observation.summary !== null) validateActorSummary(observation.summary, observation.mint, `${path}.summary`, "snapshot");
+  }
+  if (expectedMode === "live") {
+    requireValue(health.earlyActors.cohort.admittedCount === actorIntelligence.cohort.admittedCount
+      && health.earlyActors.cohort.evidenceMintCount === actorIntelligence.engine.cohort.evidenceMintCount
+      && health.earlyActors.cohort.eligibleMintCount === actorIntelligence.engine.cohort.eligibleMintCount,
+    "snapshot", "early-actor health and snapshot coverage disagreed");
+  }
+  for (const [check, value] of [
+    ["health", health], ["snapshot", snapshot], ["dossier", dossier], ["timeline", timeline],
+    ["compare", comparison], ["daily brief", dailyBrief], ["weekly brief", weeklyBrief]
+  ]) rejectPublicIdentityLeaks(value, check, check);
   for (const entry of snapshot.leaderboard?.top100 || []) {
     for (const window of ["5m", "15m", "1h", "6h", "24h"]) {
       const outcome = entry?.outcome?.windows?.[window];
@@ -558,6 +750,10 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(htmlResult.body.includes('data-release-marker="actionable-intelligence-v1"')
     && htmlResult.body.includes("BROWSER-LOCAL WORKBENCH") && htmlResult.body.includes("MATERIALITY POLICY v1"),
   "html", "actionable intelligence release marker was missing");
+  requireValue(htmlResult.body.includes('data-release-marker="anonymous-early-actor-v1"')
+    && htmlResult.body.includes("Per-installation keyed Actor numbers")
+    && htmlResult.body.includes("CORRELATIONS WITHHELD"),
+  "html", "anonymous early-actor privacy or downstream-withholding marker was missing");
   requireValue(scriptResult.body.includes("renderFeedObservability"), "app.js", "feed observability UI marker was missing");
   requireValue(scriptResult.body.includes("renderOutcomes") && scriptResult.body.includes("raw candle retention off"), "app.js", "outcome engine UI marker was missing");
   requireValue(scriptResult.body.includes("renderRiskIntelligence")
@@ -566,18 +762,34 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(scriptResult.body.includes("PREFERENCE_KEY") && scriptResult.body.includes("localStorage")
     && scriptResult.body.includes("renderActionIntelligence") && scriptResult.body.includes("renderCoinTimeline")
     && scriptResult.body.includes("/api/compare?mints="), "app.js", "watchlist, timeline, or compare UI markers were missing");
+  requireValue(scriptResult.body.includes("renderEarlyActors") && scriptResult.body.includes("earlyActorDetail")
+    && scriptResult.body.includes("installation-scoped, non-reversible labels")
+    && scriptResult.body.includes("trade signal"),
+  "app.js", "anonymous early-actor evidence UI markers were missing");
   requireValue(preferencesResult.body.includes("normalizePreferences") && preferencesResult.body.includes("WATCHLIST_LIMIT = 50")
     && preferencesResult.body.includes("PRESET_LIMIT = 12"), "preferences.js", "bounded browser preference contract was missing");
   requireValue(stylesResult.body.includes(".outcome-source,footer{font-size:10px}"), "styles.css", "minimum-size provider attribution style was missing");
   requireValue(stylesResult.body.includes(".risk-intelligence-source"), "styles.css", "risk identity responsive style was missing");
   requireValue(stylesResult.body.includes(".action-intelligence") && stylesResult.body.includes(".comparison-table")
     && stylesResult.body.includes(".timeline-entry"), "styles.css", "action intelligence responsive styles were missing");
+  requireValue(stylesResult.body.includes("v0.9 anonymous early-actor intelligence")
+    && stylesResult.body.includes(".early-actors") && stylesResult.body.includes(".early-actor-detail")
+    && stylesResult.body.includes("@media(max-width:650px)"),
+  "styles.css", "anonymous early-actor desktop or responsive styles were missing");
   requireValue(termsResult.body.includes("CoinGecko API Terms") && termsResult.body.includes("not verified prices")
     && termsResult.body.includes("does not prove duplicate content") && termsResult.body.includes("common control")
     && termsResult.body.includes("materiality policy") && termsResult.body.includes("migration observation"), "terms", "provider ownership, alert, or risk-evidence terms were missing");
   requireValue(privacyResult.body.includes("Minimal data by design") && privacyResult.body.includes("does not persist or expose bulk GeckoTerminal responses") && privacyResult.body.includes("domain-separated hashes"), "privacy", "privacy and retention notice was missing");
   requireValue(privacyResult.body.includes("browser-local") && privacyResult.body.includes("Telegram")
     && privacyResult.body.includes("Bot API") && privacyResult.body.includes("opt out"), "privacy", "watchlist or Telegram privacy notice was missing");
+  requireValue(/early[- ]actor/i.test(termsResult.body) && /partial.{0,40}unmeasured/is.test(termsResult.body)
+    && /does not (?:establish|prove).{0,100}(?:identity|coordination)/is.test(termsResult.body)
+    && /trade signal/i.test(termsResult.body),
+  "terms", "early-actor source limitations or neutral-use terms were missing");
+  requireValue(/per-installation keyed Actor/i.test(privacyResult.body)
+    && /raw wallet addresses/i.test(privacyResult.body) && /transaction signatures/i.test(privacyResult.body)
+    && /(?:72[- ]hour|72 hours)/i.test(privacyResult.body) && /mapping material/i.test(privacyResult.body),
+  "privacy", "early-actor pseudonymization, retention, or raw-identity privacy notice was missing");
 
   return {
     ok: true,
@@ -591,7 +803,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       errorsTotal: health.telemetry.errorsTotal,
       responses5xx: health.telemetry.responses5xx,
       outcomeState: health.outcomes.status,
-      riskIdentityState: health.riskIntelligence.status
+      riskIdentityState: health.riskIntelligence.status,
+      earlyActorState: health.earlyActors.status
     },
     http: {
       health: 200, snapshot: 200, html: 200, appJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
@@ -600,7 +813,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     markers: {
       version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
       actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-      parserRevision: true, legalNotices: true
+      parserRevision: true, anonymousEarlyActors: true, legalNotices: true
     }
   };
 }

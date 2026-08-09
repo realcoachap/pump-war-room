@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 
-const version = "0.8.1";
+const version = "0.9.0";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -114,6 +114,139 @@ function riskCoverage({ stateCount = 120, successCount = 90, statusCounts = { av
   };
 }
 
+function actorDownstreamGate() {
+  return {
+    status: "withheld",
+    minimumEligibleMints: 20,
+    minimumAcquisitionCoverage: 0.6,
+    eligibleMintCount: 1,
+    acquisitionCoverage: 1,
+    labeledHoldoutCalibrationPassed: false,
+    rankingImpact: "none",
+    riskProbabilityImpact: "none",
+    telegramAlertImpact: "none",
+    recommendationImpact: "none"
+  };
+}
+
+function actorSummary(mint = cohortMint(0)) {
+  return {
+    mint,
+    coverage: {
+      state: "available",
+      eventCount: 5,
+      uniqueActorCount: 3,
+      launchObservedAt: { state: "available", value: "2026-08-08T11:45:00.000Z" },
+      sourceTimestamps: { state: "available", availableCount: 5, missingCount: 0, ratio: 1 },
+      gate: {
+        minimumEventCount: 5,
+        minimumActorCount: 3,
+        minimumSourceTimestampRatio: 1,
+        eventCountMet: true,
+        actorCountMet: true,
+        sourceTimestampRatioMet: true
+      }
+    },
+    metrics: {
+      timing: {
+        state: "available", basis: "source-timestamp-minus-launch-observed-at",
+        launchObservedAt: "2026-08-08T11:45:00.000Z", earlyWindowMs: 1_800_000,
+        firstActivityAt: "2026-08-08T11:45:10.000Z", lastActivityAt: "2026-08-08T11:46:20.000Z",
+        actorsObservedWithinWindow: 3,
+        actorFirstObservationOffsetMs: { minimum: 10_000, median: 20_000, maximum: 30_000 }
+      },
+      uniqueActors: { state: "available", count: 3 },
+      repeatActivity: { state: "available", actorsWithMultipleBuys: 1, actorsWithMultipleSells: 0, actorsObservedOnBothSides: 1 },
+      holdingDurationEvidence: {
+        state: "available", basis: "validated-buy-to-subsequent-sell", timestampBasis: "source-timestamp",
+        pairedObservationCount: 1, minimumMs: 60_000, medianMs: 60_000, maximumMs: 60_000
+      },
+      amountConcentration: {
+        state: "available", basis: "observed-token-amount-not-holdings",
+        amountCoverage: { state: "available", availableCount: 5, missingCount: 0 },
+        actorCountWithAmount: 3, largestActorShare: 0.5, largestThreeActorShare: 1
+      },
+      activityBurst: {
+        state: "available", timestampBasis: "source-timestamp", windowMs: 60_000,
+        maximumEventCount: 4, maximumUniqueActorCount: 3,
+        startedAt: "2026-08-08T11:45:10.000Z", endedAt: "2026-08-08T11:46:10.000Z"
+      }
+    }
+  };
+}
+
+function actorEngine() {
+  return {
+    schemaVersion: 1,
+    source: "solana-mainnet-rpc",
+    status: "observing",
+    started: true,
+    queueDepth: 0,
+    lastAttemptAt: "2026-08-08T12:00:00.000Z",
+    lastSuccessAt: "2026-08-08T12:00:00.000Z",
+    lastErrorAt: null,
+    lastErrorCode: null,
+    cohort: { limit: 32, admittedCount: 1, evidenceMintCount: 1, eligibleMintCount: 1, statusCounts: { observing: 1 } },
+    correlationGate: actorDownstreamGate(),
+    counters: { admissions: 1, attempts: 1, observationsAccepted: 1, observationsDeduplicated: 0, failures: 0 }
+  };
+}
+
+function actorIntelligence() {
+  const engine = actorEngine();
+  return {
+    schemaVersion: 1,
+    generatedAt: "2026-08-08T12:00:00.000Z",
+    source: {
+      id: "solana-mainnet-rpc",
+      evidenceClass: "on-chain-finalized",
+      endpointClass: "documented-rate-limited-public-rpc",
+      attributionUrl: "https://solana.com/docs/references/clusters",
+      pumpProgramDocs: "https://github.com/pump-fun/pump-public-docs",
+      scope: "getSignaturesForAddress newest 16; earliest 8 in-window candidates inspected",
+      completeness: "partial-and-unmeasured",
+      productionSuitability: "best-effort public endpoint; failures and rate limits remain explicit"
+    },
+    engine,
+    sampling: {
+      policy: "prospective-fixed-admission-v1",
+      cohortLimit: 32,
+      earlyWindowSeconds: 1_800,
+      attemptsAtSeconds: [120, 600, 1800],
+      signaturePageLimit: 16,
+      transactionLimitPerAttempt: 8,
+      rawSourcePayloadsPersisted: false,
+      rawWalletsPersisted: false,
+      rawTransactionIdsPersisted: false,
+      normalizedObservationRetentionSeconds: 72 * 60 * 60,
+      aggregateSummariesPersisted: true
+    },
+    cohort: {
+      admittedCount: 1,
+      limit: 32,
+      observations: [{
+        mint: cohortMint(0), name: "Token 1", symbol: "T1",
+        launchObservedAt: "2026-08-08T11:45:00.000Z",
+        acquisition: {
+          status: "observing", attemptCount: 1, lastAttemptAt: "2026-08-08T12:00:00.000Z",
+          nextAttemptAt: "2026-08-08T12:15:00.000Z", lastSuccessAt: "2026-08-08T12:00:00.000Z",
+          missingReason: "Minimum per-coin event/actor/source-time gate not yet met", errorCode: null
+        },
+        summary: actorSummary()
+      }]
+    },
+    privacy: {
+      labels: "per-installation keyed Actor numbers",
+      rawWalletsPublic: false,
+      rawProfilesPublic: false,
+      actorLookupEndpoint: false,
+      hiddenMappingMaterialPublic: false
+    },
+    downstream: actorDownstreamGate(),
+    disclaimer: "Bounded finalized observations are partial and do not establish identity, coordination, or a trade signal."
+  };
+}
+
 async function fixture(t, overrides = {}, headerOverrides = {}) {
   const bodies = {
     "/api/health": JSON.stringify({
@@ -161,7 +294,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
           failures: 2
         }
       },
-      riskIdentityCoverage: riskCoverage()
+      riskIdentityCoverage: riskCoverage(),
+      earlyActors: actorEngine()
     }),
     "/api/snapshot": JSON.stringify({
       version,
@@ -224,12 +358,13 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
           observations: riskObservations()
         },
         summary: { totalTracked: 120 }
-      }
+      },
+      earlyActorIntelligence: actorIntelligence()
     }),
     [`/api/coins/${cohortMint(0)}`]: JSON.stringify({
       schemaVersion: 1, generatedAt: "2026-08-08T12:00:00.000Z", token: { mint: cohortMint(0), symbol: "T1" },
       radar: { score: null, orderingBasis: "recency", reasons: [], freshness: { state: "fresh" }, riskConfidence: "unavailable" },
-      outcome: { windows: {} }, timeline: `/api/coins/${cohortMint(0)}/timeline`, scope: "bounded", disclaimer: "observational"
+      outcome: { windows: {} }, earlyActor: actorSummary(), timeline: `/api/coins/${cohortMint(0)}/timeline`, scope: "bounded", disclaimer: "observational"
     }),
     [`/api/coins/${cohortMint(0)}/timeline?limit=2`]: JSON.stringify({
       schemaVersion: 1, mint: cohortMint(0), generatedAt: "2026-08-08T12:00:00.000Z", limit: 2,
@@ -246,12 +381,12 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     }),
     "/api/briefs/daily": JSON.stringify(measuredBrief("daily")),
     "/api/briefs/weekly": JSON.stringify(measuredBrief("weekly")),
-    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section>`,
-    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} fetch('/api/compare?mints='); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO",
+    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section>`,
+    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} fetch('/api/compare?mints='); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal",
     "/preferences.js": "export const WATCHLIST_LIMIT = 50; export const PRESET_LIMIT = 12; export function normalizePreferences() {}",
-    "/styles.css": ".outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}",
-    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p>",
-    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p>"
+    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}@media(max-width:650px){}",
+    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p><p>Early-actor evidence has partial and unmeasured coverage and does not establish identity or coordination and is not a trade signal.</p>",
+    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p><p>Per-installation keyed Actor numbers replace raw wallet addresses. Transaction signatures and mapping material are not persisted; normalized observations expire after 72 hours.</p>"
   };
   for (const [pathname, override] of Object.entries(overrides)) {
     bodies[pathname] = typeof override === "function" ? override(bodies[pathname]) : override;
@@ -293,8 +428,84 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   assert.deepEqual(result.markers, {
     version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
     actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-    parserRevision: true, legalNotices: true
+    parserRevision: true, anonymousEarlyActors: true, legalNotices: true
   });
+});
+
+test("fails when early-actor sampling loses its bounded raw-data retention contract", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.earlyActorIntelligence.sampling.rawTransactionIdsPersisted = true;
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "snapshot" && /sampling and retention contract/.test(error.message)
+  );
+});
+
+test("fails when actor evidence is allowed into any downstream decision surface", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => {
+      health.earlyActors.correlationGate.telegramAlertImpact = "enabled";
+    }),
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.earlyActorIntelligence.engine.correlationGate.telegramAlertImpact = "enabled";
+      snapshot.earlyActorIntelligence.downstream.telegramAlertImpact = "enabled";
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && /downstream use withheld/.test(error.message)
+  );
+});
+
+test("recursively rejects raw identity keys from every public JSON surface", async (t) => {
+  const baseUrl = await fixture(t, {
+    [`/api/coins/${cohortMint(0)}`]: jsonOverride((dossier) => {
+      dossier.earlyActor.audit = { actorAddress: cohortMint(15) };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "dossier" && /raw public identity key/.test(error.message)
+  );
+});
+
+test("recursively rejects hidden actor mapping or provenance material", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.earlyActorIntelligence.cohort.observations[0].internal = { provenanceDigest: "opaque-but-public" };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "snapshot" && /hidden mapping, key, digest, or provenance/.test(error.message)
+  );
+});
+
+test("recursively rejects raw social profile strings outside the risk schema", async (t) => {
+  const baseUrl = await fixture(t, {
+    [`/api/coins/${cohortMint(0)}/timeline?limit=2`]: jsonOverride((timeline) => {
+      timeline.entries.push({ sourceActor: "https://x.com/raw_handle" });
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "timeline" && /raw social profile value/.test(error.message)
+  );
+});
+
+test("fails when the dossier omits its explicit early-actor missing state", async (t) => {
+  const baseUrl = await fixture(t, {
+    [`/api/coins/${cohortMint(0)}`]: jsonOverride((dossier) => {
+      delete dossier.earlyActor;
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "dossier" && /evidence field was missing/.test(error.message)
+  );
 });
 
 test("fails when the current parser revision marker is absent", async (t) => {
@@ -530,7 +741,8 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
         selectedStateCount: 16, attempts: 16, successes: 14, failures: 2
       }
     },
-    riskIdentityCoverage: riskCoverage()
+    riskIdentityCoverage: riskCoverage(),
+    earlyActors: actorEngine()
   };
   const baseUrl = await fixture(t, { "/api/health": JSON.stringify(health) });
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });

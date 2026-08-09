@@ -1,8 +1,8 @@
 # Pump War Room
 
-Current release: **v0.8.1**
+Current release: **v0.9.0**
 
-A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, and exposes holder, liquidity, lifecycle, creator/deployer, and exact identity-reuse evidence without presenting an uncalibrated risk probability.
+A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, and reports bounded anonymous early-actor observations without presenting an uncalibrated probability or trade signal.
 
 ## Deploy to Railway
 
@@ -30,7 +30,7 @@ Re-run the restore drill on an existing artifact without touching `DB_PATH`:
 npm run db:restore:verify -- --backup /app/data/backups/pump-war-room-2026-08-08.db
 ```
 
-The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Exact v0.5.1/schema-501, v0.6/schema-600, v0.7/schema-700, and v0.8.0/schema-800 artifacts remain drillable: the verifier proves the original copy, migrates only its disposable restore copy to schema 801, then runs the current application write probe without changing the artifact. Schema 801 verifies material-event dedupe indices, frozen brief rows, and a restart-safe Telegram outbox whose pending/retrying rows must have a recoverable due time; schema-800 pending rows missing that due time are repaired only in the disposable migration. The write probe proves that a pending row is selectable and that the invalid state is rejected. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
+The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Exact v0.5.1/schema-501, v0.6/schema-600, v0.7/schema-700, v0.8.0/schema-800, and v0.8.1/schema-801 artifacts remain drillable: the verifier proves the original copy, migrates only its disposable restore copy to schema 900, then runs the current application write probe without changing the artifact. Schema 900 additionally verifies the singleton installation secret, prospective actor cohort, minimized deduplicated observations, bounded retention indexes, and aggregate summaries. The probe proves secret continuity, actor admission, dedupe/conflict handling, retention, and summary writes while rejecting raw wallet, profile, transaction, digest, and key material. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
 
 ## Quick look
 
@@ -49,7 +49,7 @@ set -a && source .env && set +a
 npm run live
 ```
 
-Live mode subscribes once to PumpPortal's documented `subscribeNewToken` and `subscribeMigration` streams and stores every observed mint. It does not subscribe to metered trade streams. Pump's declared creator and the transaction user/deployer are retained separately. The feed's `vSolInBondingCurve` is labeled virtual SOL reserve and `solAmount` is labeled create-transaction SOL amount; neither is relabeled as five-minute volume, curve progress, or migration proof.
+Live mode subscribes once to PumpPortal's documented free `subscribeNewToken` and `subscribeMigration` streams and stores every observed mint. It does not subscribe to PumpPortal's metered token-trade stream, create or fund a linked wallet, or spend SOL. Pump's declared creator and transaction user/deployer remain private evidence; every public API, SSE event, UI, analyst response, and export replaces those values with installation-scoped opaque Actor numbers. The feed's `vSolInBondingCurve` is labeled virtual SOL reserve and `solAmount` is labeled create-transaction SOL amount; neither is relabeled as five-minute volume, curve progress, or migration proof.
 
 `SOL_USD` is optional. When absent, the app withholds a USD market-cap conversion instead of using a guessed exchange rate; when present, it labels the conversion as locally derived from the feed's SOL-denominated market cap and the operator-supplied rate.
 
@@ -107,9 +107,21 @@ Daily briefs cover the last closed UTC day `[00:00Z, next 00:00Z)`; weekly brief
 
 No new SaaS, charting package, ORM, bot framework, account system, or paid provider was introduced. The implementation uses URL state, browser storage, native SQLite, the existing direct Bot API transport, and existing GeckoTerminal/PumpPortal evidence. Provider permission must be re-reviewed before persisting or redistributing any broader history than these bounded derived observations.
 
-## Pump.fun Callouts
+### Anonymous early-actor intelligence
 
-Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter connects to Bark's documented `wss://news.bark.gg/ws`, accepts only `PUMPFUN_CALLOUT` events, persists them by external event ID, and surfaces third-party provenance in the dashboard. Without a key, the rest of the War Room continues normally and the panel remains explicitly disabled. No Pump.fun JWT, wallet connection, or undocumented frontend scraping is used.
+v0.9.0 adds an isolated, prospective cohort of at most 32 exact PumpPortal mints. At 2, 10, and 30 minutes after each admitted launch, a conservatively paced reader asks Solana's documented public mainnet RPC for at most 16 finalized signatures referencing that mint and inspects at most eight in-window transactions per attempt. A buy or sell is accepted only when the transaction succeeded, the exact mint changed in a validated signed user account, and the instruction matches an official Pump or PumpSwap program plus its published discriminator and account contract. A generic token-balance delta, transfer, mint, burn, liquidity action, unsupported program, malformed transaction, missing signer, or contradictory delta is rejected rather than inferred as a trade.
+
+The default public mainnet RPC is keyless, rate-limited, and explicitly not production-grade. Acquisition is therefore best-effort, partial, and unmeasured; rate limits, gaps, missing transactions, and invalid responses remain visible. The worker never backfills launches from before it became active. PumpPortal's metered token-trade stream stays disabled because it requires a funded linked wallet and spend, and its response-frame fields are not documented in the official material reviewed for this release. `SOLANA_RPC_URL` may select another already-authorized credential-free HTTPS endpoint, while credentials embedded in URLs are rejected. Set `EARLY_ACTOR_ENRICHMENT=false` to disable the worker without affecting the rest of the War Room.
+
+An installation-random 32-byte secret maps each observed wallet through a domain-separated keyed digest to a stable `Actor N` label. Raw wallet addresses, transaction signatures, source payloads, provenance digests, and lookup mappings are not persisted in actor tables or exposed publicly. Minimized normalized observations are deterministically deduplicated and retained for at most 72 hours, with a global 4,096-row prune bound; aggregate per-mint summaries remain auditable after raw observation expiry. Backup/restore verification proves that the installation secret—and therefore Actor labels—survives a recovery drill without exposing the secret.
+
+Per-coin metrics remain unavailable until at least five validated events from at least three opaque actors have complete source timestamps. Eligible summaries show launch-relative timing, unique actor count, repeat buys/sells, defensible observed buy-to-later-sell duration pairs, sampled token-amount concentration, and one-minute activity bursts. Amount concentration is not holder concentration or current holdings. Correlations remain withheld until at least 20 eligible mints and 60% acquisition coverage, and even then require a separately reviewed labeled holdout calibration. Actor evidence is byte-invariant to leaderboard rank, risk factors, material alerts, Telegram text, analyst recommendations, and trade guidance.
+
+The public wording is deliberately neutral: **early actor**, **activity evidence**, and **activity burst**. The release makes no claim of real-world identity, smart money, insider status, bot behavior, coordination, intent, skill, safety, risk probability, recommendation, or trade signal. Pump.fun and Fomo live platform connectors remain disabled unless an official API, authorized export, user-supplied lawful export, or written permission defines fields, rates, retention, attribution, and display rights.
+
+## Third-party Bark observations
+
+Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter connects to Bark's documented `wss://news.bark.gg/ws`, accepts only `PUMPFUN_CALLOUT` events, deduplicates them by an internal external-event key, replaces the source profile with an opaque installation-scoped Actor number, and surfaces neutral third-party provenance in the dashboard. New v0.9 records do not persist the raw source profile, and startup sanitizes legacy Bark callout/event payloads. Without a key, the rest of the War Room continues normally and the panel remains explicitly disabled. No Pump.fun JWT, wallet connection, or undocumented frontend scraping is used.
 
 ## v0.9 connector authorization
 
@@ -131,7 +143,8 @@ The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permissi
 - Evidence scores are withheld when momentum and buyer breadth are unavailable; those rows are explicitly ordered by observation recency, while uncalibrated risk factors remain excluded from score and order
 - Mint fingerprints on every row so same-name launches cannot be mistaken for the same contract
 - Provider-observed holder/developer evidence, locally derived exact-identity duplicate counts, prospective creator/deployer history, pool-reserve and feed-observed virtual-SOL evidence, and explicit unknowns
-- Optional real-time Pump.fun Callouts stream with caller, mint, callout price, multiple, max price, and market cap
+- Anonymous early-actor panels backed by bounded finalized official-program instruction evidence, explicit source/coverage/missing states, keyed Actor labels, short raw-observation retention, and no downstream score or alert impact
+- Optional real-time third-party Bark observations with opaque source-actor labels, mint, callout price, multiple, max price, and market cap
 - Versioned material score/factor/identity/creator-history and processed-migration alerts with explicit null semantics, replay dedupe, and recurrence-safe evidence keys
 - Optional restart-safe, rate-limited Telegram Bot API delivery with aggregate-only public health; no bot credentials or destination identifiers are persisted
 - Browser-local watchlists and saved URL filter lenses with bounded JSON portability; no anonymous server-side or cross-device account claim
@@ -146,7 +159,7 @@ The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permissi
 - `GET /api/health`
 - `GET /api/snapshot`
 
-The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, and `actionIntelligence` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability. Action intelligence exposes browser-local preference limits, materiality rules, aggregate outbox health, timeline/compare contracts, and the frozen daily/weekly models without secrets or raw provider histories.
+The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `actionIntelligence`, and `earlyActorIntelligence` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability. Action intelligence exposes browser-local preference limits, materiality rules, aggregate outbox health, timeline/compare contracts, and the frozen daily/weekly models without secrets or raw provider histories. Early-actor intelligence exposes only aggregate prospective-cohort acquisition state and gated per-mint summaries; there is no actor lookup endpoint.
 - `GET /api/stream` (server-sent events)
 - `GET /api/coins/:mint`
 - `GET /api/coins/:mint/timeline?limit=50&before=<cursor>` (`limit` 1–200)
@@ -163,7 +176,7 @@ The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, a
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.8.1 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.0 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.
@@ -181,3 +194,4 @@ There is no wallet connection, private-key handling, trade execution, token crea
 - Live PumpPortal create/migration rows normally lack comparable numeric radar inputs, so score-change alerts often remain unavailable. This is disclosed rather than replaced with guessed momentum.
 - Browser-local watchlists are intentionally not authenticated or cross-device. Operator Telegram delivery is intentionally independent, best-effort, and at-least-once.
 - Closed-period briefs cover this deployment and fixed cohorts only. Feed coverage is unmeasured, and historical cohort removals/deduplicated suppression counts remain unavailable rather than being presented as zero.
+- Public Solana RPC early-actor reads are prospective, bounded, rate-limited, and incomplete. Missing or rejected transactions stay unavailable, and sampled activity never implies complete wallet history, coordination, current holdings, or identity.

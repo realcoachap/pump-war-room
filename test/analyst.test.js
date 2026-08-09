@@ -138,13 +138,14 @@ test("callouts remain explicitly third-party and mint-cited", () => {
     callouts: [{
       mint: "Callout11111111111111111111111111111111pump",
       symbol: "CALL",
-      caller: "observer",
+      sourceActor: "Actor 27",
       multiple: 3.5,
       createdAt: "2026-08-08T20:58:00.000Z"
     }]
   }, { now: NOW });
 
-  assert.match(result.answer, /@observer on CALL/);
+  assert.match(result.answer, /Actor 27 on CALL/);
+  assert.doesNotMatch(result.answer, /@observer|caller/i);
   assert.match(result.answer, /third-party observations/i);
   assert.equal(result.evidence[0].citation, "snapshot.callouts");
   assert.equal(result.evidence[0].mint, "Callout11111111111111111111111111111111pump");
@@ -157,6 +158,37 @@ test("trade and external-data requests stop at the read-only snapshot boundary",
 
   const external = analyzeSnapshot("Search Twitter for this token", snapshot, { now: NOW });
   assert.match(external.answer, /does not call external services/i);
+});
+
+test("early-actor evidence cannot change rankings or recommendation-boundary answers", () => {
+  const baseline = { mode: "live", tokens: [token()] };
+  const actorDecorated = {
+    mode: "live",
+    tokens: [{
+      ...token(),
+      earlyActor: {
+        coverage: { state: "available", uniqueActorCount: 12, eventCount: 40 },
+        metrics: { concentration: { largestObservedActivitySharePct: 97 } },
+        actors: ["Actor 19"]
+      }
+    }],
+    earlyActorIntelligence: {
+      downstream: {
+        status: "withheld",
+        rankingImpact: "none",
+        riskProbabilityImpact: "none",
+        telegramAlertImpact: "none",
+        recommendationImpact: "none"
+      }
+    }
+  };
+
+  for (const question of ["What should I buy?", "Show top momentum"]) {
+    assert.deepEqual(
+      analyzeSnapshot(question, actorDecorated, { now: NOW }),
+      analyzeSnapshot(question, baseline, { now: NOW })
+    );
+  }
 });
 
 test("analysis does not mutate the supplied snapshot", () => {

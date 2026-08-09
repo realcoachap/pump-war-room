@@ -21,7 +21,7 @@ virtual_sol_reserve: null
 ## Snapshot
 
 - **Contract:** `u8EJAQj1XykLYxK6QpmggiouHoD7HWhbje3kGupump`
-- **Creator:** `mDz4nj2HXeBnCzY2hLvofJ1Q5h3Dg5X95LgBn2pump`
+- **Creator actor:** unavailable in this pre-v0.9 synthetic artifact
 - **Status:** migration-observed (synthetic example; finalization unverified)
 - **Narrative:** [[AI agents]]
 - **Market cap:** $61,359

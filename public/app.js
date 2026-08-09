@@ -11,7 +11,7 @@ import {
 
 void PREFERENCE_KEY;
 
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let refreshInFlight = false;
@@ -629,6 +629,81 @@ function riskIdentityDetail(token) {
   return `<div class="risk-detail"><span class="kicker">RISK + IDENTITY FACTORS // ${esc(identity.overallEvidence || "unavailable")}</span><p>No composite risk probability is published and these factors do not affect rank. Exact declared-social or registrable-domain matches establish identifier reuse only—not duplicate content; likely controller and maliciousness remain unknown.${esc(missing)}</p><div class="risk-detail-grid">${rows}</div></div>`;
 }
 
+function durationMsLabel(value) {
+  if (!hasNumber(value) || number(value) < 0) return "—";
+  const seconds = Math.round(number(value) / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3_600) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds / 3_600 * 10) / 10}h`;
+}
+
+function offsetMsLabel(value) {
+  if (!hasNumber(value)) return "—";
+  const amount = number(value);
+  return `${amount < 0 ? "−" : "+"}${durationMsLabel(Math.abs(amount))}`;
+}
+
+function earlyActorDetail(summary, acquisition = null) {
+  const coverage = summary?.coverage && typeof summary.coverage === "object" ? summary.coverage : {};
+  const metrics = summary?.metrics && typeof summary.metrics === "object" ? summary.metrics : null;
+  const stateLabel = String(coverage.state || acquisition?.status || "unavailable").replaceAll("-", " ");
+  if (!metrics) {
+    const gate = coverage.gate || {};
+    const gateEvidence = summary
+      ? `${number(coverage.eventCount)}/${number(gate.minimumEventCount, 5)} events · ${number(coverage.uniqueActorCount)}/${number(gate.minimumActorCount, 3)} actors · source time ${Math.round(number(coverage.sourceTimestamps?.ratio) * 100)}%`
+      : "No minimized actor observation summary is retained for this mint.";
+    const reason = acquisition?.missingReason || "The minimum event, actor, and source-time gate has not been met.";
+    return `<div class="early-actor-detail"><span class="kicker">ANONYMOUS EARLY-ACTOR EVIDENCE // ${esc(stateLabel.toUpperCase())}</span><p>${esc(gateEvidence)}. ${esc(reason)} Missing evidence is unknown; no behavior or outcome inference is published.</p></div>`;
+  }
+  const timing = metrics.timing || {};
+  const repeats = metrics.repeatActivity || {};
+  const holding = metrics.holdingDurationEvidence || {};
+  const amount = metrics.amountConcentration || {};
+  const burst = metrics.activityBurst || {};
+  const rows = [
+    ["Unique actors", nf.format(number(metrics.uniqueActors?.count)), `${number(coverage.eventCount)} retained events · source-time coverage ${Math.round(number(coverage.sourceTimestamps?.ratio) * 100)}%`],
+    ["Launch-relative timing", timing.state === "available" ? offsetMsLabel(timing.actorFirstObservationOffsetMs?.median) : "—", `${timing.actorsObservedWithinWindow ?? "—"} actors observed inside the ${durationMsLabel(timing.earlyWindowMs)} bounded window; source time minus launch receipt`],
+    ["Repeat activity", `${number(repeats.actorsWithMultipleBuys)} buy / ${number(repeats.actorsWithMultipleSells)} sell`, `${number(repeats.actorsObservedOnBothSides)} actors observed on both validated sides`],
+    ["Observed duration", holding.state === "available" ? durationMsLabel(holding.medianMs) : "—", `${number(holding.pairedObservationCount)} observed buy-to-later-sell pairings; not a complete holding period`],
+    ["Amount concentration", amount.state === "available" ? `${Math.round(number(amount.largestActorShare) * 100)}%` : "—", "Largest share of sampled token amount; not holder concentration or current holdings"],
+    ["Activity burst", burst.state === "available" ? `${number(burst.maximumEventCount)} events` : "—", `${number(burst.maximumUniqueActorCount)} unique actors in the busiest ${durationMsLabel(burst.windowMs)} sampled window`]
+  ].map(([label, value, note]) => `<div><b>${esc(label)}</b><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
+  return `<div class="early-actor-detail"><span class="kicker">ANONYMOUS EARLY-ACTOR EVIDENCE // ELIGIBLE PER-COIN SAMPLE</span><p>Finalized instruction evidence is bounded and partial. Actor numbers are installation-scoped, non-reversible labels—not identities. These observations do not establish coordination, automation, intent, skill, safety, or a trade signal.</p><div class="early-actor-detail-grid">${rows}</div></div>`;
+}
+
+function renderEarlyActors() {
+  const intelligence = state.earlyActorIntelligence && typeof state.earlyActorIntelligence === "object" ? state.earlyActorIntelligence : {};
+  const engine = intelligence.engine && typeof intelligence.engine === "object" ? intelligence.engine : {};
+  const cohort = intelligence.cohort && typeof intelligence.cohort === "object" ? intelligence.cohort : {};
+  const observations = Array.isArray(cohort.observations) ? cohort.observations : [];
+  const engineStatus = String(engine.status || (state.mode === "live" ? "awaiting-prospective-admission" : "disabled"));
+  $("#early-actor-engine-state").textContent = engineStatus.replaceAll("-", " ").toUpperCase();
+  const counts = engine.cohort || {};
+  const admitted = number(counts.admittedCount ?? cohort.admittedCount);
+  const limit = number(counts.limit ?? cohort.limit, 32);
+  const evidenceMints = number(counts.evidenceMintCount);
+  const eligibleMints = number(counts.eligibleMintCount);
+  const acquisition = admitted ? Math.round(evidenceMints / admitted * 100) : 0;
+  $("#early-actor-summary").innerHTML = [
+    ["ADMITTED MINTS", `${nf.format(admitted)}/${nf.format(limit)}`, "fixed prospective cohort; no historical backfill"],
+    ["EVIDENCE MINTS", nf.format(evidenceMints), `${admitted ? acquisition : 0}% sampled acquisition; completeness unmeasured`],
+    ["ELIGIBLE MINTS", nf.format(eligibleMints), "per-coin event, actor, and source-time gates met"],
+    ["RAW IDENTITY RETENTION", "OFF", "wallets, signatures, payloads, and lookup mappings excluded"]
+  ].map(([label, value, note]) => `<article><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
+  $("#early-actor-cohort-scope").textContent = `${nf.format(admitted)}/${nf.format(limit)} admitted · ${nf.format(evidenceMints)} with evidence · partial acquisition expected`;
+  $("#early-actor-cohort").innerHTML = observations.length ? observations.slice(0, 12).map((observation) => {
+    const coverage = observation.summary?.coverage || {};
+    const status = String(coverage.state || observation.acquisition?.status || "unavailable").replaceAll("-", " ");
+    const detail = observation.summary
+      ? `${number(coverage.eventCount)} events · ${number(coverage.uniqueActorCount)} actors`
+      : observation.acquisition?.missingReason || "No retained observation summary";
+    return `<button type="button" class="early-actor-row" data-early-actor-mint="${esc(observation.mint)}"><span><b>${esc(observation.name || "Unnamed mint")}</b><small>${esc(observation.symbol || "??")} · ${esc(shortMint(observation.mint))}</small></span><span><b>${esc(status.toUpperCase())}</b><small>${esc(detail)}</small></span></button>`;
+  }).join("") : '<div class="early-actor-empty">The v0.9 cohort admits only new PumpPortal launch observations while this worker is active. No backfill is implied.</div>';
+  document.querySelectorAll(".early-actor-row").forEach((row) => row.addEventListener("click", () => void openCoin(row.dataset.earlyActorMint)));
+  const gate = engine.correlationGate || intelligence.downstream || {};
+  $("#early-actor-gate").textContent = gate.status === "review-required" ? "POLICY REVIEW REQUIRED" : "CORRELATIONS WITHHELD";
+}
+
 function narrativeRows() {
   return Object.values(rankedTokens().reduce((rows, token) => {
     const name = token.narrative || "Unclassified";
@@ -670,7 +745,7 @@ function renderCallouts() {
   const callouts = Array.isArray(state.callouts) ? state.callouts : [];
   $("#callout-count").textContent = callouts.length;
   $("#callouts").innerHTML = callouts.length ? callouts.slice(0, 8).map((callout) => `<a class="callout" href="${esc(callout.url)}" target="_blank" rel="noreferrer">
-    <div><strong>@${esc(callout.caller)} observed ${esc(callout.symbol)}</strong><span>${esc(shortMint(callout.mint))} · ${money(callout.marketCap)}</span></div>
+    <div><strong>${esc(callout.sourceActor || "Anonymous source actor")} observed ${esc(callout.symbol)}</strong><span>${esc(shortMint(callout.mint))} · ${money(callout.marketCap)}</span></div>
     <b>${hasNumber(callout.multiple) ? `${number(callout.multiple).toFixed(1)}×` : "NEW"}</b><time>${ago(callout.createdAt)}</time>
   </a>`).join("") : `<div class="loading">${state.calloutStatus === "disabled" ? "Callout telemetry is not configured." : "Listening for observed callouts…"}</div>`;
 }
@@ -856,6 +931,7 @@ function render() {
   renderLeaderboard();
   renderActionIntelligence();
   renderRiskIntelligence();
+  renderEarlyActors();
   renderOutcomes();
   renderTokens();
   renderCallouts();
@@ -881,7 +957,8 @@ async function refresh() {
       leaderboard: snapshot.leaderboard && typeof snapshot.leaderboard === "object" ? snapshot.leaderboard : { top100: [] },
       outcomes: snapshot.outcomes && typeof snapshot.outcomes === "object" ? snapshot.outcomes : {},
       riskIntelligence: snapshot.riskIntelligence && typeof snapshot.riskIntelligence === "object" ? snapshot.riskIntelligence : {},
-      actionIntelligence: snapshot.actionIntelligence && typeof snapshot.actionIntelligence === "object" ? snapshot.actionIntelligence : {}
+      actionIntelligence: snapshot.actionIntelligence && typeof snapshot.actionIntelligence === "object" ? snapshot.actionIntelligence : {},
+      earlyActorIntelligence: snapshot.earlyActorIntelligence && typeof snapshot.earlyActorIntelligence === "object" ? snapshot.earlyActorIntelligence : {}
     };
     snapshotFailed = false;
     render();
@@ -936,8 +1013,8 @@ function openToken(mint, dossier = null) {
   if (hasNumber(token.buyRatio) && number(token.buyRatio) >= .64) momentum.push("buy-side pressure");
   if (hasNumber(token.bondingProgress) && number(token.bondingProgress) >= 75) momentum.push("approaching migration");
   $("#token-detail").innerHTML = `<div class="detail"><span class="kicker">${esc(token.narrative || "Unclassified")} // ${esc(token.status || "observed")}</span><h2>${esc(token.name || "Unnamed mint")} <span class="risk-low">${esc(token.symbol || "??")}</span></h2><div class="mint">${esc(token.mint)}</div>
-    <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>RISK PROBABILITY</label><strong class="risk-unverified">WITHHELD</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>SMART WALLETS</label><strong>${hasNumber(token.smartWallets) ? nf.format(number(token.smartWallets)) : "—"}</strong></div></div>
-    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${riskIdentityDetail(token)}${outcomeDetail(leaderboardEntry)}
+    <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>RISK COMPOSITE</label><strong class="risk-unverified">WITHHELD</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>ACTIVITY EVIDENCE</label><strong>SEE BELOW</strong><small>never rank input</small></div></div>
+    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${riskIdentityDetail(token)}${earlyActorDetail(dossier?.earlyActor || state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.summary, state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.acquisition)}${outcomeDetail(leaderboardEntry)}
     <div class="coin-timeline"><span class="kicker">DISCRETE RETAINED TIMELINE // NO INTERPOLATION</span><div id="coin-timeline"><div class="action-empty">Loading typed observations…</div></div></div>
     <div class="detail-actions"><button class="primary" id="watch-coin" aria-pressed="${watched(token.mint)}">${watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER"}</button><button id="export-coin">EXPORT TO OBSIDIAN</button><a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
   $("#token-dialog").showModal();

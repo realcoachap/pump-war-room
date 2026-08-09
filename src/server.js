@@ -24,6 +24,9 @@ import {
 } from "./risk-identity.js";
 import { attachRiskIdentityEvidence } from "./risk-public.js";
 import { normalizePersistedLiveToken } from "./live-token.js";
+import { projectPublicCallout, projectPublicToken } from "./privacy.js";
+import { ACTOR_COHORT_LIMIT, ACTOR_EARLY_WINDOW_MS, ACTOR_RAW_RETENTION_MS, ACTOR_SIGNATURE_LIMIT, ACTOR_TRANSACTION_LIMIT, EarlyActorIngestor } from "./actor-ingest.js";
+import { SOLANA_MAINNET_RPC, SolanaRpcClient } from "./solana-rpc.js";
 import {
   buildCoinComparison,
   buildCoinTimeline,
@@ -51,6 +54,10 @@ const publicMintPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const MATERIAL_BASELINE_EVENT_KEY = "material-baseline-v1";
 process.on("uncaughtExceptionMonitor", (error, origin) => runtimeTelemetry.error("process.uncaught_exception", error, { origin }));
 const store = new Store(dbPath);
+const actorPrivacySecret = store.actorPrivacySecret();
+const publicToken = (token) => projectPublicToken(token, { installationSecret: actorPrivacySecret });
+const publicCallout = (callout) => projectPublicCallout(callout, { installationSecret: actorPrivacySecret });
+const identityCleanup = store.sanitizeLegacyCalloutProfiles(publicCallout);
 const storage = observeStorage({
   databasePath: dbPath,
   canonicalDatabasePath: realpathSync(dbPath),
@@ -76,6 +83,8 @@ let pumpPortalIngestor = null;
 let outcomeIngestor = null;
 let riskIdentityIngestor = null;
 let geckoTerminalClient = null;
+let actorIngestor = null;
+let solanaRpcClient = null;
 let telegramDeliveryTimer = null;
 let telegramDeliveryRunning = false;
 let telegramLastAttemptAt = 0;
@@ -339,18 +348,20 @@ function upsert(token) {
   outcomeIngestor?.enqueue(token);
   const priorRiskState = riskIdentityIngestor ? store.riskIdentityState(token.mint) : null;
   riskIdentityIngestor?.enqueue(token);
+  if (!previous) actorIngestor?.admit(token);
   if (!priorRiskState && riskIdentityIngestor && store.riskIdentityState(token.mint)) {
     try { evaluateRiskMateriality(); }
     catch (error) { runtimeTelemetry.error("alerts.risk_admission_evaluation_failed", error, { mint: token.mint }); }
   }
   broadcastMaterialAlerts(committed.alerts);
-  send(previous ? "token-update" : "new-token", token);
+  send(previous ? "token-update" : "new-token", publicToken(token));
 }
 
 function addCallout(callout) {
-  store.upsertCallout(callout);
-  store.addEvent("callout", callout);
-  send("callout", callout);
+  const sanitized = publicCallout(callout);
+  store.upsertCallout({ ...sanitized, externalId: callout.externalId });
+  store.addEvent("callout", sanitized);
+  send("callout", sanitized);
 }
 
 function normalizeLiveToken(token) {
@@ -425,7 +436,8 @@ function snapshot() {
     const enrichment = enrichmentByMint.get(token.mint);
     return enrichment ? [[token.mint, enrichment]] : [];
   }));
-  const top100 = createTop100(latestEnrichedTokens, { mode, outcomesByMint });
+  const top100 = createTop100(latestEnrichedTokens, { mode, outcomesByMint })
+    .map((entry) => ({ ...entry, token: publicToken(entry.token) }));
   const cohortEntries = enrichmentStates.flatMap((enrichment) => {
     const token = normalizeLiveToken(store.token(enrichment.mint));
     if (!token || token.source !== "pumpportal") return [];
@@ -516,6 +528,81 @@ function snapshot() {
     compare: { endpoint: "/api/compare?mints={mint},{mint}", minimumMints: 2, maximumMints: 4 },
     briefs: { daily: measuredBrief("daily"), weekly: measuredBrief("weekly") }
   };
+  const actorStates = store.actorStates({ limit: ACTOR_COHORT_LIMIT });
+  const actorSummaries = store.actorSummaries(ACTOR_COHORT_LIMIT);
+  const actorSummaryByMint = new Map(actorSummaries.map((summary) => [summary.mint, summary]));
+  const actorStatus = actorIngestor?.getStatus() || {
+    schemaVersion: 1,
+    source: SOLANA_MAINNET_RPC.id,
+    status: mode === "live" ? "disabled" : "simulation-disabled",
+    queueDepth: 0,
+    cohort: { limit: ACTOR_COHORT_LIMIT, admittedCount: 0, evidenceMintCount: 0, eligibleMintCount: 0, statusCounts: {} },
+    correlationGate: {
+      status: "withheld", minimumEligibleMints: 20, minimumAcquisitionCoverage: 0.6,
+      eligibleMintCount: 0, acquisitionCoverage: null, labeledHoldoutCalibrationPassed: false,
+      rankingImpact: "none", riskProbabilityImpact: "none", telegramAlertImpact: "none", recommendationImpact: "none"
+    }
+  };
+  const earlyActorIntelligence = {
+    schemaVersion: 1,
+    generatedAt,
+    source: {
+      id: SOLANA_MAINNET_RPC.id,
+      evidenceClass: "on-chain-finalized",
+      endpointClass: "documented-rate-limited-public-rpc",
+      attributionUrl: SOLANA_MAINNET_RPC.attributionUrl,
+      pumpProgramDocs: "https://github.com/pump-fun/pump-public-docs",
+      scope: `getSignaturesForAddress newest ${ACTOR_SIGNATURE_LIMIT}; earliest ${ACTOR_TRANSACTION_LIMIT} in-window candidates inspected`,
+      completeness: "partial-and-unmeasured",
+      productionSuitability: "best-effort public endpoint; failures and rate limits remain explicit"
+    },
+    engine: actorStatus,
+    sampling: {
+      policy: "prospective-fixed-admission-v1",
+      cohortLimit: ACTOR_COHORT_LIMIT,
+      earlyWindowSeconds: ACTOR_EARLY_WINDOW_MS / 1_000,
+      attemptsAtSeconds: [120, 600, 1800],
+      signaturePageLimit: ACTOR_SIGNATURE_LIMIT,
+      transactionLimitPerAttempt: ACTOR_TRANSACTION_LIMIT,
+      rawSourcePayloadsPersisted: false,
+      rawWalletsPersisted: false,
+      rawTransactionIdsPersisted: false,
+      normalizedObservationRetentionSeconds: ACTOR_RAW_RETENTION_MS / 1_000,
+      aggregateSummariesPersisted: true
+    },
+    cohort: {
+      admittedCount: actorStates.length,
+      limit: ACTOR_COHORT_LIMIT,
+      observations: actorStates.map((actorState) => {
+        const token = store.token(actorState.mint);
+        return {
+          mint: actorState.mint,
+          name: token?.name || "Unnamed mint",
+          symbol: token?.symbol || "???",
+          launchObservedAt: actorState.launchObservedAt,
+          acquisition: {
+            status: actorState.status,
+            attemptCount: actorState.attemptCount,
+            lastAttemptAt: actorState.lastAttemptAt,
+            nextAttemptAt: actorState.nextAttemptAt,
+            lastSuccessAt: actorState.lastSuccessAt,
+            missingReason: actorState.missingReason,
+            errorCode: actorState.errorCode
+          },
+          summary: actorSummaryByMint.get(actorState.mint) || null
+        };
+      })
+    },
+    privacy: {
+      labels: "per-installation keyed Actor numbers",
+      rawWalletsPublic: false,
+      rawProfilesPublic: false,
+      actorLookupEndpoint: false,
+      hiddenMappingMaterialPublic: false
+    },
+    downstream: actorStatus.correlationGate,
+    disclaimer: "Bounded finalized observations are partial, can miss transactions, and describe activity only. They do not establish identity, coordination, automation, intent, skill, safety, or a trade signal."
+  };
   return {
     version: appVersion, generatedAt, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage, telemetry: runtimeTelemetry.snapshot(),
     feedStatus, feedHealth: feed.state, feed, calloutStatus, lastEventAt, lastMintAt,
@@ -531,7 +618,7 @@ function snapshot() {
       migrationsObserved: tokens.filter((t) => ["migration-observed", "graduated"].includes(t.status)).length,
       calloutsLastHour: store.calloutCountSince(hour)
     },
-    tokens,
+    tokens: tokens.map(publicToken),
     leaderboard: {
       schemaVersion: 2,
       mode,
@@ -636,8 +723,8 @@ function snapshot() {
       summary: riskCohortView.summary,
       disclaimer: "Provider and feed observations can be incomplete, delayed, or wrong. Exact declared-identifier or registrable-domain reuse does not establish duplicate content, common control, maliciousness, safety, or a probability of harm."
     },
-    actionIntelligence,
-    narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40).map(publicAlert)
+    actionIntelligence, earlyActorIntelligence,
+    narratives, callouts: callouts.slice(0, 30).map(publicCallout), alerts: store.alerts(40).map(publicAlert)
   };
 }
 
@@ -661,7 +748,7 @@ function coinDossier(mint, currentSnapshot) {
     }).tokens[0];
   }
   const enrichment = store.enrichmentState(mint);
-  const [entry] = createTop100([token], {
+  const [entry] = createTop100([publicToken(token)], {
     mode,
     outcomesByMint: enrichment ? new Map([[mint, enrichment]]) : null
   });
@@ -678,6 +765,7 @@ function coinDossier(mint, currentSnapshot) {
       riskConfidence: entry.riskConfidence
     },
     outcome: entry.outcome,
+    earlyActor: store.actorSummary(mint),
     timeline: `/api/coins/${mint}/timeline`,
     scope: "bounded observations retained by this deployment; not a complete market or on-chain dossier",
     disclaimer: "Observational research only; missing evidence stays unavailable and nothing here is financial advice."
@@ -770,6 +858,25 @@ if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
     try { evaluateRiskMateriality(); }
     catch (error) { runtimeTelemetry.error("alerts.risk_recovery_evaluation_failed", error); }
   }, 300_000).unref();
+}
+
+if (mode === "live" && process.env.EARLY_ACTOR_ENRICHMENT !== "false") {
+  solanaRpcClient = new SolanaRpcClient({ endpoint: process.env.SOLANA_RPC_URL || SOLANA_MAINNET_RPC.endpoint });
+  actorIngestor = new EarlyActorIngestor({
+    store,
+    client: solanaRpcClient,
+    onStatus: (status, telemetry = {}) => {
+      const details = { status, mint: telemetry.mint, errorCode: telemetry.errorCode, coverageState: telemetry.coverageState };
+      if (telemetry.error) runtimeTelemetry.error("early_actors.worker_failed", telemetry.error, details);
+      else if (["degraded", "rate-limited", "invalid-response"].includes(status)) runtimeTelemetry.warn("early_actors.status", details);
+      else if (["observing", "complete"].includes(status)) runtimeTelemetry.info("early_actors.status", details);
+    }
+  });
+  actorIngestor.start();
+  void actorIngestor.drainDue().catch((error) => runtimeTelemetry.error("early_actors.drain_failed", error));
+  setInterval(() => {
+    void actorIngestor.drainDue().catch((error) => runtimeTelemetry.error("early_actors.drain_failed", error));
+  }, 15_000).unref();
 }
 
 if (process.env.BARK_API_KEY) {
@@ -885,7 +992,8 @@ const server = http.createServer(async (req, res) => {
         alertDedupe: "persistent",
         materialPersistence: "atomic-with-durable-baseline",
         telegram: telegramHealth()
-      }
+      },
+      earlyActors: actorIngestor?.getStatus() || { schemaVersion: 1, source: SOLANA_MAINNET_RPC.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 }
     });
     }
     if (url.pathname === "/api/snapshot") {
@@ -911,7 +1019,7 @@ const server = http.createServer(async (req, res) => {
       const storedToken = store.token(mint);
       if (!storedToken) return json(res, 404, { ok: false, error: "Coin was not observed by this deployment", requestId });
       const currentSnapshot = snapshot();
-      const token = currentSnapshot.tokens.find((candidate) => candidate.mint === mint) || normalizePersistedLiveToken(storedToken, { mode });
+      const token = currentSnapshot.tokens.find((candidate) => candidate.mint === mint) || publicToken(normalizePersistedLiveToken(storedToken, { mode }));
       const enrichment = store.enrichmentState(mint);
       let outcome = null;
       try {
@@ -921,9 +1029,11 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, buildCoinTimeline({
           mint,
           token,
-          events: store.eventsForMint(mint, 500),
+          events: store.eventsForMint(mint, 500).map((row) => row.kind === "callout"
+            ? { ...row, payload: publicCallout(row.payload) }
+            : row),
           alerts: store.alertsForMint(mint, 200),
-          callouts: store.calloutsForMint(mint, 200),
+          callouts: store.calloutsForMint(mint, 200).map(publicCallout),
           outcome,
           generatedAt: currentSnapshot.generatedAt,
           limit,
@@ -1067,7 +1177,15 @@ server.listen(port, "0.0.0.0", () => {
       enabled: Boolean(riskIdentityIngestor),
       apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
       rawProfilesPersisted: false
+    },
+    earlyActors: {
+      source: SOLANA_MAINNET_RPC.id,
+      enabled: Boolean(actorIngestor),
+      cohortLimit: ACTOR_COHORT_LIMIT,
+      rawWalletsPersisted: false,
+      rawTransactionsPersisted: false
     }
   });
   if (cleanup.tokens) runtimeTelemetry.info("database.demo_cleanup", cleanup);
+  if (identityCleanup.callouts || identityCleanup.events) runtimeTelemetry.info("database.identity_cleanup", identityCleanup);
 });

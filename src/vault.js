@@ -32,8 +32,8 @@ virtual_sol_reserve: ${finite(token.curveSol) ? token.curveSol : "null"}
 ## Snapshot
 
 - **Contract:** \`${token.mint}\`
-- **Creator:** \`${token.creator || "unknown"}\`
-- **Deployer/user:** \`${token.deployer || "unknown"}\`
+- **Creator actor:** ${token.creatorActor || "unavailable"}
+- **Deployer/user actor:** ${token.deployerActor || "unavailable"}
 - **Status:** ${token.status}
 - **Narrative:** [[${token.narrative}]]
 - **Market cap:** ${finite(token.marketCap) ? `$${integerOrUnknown(token.marketCap)}` : "unknown"}

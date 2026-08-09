@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
 
-export const STORE_SCHEMA_VERSION = 801;
+export const STORE_SCHEMA_VERSION = 900;
 
 const MAX_ENRICHMENT_QUERY = 200;
 const MAX_EVIDENCE_BYTES = 64 * 1_024;
@@ -596,6 +596,42 @@ export class Store {
         ON risk_identity_enrichment(provider, status, updated_at DESC, mint);
       CREATE INDEX IF NOT EXISTS risk_identity_provider_due
         ON risk_identity_enrichment(provider, next_attempt_at, mint);
+      CREATE TABLE IF NOT EXISTS actor_installation (
+        id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+        secret BLOB NOT NULL CHECK(length(secret)=32),
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS actor_cohort (
+        mint TEXT PRIMARY KEY NOT NULL,
+        launch_observed_at TEXT NOT NULL,
+        admitted_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('queued','observing','available','unavailable','rate-limited','degraded','invalid-response','complete')),
+        attempt_count INTEGER NOT NULL CHECK(attempt_count>=0 AND attempt_count<=3),
+        last_attempt_at TEXT,
+        next_attempt_at TEXT,
+        last_success_at TEXT,
+        missing_reason TEXT,
+        error_code TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS actor_cohort_due ON actor_cohort(next_attempt_at,mint);
+      CREATE INDEX IF NOT EXISTS actor_cohort_status_updated ON actor_cohort(status,updated_at DESC,mint);
+      CREATE TABLE IF NOT EXISTS actor_observations (
+        event_key TEXT PRIMARY KEY NOT NULL,
+        mint TEXT NOT NULL,
+        event TEXT NOT NULL CHECK(json_valid(event) AND json_type(event)='object'),
+        source_at TEXT,
+        observed_at TEXT NOT NULL,
+        retained_until TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS actor_observations_mint_observed ON actor_observations(mint,observed_at,event_key);
+      CREATE INDEX IF NOT EXISTS actor_observations_retention ON actor_observations(retained_until,event_key);
+      CREATE TABLE IF NOT EXISTS actor_summaries (
+        mint TEXT PRIMARY KEY NOT NULL,
+        summary TEXT NOT NULL CHECK(json_valid(summary) AND json_type(summary)='object'),
+        updated_at TEXT NOT NULL
+      );
       `);
       const alertColumns = new Set(this.db.prepare("PRAGMA table_info(alerts)").all().map(({ name }) => name));
       for (const [name, definition] of [
@@ -660,6 +696,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS events_mint_created ON events(mint, created_at DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS events_event_key ON events(event_key) WHERE event_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS brief_runs_kind_period_end ON brief_runs(kind, period_end DESC);
+      INSERT OR IGNORE INTO actor_installation (id,secret,created_at)
+        VALUES (1,randomblob(32),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       PRAGMA user_version = ${STORE_SCHEMA_VERSION};
       COMMIT;`);
       restrictDatabasePermissions(dbPath);
@@ -948,7 +986,49 @@ export class Store {
     return { total: rows.reduce((total, row) => total + Number(row.count), 0), statusCounts: Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])) };
   }
   upsertCallout(callout) {
-    this.calloutStmt.run(callout.externalId, callout.mint, JSON.stringify(callout), callout.createdAt);
+    const payload = { ...callout };
+    delete payload.externalId;
+    this.calloutStmt.run(callout.externalId, callout.mint, JSON.stringify(payload), callout.createdAt);
+  }
+  sanitizeLegacyCalloutProfiles(project) {
+    if (typeof project !== "function") throw new TypeError("callout projection must be a function");
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      let callouts = 0;
+      let events = 0;
+      for (const row of this.db.prepare("SELECT external_id,payload FROM callouts ORDER BY external_id").all()) {
+        let value;
+        try { value = JSON.parse(row.payload); } catch { continue; }
+        const sanitized = project(value);
+        if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) continue;
+        delete sanitized.externalId;
+        const payload = JSON.stringify(sanitized);
+        if (payload !== row.payload) {
+          this.db.prepare("UPDATE callouts SET payload=? WHERE external_id=?").run(payload, row.external_id);
+          callouts++;
+        }
+      }
+      for (const row of this.db.prepare("SELECT id,payload FROM events WHERE kind='callout' ORDER BY id").all()) {
+        let value;
+        try { value = JSON.parse(row.payload); } catch { continue; }
+        const sanitized = project(value);
+        if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) continue;
+        delete sanitized.externalId;
+        const payload = JSON.stringify(sanitized);
+        if (payload !== row.payload) {
+          this.db.prepare("UPDATE events SET payload=? WHERE id=?").run(payload, row.id);
+          events++;
+        }
+      }
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return { callouts, events };
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
   }
   upsertEnrichmentState(state) {
     if (!state || typeof state !== "object" || Array.isArray(state)) throw new TypeError("enrichment state must be an object");
@@ -1273,6 +1353,147 @@ export class Store {
       cohortAdmissions: { outcome: outcomeCohortAdmissions, risk: riskCohortAdmissions },
       cohortDrops: { outcome: null, risk: null, reason: "Historical cohort removals are not tracked; null means unavailable, not zero." }
     };
+  }
+  actorPrivacySecret() {
+    const row = this.db.prepare("SELECT secret FROM actor_installation WHERE id=1").get();
+    if (!(Buffer.isBuffer(row?.secret) || row?.secret instanceof Uint8Array) || row.secret.length !== 32) {
+      throw new Error("actor installation secret is unavailable");
+    }
+    return Buffer.from(row.secret);
+  }
+  admitActorMint({ mint, launchObservedAt, admittedAt = new Date().toISOString(), nextAttemptAt, limit = 16 } = {}) {
+    const normalizedMint = text(mint, "actor mint", { max: 44 });
+    if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor mint must be a Solana base58 address");
+    const normalizedLaunchAt = timestamp(launchObservedAt, "actor launchObservedAt");
+    const normalizedAdmittedAt = timestamp(admittedAt, "actor admittedAt");
+    const normalizedNextAt = timestamp(nextAttemptAt, "actor nextAttemptAt");
+    const normalizedLimit = boundedInteger(limit, "actor cohort limit", { min: 1, max: 64 });
+    const existing = this.db.prepare("SELECT * FROM actor_cohort WHERE mint=?").get(normalizedMint);
+    if (existing) return { admitted: false, reason: "already-admitted", state: this.actorState(normalizedMint) };
+    const count = Number(this.db.prepare("SELECT count(*) AS count FROM actor_cohort").get().count);
+    if (count >= normalizedLimit) return { admitted: false, reason: "cohort-full", state: null };
+    this.db.prepare(`INSERT INTO actor_cohort
+      (mint,launch_observed_at,admitted_at,status,attempt_count,last_attempt_at,next_attempt_at,last_success_at,missing_reason,error_code,updated_at)
+      VALUES (?,?,?,'queued',0,NULL,?,NULL,'Awaiting bounded finalized transaction acquisition',NULL,?)`)
+      .run(normalizedMint, normalizedLaunchAt, normalizedAdmittedAt, normalizedNextAt, normalizedAdmittedAt);
+    return { admitted: true, reason: null, state: this.actorState(normalizedMint) };
+  }
+  actorState(mint) {
+    const normalizedMint = text(mint, "actor mint", { max: 44 });
+    const row = this.db.prepare(`SELECT mint,launch_observed_at AS launchObservedAt,admitted_at AS admittedAt,status,
+      attempt_count AS attemptCount,last_attempt_at AS lastAttemptAt,next_attempt_at AS nextAttemptAt,
+      last_success_at AS lastSuccessAt,missing_reason AS missingReason,error_code AS errorCode,updated_at AS updatedAt
+      FROM actor_cohort WHERE mint=?`).get(normalizedMint);
+    return row || null;
+  }
+  actorStates({ limit = 64 } = {}) {
+    const normalizedLimit = boundedInteger(limit, "actor state limit", { min: 1, max: 200 });
+    return this.db.prepare(`SELECT mint,launch_observed_at AS launchObservedAt,admitted_at AS admittedAt,status,
+      attempt_count AS attemptCount,last_attempt_at AS lastAttemptAt,next_attempt_at AS nextAttemptAt,
+      last_success_at AS lastSuccessAt,missing_reason AS missingReason,error_code AS errorCode,updated_at AS updatedAt
+      FROM actor_cohort ORDER BY admitted_at ASC,mint ASC LIMIT ?`).all(normalizedLimit);
+  }
+  dueActorStates({ now = new Date().toISOString(), limit = 16 } = {}) {
+    const normalizedNow = timestamp(now, "actor due time");
+    const normalizedLimit = boundedInteger(limit, "actor due limit", { min: 1, max: 32 });
+    return this.db.prepare(`SELECT mint,launch_observed_at AS launchObservedAt,admitted_at AS admittedAt,status,
+      attempt_count AS attemptCount,last_attempt_at AS lastAttemptAt,next_attempt_at AS nextAttemptAt,
+      last_success_at AS lastSuccessAt,missing_reason AS missingReason,error_code AS errorCode,updated_at AS updatedAt
+      FROM actor_cohort WHERE next_attempt_at IS NOT NULL AND next_attempt_at<=?
+      ORDER BY next_attempt_at ASC,mint ASC LIMIT ?`).all(normalizedNow, normalizedLimit);
+  }
+  recordActorState({ mint, status, attemptedAt, nextAttemptAt = null, successAt = null, missingReason = null, errorCode = null } = {}) {
+    const normalizedMint = text(mint, "actor mint", { max: 44 });
+    const normalizedStatus = text(status, "actor status", { max: 32, code: true }).toLowerCase();
+    if (!["observing", "available", "unavailable", "rate-limited", "degraded", "invalid-response", "complete"].includes(normalizedStatus)) {
+      throw new TypeError("actor status is unsupported");
+    }
+    const normalizedAttemptedAt = timestamp(attemptedAt, "actor attemptedAt");
+    const normalizedNextAt = nextAttemptAt === null ? null : timestamp(nextAttemptAt, "actor nextAttemptAt");
+    const normalizedSuccessAt = successAt === null ? null : timestamp(successAt, "actor successAt");
+    const normalizedReason = missingReason === null ? null : text(missingReason, "actor missingReason", { max: 512 });
+    const normalizedError = errorCode === null ? null : text(errorCode, "actor errorCode", { max: 64, code: true }).toLowerCase();
+    const result = this.db.prepare(`UPDATE actor_cohort SET status=?,attempt_count=attempt_count+1,last_attempt_at=?,
+      next_attempt_at=?,last_success_at=coalesce(?,last_success_at),missing_reason=?,error_code=?,updated_at=?
+      WHERE mint=? AND attempt_count<3`).run(normalizedStatus, normalizedAttemptedAt, normalizedNextAt,
+      normalizedSuccessAt, normalizedReason, normalizedError, normalizedAttemptedAt, normalizedMint);
+    if (result.changes !== 1) throw new Error("actor cohort state could not record a bounded attempt");
+    return this.actorState(normalizedMint);
+  }
+  saveActorObservation({ eventKey, mint, event, sourceAt = null, observedAt, retainedUntil } = {}) {
+    const normalizedEventKey = text(eventKey, "actor event key", { max: 192, code: true });
+    const normalizedMint = text(mint, "actor observation mint", { max: 44 });
+    if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor observation mint must be a Solana base58 address");
+    const normalizedObservedAt = timestamp(observedAt, "actor observedAt");
+    const normalizedSourceAt = sourceAt === null ? null : timestamp(sourceAt, "actor sourceAt");
+    const normalizedRetainedUntil = timestamp(retainedUntil, "actor retainedUntil");
+    if (normalizedRetainedUntil <= normalizedObservedAt) throw new RangeError("actor retainedUntil must follow observedAt");
+    if (!event || typeof event !== "object" || Array.isArray(event) || event.mint !== normalizedMint
+      || typeof event.actor !== "string" || !/^Actor [1-9][0-9]{0,19}$/.test(event.actor)
+      || !["buy", "sell"].includes(event.side)) throw new TypeError("actor event did not match the minimized persistence contract");
+    const encoded = JSON.stringify(event);
+    if (Buffer.byteLength(encoded) > 8 * 1_024 || /(?:traderPublicKey|actorAddress|signature|cookie|authorization|privateKey)/i.test(encoded)) {
+      throw new TypeError("actor event contained raw identity, transaction, credential, or oversized data");
+    }
+    const createdAt = new Date().toISOString();
+    const result = this.db.prepare(`INSERT OR IGNORE INTO actor_observations
+      (event_key,mint,event,source_at,observed_at,retained_until,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(normalizedEventKey, normalizedMint, encoded, normalizedSourceAt, normalizedObservedAt, normalizedRetainedUntil, createdAt);
+    if (result.changes === 0) {
+      const existing = this.db.prepare(`SELECT mint,event,source_at AS sourceAt,observed_at AS observedAt
+        FROM actor_observations WHERE event_key=?`).get(normalizedEventKey);
+      if (!existing || existing.mint !== normalizedMint || existing.event !== encoded
+        || existing.sourceAt !== normalizedSourceAt || existing.observedAt !== normalizedObservedAt) {
+        throw new Error("actor observation dedupe key conflicts with retained evidence");
+      }
+    }
+    return { written: result.changes === 1 };
+  }
+  actorObservationEvents(mint, limit = 512) {
+    const normalizedMint = text(mint, "actor mint", { max: 44 });
+    const normalizedLimit = boundedInteger(limit, "actor event limit", { min: 1, max: 4096 });
+    return this.db.prepare(`SELECT event FROM actor_observations WHERE mint=? ORDER BY observed_at ASC,event_key ASC LIMIT ?`)
+      .all(normalizedMint, normalizedLimit).flatMap(({ event }) => {
+        try { return [JSON.parse(event)]; } catch { return []; }
+      });
+  }
+  pruneActorObservations({ now = new Date().toISOString(), maximum = 4096 } = {}) {
+    const normalizedNow = timestamp(now, "actor retention time");
+    const normalizedMaximum = boundedInteger(maximum, "actor retention maximum", { min: 1, max: 100_000 });
+    const expired = this.db.prepare("DELETE FROM actor_observations WHERE retained_until<=?").run(normalizedNow).changes;
+    const excess = this.db.prepare(`DELETE FROM actor_observations WHERE event_key IN (
+      SELECT event_key FROM actor_observations ORDER BY observed_at DESC,event_key DESC LIMIT -1 OFFSET ?
+    )`).run(normalizedMaximum).changes;
+    return { expired, excess, retained: Number(this.db.prepare("SELECT count(*) AS count FROM actor_observations").get().count) };
+  }
+  saveActorSummary(mint, summary) {
+    const normalizedMint = text(mint, "actor summary mint", { max: 44 });
+    if (!summary || typeof summary !== "object" || Array.isArray(summary) || summary.mint !== normalizedMint
+      || !summary.coverage || !["missing", "insufficient-sample", "available"].includes(summary.coverage.state)) {
+      throw new TypeError("actor summary did not match the public aggregate contract");
+    }
+    const encoded = JSON.stringify(summary);
+    if (Buffer.byteLength(encoded) > 32 * 1_024 || /(?:traderPublicKey|actorAddress|signature|transactionProvenance|cookie|authorization|privateKey)/i.test(encoded)) {
+      throw new TypeError("actor summary contained private, raw, or oversized data");
+    }
+    const updatedAt = new Date().toISOString();
+    this.db.prepare(`INSERT INTO actor_summaries (mint,summary,updated_at) VALUES (?,?,?)
+      ON CONFLICT(mint) DO UPDATE SET summary=excluded.summary,updated_at=excluded.updated_at`)
+      .run(normalizedMint, encoded, updatedAt);
+    return { ...summary, updatedAt };
+  }
+  actorSummaries(limit = 64) {
+    const normalizedLimit = boundedInteger(limit, "actor summary limit", { min: 1, max: 200 });
+    return this.db.prepare("SELECT summary,updated_at AS updatedAt FROM actor_summaries ORDER BY updated_at DESC,mint ASC LIMIT ?")
+      .all(normalizedLimit).flatMap(({ summary, updatedAt }) => {
+        try { return [{ ...JSON.parse(summary), updatedAt }]; } catch { return []; }
+      });
+  }
+  actorSummary(mint) {
+    const normalizedMint = text(mint, "actor summary mint", { max: 44 });
+    const row = this.db.prepare("SELECT summary,updated_at AS updatedAt FROM actor_summaries WHERE mint=?").get(normalizedMint);
+    if (!row) return null;
+    try { return { ...JSON.parse(row.summary), updatedAt: row.updatedAt }; } catch { return null; }
   }
   countBySource(source) {
     if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");

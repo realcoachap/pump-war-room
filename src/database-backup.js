@@ -25,6 +25,7 @@ const LEGACY_SCHEMA_VERSION = 501;
 const OUTCOME_SCHEMA_VERSION = 600;
 const RISK_SCHEMA_VERSION = 700;
 const ACTION_SCHEMA_VERSION = 800;
+const HARDENED_ACTION_SCHEMA_VERSION = 801;
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
@@ -46,7 +47,16 @@ export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   risk_identity_enrichment: Object.freeze([
     "mint", "provider", "evidence", "status", "missing_reason", "error_code", "attempt_count",
     "last_attempt_at", "next_attempt_at", "last_success_at", "updated_at"
-  ])
+  ]),
+  actor_installation: Object.freeze(["id", "secret", "created_at"]),
+  actor_cohort: Object.freeze([
+    "mint", "launch_observed_at", "admitted_at", "status", "attempt_count", "last_attempt_at",
+    "next_attempt_at", "last_success_at", "missing_reason", "error_code", "updated_at"
+  ]),
+  actor_observations: Object.freeze([
+    "event_key", "mint", "event", "source_at", "observed_at", "retained_until", "created_at"
+  ]),
+  actor_summaries: Object.freeze(["mint", "summary", "updated_at"])
 });
 
 const REQUIRED_COLUMN_TYPES = Object.freeze({
@@ -74,7 +84,18 @@ const REQUIRED_COLUMN_TYPES = Object.freeze({
   risk_identity_enrichment: Object.freeze({
     mint: "TEXT", provider: "TEXT", evidence: "TEXT", status: "TEXT", missing_reason: "TEXT", error_code: "TEXT",
     attempt_count: "INTEGER", last_attempt_at: "TEXT", next_attempt_at: "TEXT", last_success_at: "TEXT", updated_at: "TEXT"
-  })
+  }),
+  actor_installation: Object.freeze({ id: "INTEGER", secret: "BLOB", created_at: "TEXT" }),
+  actor_cohort: Object.freeze({
+    mint: "TEXT", launch_observed_at: "TEXT", admitted_at: "TEXT", status: "TEXT", attempt_count: "INTEGER",
+    last_attempt_at: "TEXT", next_attempt_at: "TEXT", last_success_at: "TEXT", missing_reason: "TEXT",
+    error_code: "TEXT", updated_at: "TEXT"
+  }),
+  actor_observations: Object.freeze({
+    event_key: "TEXT", mint: "TEXT", event: "TEXT", source_at: "TEXT", observed_at: "TEXT",
+    retained_until: "TEXT", created_at: "TEXT"
+  }),
+  actor_summaries: Object.freeze({ mint: "TEXT", summary: "TEXT", updated_at: "TEXT" })
 });
 
 const REQUIRED_PRIMARY_KEYS = Object.freeze({
@@ -84,7 +105,11 @@ const REQUIRED_PRIMARY_KEYS = Object.freeze({
   callouts: Object.freeze(["external_id"]),
   brief_runs: Object.freeze(["brief_key"]),
   outcome_enrichment: Object.freeze(["mint"]),
-  risk_identity_enrichment: Object.freeze(["mint"])
+  risk_identity_enrichment: Object.freeze(["mint"]),
+  actor_installation: Object.freeze(["id"]),
+  actor_cohort: Object.freeze(["mint"]),
+  actor_observations: Object.freeze(["event_key"]),
+  actor_summaries: Object.freeze(["mint"])
 });
 
 const REQUIRED_NOT_NULL = Object.freeze({
@@ -97,7 +122,11 @@ const REQUIRED_NOT_NULL = Object.freeze({
     "data_cutoff", "model", "created_at"
   ]),
   outcome_enrichment: Object.freeze(["mint", "evidence", "status", "attempt_count", "updated_at"]),
-  risk_identity_enrichment: Object.freeze(["mint", "provider", "evidence", "status", "attempt_count", "updated_at"])
+  risk_identity_enrichment: Object.freeze(["mint", "provider", "evidence", "status", "attempt_count", "updated_at"]),
+  actor_installation: Object.freeze(["id", "secret", "created_at"]),
+  actor_cohort: Object.freeze(["mint", "launch_observed_at", "admitted_at", "status", "attempt_count", "updated_at"]),
+  actor_observations: Object.freeze(["event_key", "mint", "event", "observed_at", "retained_until", "created_at"]),
+  actor_summaries: Object.freeze(["mint", "summary", "updated_at"])
 });
 
 const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
@@ -112,6 +141,30 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     name: "alerts_mint_created",
     tableName: "alerts",
     sql: "CREATE INDEX alerts_mint_created ON alerts(mint, created_at DESC)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "actor_cohort_due",
+    tableName: "actor_cohort",
+    sql: "CREATE INDEX actor_cohort_due ON actor_cohort(next_attempt_at,mint)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "actor_cohort_status_updated",
+    tableName: "actor_cohort",
+    sql: "CREATE INDEX actor_cohort_status_updated ON actor_cohort(status,updated_at DESC,mint)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "actor_observations_mint_observed",
+    tableName: "actor_observations",
+    sql: "CREATE INDEX actor_observations_mint_observed ON actor_observations(mint,observed_at,event_key)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "actor_observations_retention",
+    tableName: "actor_observations",
+    sql: "CREATE INDEX actor_observations_retention ON actor_observations(retained_until,event_key)"
   }),
   Object.freeze({
     type: "index",
@@ -189,6 +242,58 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
   }),
   Object.freeze({
     type: "table",
+    name: "actor_cohort",
+    tableName: "actor_cohort",
+    sql: `CREATE TABLE actor_cohort (
+      mint TEXT PRIMARY KEY NOT NULL,
+      launch_observed_at TEXT NOT NULL,
+      admitted_at TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('queued','observing','available','unavailable','rate-limited','degraded','invalid-response','complete')),
+      attempt_count INTEGER NOT NULL CHECK(attempt_count>=0 AND attempt_count<=3),
+      last_attempt_at TEXT,
+      next_attempt_at TEXT,
+      last_success_at TEXT,
+      missing_reason TEXT,
+      error_code TEXT,
+      updated_at TEXT NOT NULL
+    )`
+  }),
+  Object.freeze({
+    type: "table",
+    name: "actor_installation",
+    tableName: "actor_installation",
+    sql: `CREATE TABLE actor_installation (
+      id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+      secret BLOB NOT NULL CHECK(length(secret)=32),
+      created_at TEXT NOT NULL
+    )`
+  }),
+  Object.freeze({
+    type: "table",
+    name: "actor_observations",
+    tableName: "actor_observations",
+    sql: `CREATE TABLE actor_observations (
+      event_key TEXT PRIMARY KEY NOT NULL,
+      mint TEXT NOT NULL,
+      event TEXT NOT NULL CHECK(json_valid(event) AND json_type(event)='object'),
+      source_at TEXT,
+      observed_at TEXT NOT NULL,
+      retained_until TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`
+  }),
+  Object.freeze({
+    type: "table",
+    name: "actor_summaries",
+    tableName: "actor_summaries",
+    sql: `CREATE TABLE actor_summaries (
+      mint TEXT PRIMARY KEY NOT NULL,
+      summary TEXT NOT NULL CHECK(json_valid(summary) AND json_type(summary)='object'),
+      updated_at TEXT NOT NULL
+    )`
+  }),
+  Object.freeze({
+    type: "table",
     name: "brief_runs",
     tableName: "brief_runs",
     sql: `CREATE TABLE brief_runs (
@@ -257,7 +362,16 @@ const ACTION_SCHEMA_ALERT_OBJECT = Object.freeze({
     created_at TEXT NOT NULL
   )`
 });
-const ACTION_SCHEMA_OBJECTS = Object.freeze(EXPECTED_SCHEMA_OBJECTS.map((entry) => (
+const ACTOR_TABLES = Object.freeze(new Set([
+  "actor_installation", "actor_cohort", "actor_observations", "actor_summaries"
+]));
+const HARDENED_ACTION_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
+  Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => !ACTOR_TABLES.has(table))
+));
+const HARDENED_ACTION_SCHEMA_OBJECTS = Object.freeze(
+  EXPECTED_SCHEMA_OBJECTS.filter(({ tableName }) => !ACTOR_TABLES.has(tableName))
+);
+const ACTION_SCHEMA_OBJECTS = Object.freeze(HARDENED_ACTION_SCHEMA_OBJECTS.map((entry) => (
   entry.type === "table" && entry.name === "alerts" ? ACTION_SCHEMA_ALERT_OBJECT : entry
 )));
 
@@ -361,6 +475,44 @@ function normalizeSchemaSql(value) {
     .trim();
 }
 
+const FORBIDDEN_ACTOR_IDENTITY_KEY = /^(?:actorAddress|traderPublicKey|wallet|walletAddress|owner|signer|user|participant|address|account|accountKey|accountAddress|publicKey|creator|deployer|caller|username|handle|profile|profileId|profileUrl|signature|transactionId|txid|rawAddress|identity|identityLookup|lookupMapping|mapping|dedupeKey|integrityKey|secret|digest)$/i;
+
+function actorIdentityViolation(value, pathParts = [], depth = 0) {
+  if (depth > 32) return `${pathParts.join(".") || "root"} exceeds the supported nesting depth`;
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const violation = actorIdentityViolation(value[index], [...pathParts, String(index)], depth + 1);
+      if (violation) return violation;
+    }
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = [...pathParts, key];
+    if (FORBIDDEN_ACTOR_IDENTITY_KEY.test(key)) return childPath.join(".");
+    if (key === "actor" && (typeof child !== "string" || !/^Actor [1-9][0-9]{0,19}$/.test(child))) {
+      return `${childPath.join(".")} is not an opaque actor label`;
+    }
+    const violation = actorIdentityViolation(child, childPath, depth + 1);
+    if (violation) return violation;
+  }
+  return null;
+}
+
+function verifyActorPrivacyRows(database) {
+  for (const [table, column] of [["actor_observations", "event"], ["actor_summaries", "summary"]]) {
+    const rows = database.prepare(`SELECT ${column} AS payload FROM ${table}`).all();
+    for (const { payload } of rows) {
+      let value;
+      try { value = JSON.parse(payload); }
+      catch { continue; }
+      const violation = actorIdentityViolation(value);
+      if (violation) fail(`Database ${table}.${column} persists a raw identity or hidden mapping field: ${violation}`);
+    }
+  }
+  return 0;
+}
+
 function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const integrity = pragmaValues(database, "PRAGMA integrity_check");
   if (integrity.length !== 1 || integrity[0] !== "ok") {
@@ -377,15 +529,18 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const outcomeOnly = allowLegacy && userVersion === OUTCOME_SCHEMA_VERSION;
   const riskOnly = allowLegacy && userVersion === RISK_SCHEMA_VERSION;
   const actionOnly = allowLegacy && userVersion === ACTION_SCHEMA_VERSION;
+  const hardenedActionOnly = allowLegacy && userVersion === HARDENED_ACTION_SCHEMA_VERSION;
   const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA
     : outcomeOnly ? OUTCOME_DATABASE_SCHEMA
       : riskOnly ? RISK_DATABASE_SCHEMA
-        : REQUIRED_DATABASE_SCHEMA;
+        : actionOnly || hardenedActionOnly ? HARDENED_ACTION_DATABASE_SCHEMA
+          : REQUIRED_DATABASE_SCHEMA;
   const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS
     : outcomeOnly ? OUTCOME_SCHEMA_OBJECTS
       : riskOnly ? RISK_SCHEMA_OBJECTS
         : actionOnly ? ACTION_SCHEMA_OBJECTS
-          : EXPECTED_SCHEMA_OBJECTS;
+          : hardenedActionOnly ? HARDENED_ACTION_SCHEMA_OBJECTS
+            : EXPECTED_SCHEMA_OBJECTS;
   const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(({ name }) => name);
   const rowCounts = {};
   for (const [table, requiredColumns] of Object.entries(requiredSchema)) {
@@ -426,24 +581,45 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     fail(`Database contains unsupported trigger(s): ${unsupportedTriggers.map(({ name }) => name).join(", ")}`);
   }
   const normalizedSchema = schema.map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }));
-  const normalizedExpectedSchema = expectedSchemaObjects.map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }));
+  const normalizedExpectedSchema = expectedSchemaObjects
+    .map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }))
+    .sort((left, right) => left.type < right.type ? -1 : left.type > right.type ? 1
+      : left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
   if (JSON.stringify(normalizedSchema) !== JSON.stringify(normalizedExpectedSchema)) {
-    fail("Database schema objects do not exactly match the supported Pump War Room schema");
+    const mismatchAt = Math.max(0, normalizedSchema.findIndex((row, index) => (
+      JSON.stringify(row) !== JSON.stringify(normalizedExpectedSchema[index])
+    )));
+    const actual = normalizedSchema[mismatchAt];
+    const expected = normalizedExpectedSchema[mismatchAt];
+    fail(`Database schema objects do not exactly match the supported Pump War Room schema near ${actual?.name || "end-of-schema"}; expected ${expected?.name || "end-of-schema"}`);
   }
   if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy
-    && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION].includes(userVersion))) {
+    && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION,
+      HARDENED_ACTION_SCHEMA_VERSION].includes(userVersion))) {
     fail(`Database schema version ${userVersion} does not match required version ${STORE_SCHEMA_VERSION}`);
   }
+  const actorSchema = userVersion === STORE_SCHEMA_VERSION;
   const jsonColumns = {
     tokens: "payload", events: "payload", callouts: "payload",
     ...(legacy ? {} : { outcome_enrichment: "evidence" }),
     ...(legacy || outcomeOnly ? {} : { risk_identity_enrichment: "evidence" }),
-    ...(legacy || outcomeOnly || riskOnly ? {} : { brief_runs: "model" })
+    ...(legacy || outcomeOnly || riskOnly ? {} : { brief_runs: "model" }),
+    ...(actorSchema ? { actor_observations: "event", actor_summaries: "summary" } : {})
   };
   const invalidJsonPayloads = Object.fromEntries(Object.entries(jsonColumns).map(([table, column]) => [
     table,
     Number(database.prepare(`SELECT count(*) AS count FROM ${table} WHERE NOT json_valid(${column})`).get().count)
   ]));
+  let actorPrivacyViolations = null;
+  let actorInstallationSecretValid = null;
+  if (actorSchema) {
+    const installation = database.prepare("SELECT id,secret FROM actor_installation").all();
+    actorInstallationSecretValid = installation.length === 1 && installation[0].id === 1
+      && (Buffer.isBuffer(installation[0].secret) || installation[0].secret instanceof Uint8Array)
+      && installation[0].secret.length === 32;
+    if (!actorInstallationSecretValid) fail("Database actor installation secret is missing or malformed");
+    actorPrivacyViolations = verifyActorPrivacyRows(database);
+  }
   return {
     integrityCheck: "ok",
     foreignKeyViolations: 0,
@@ -452,7 +628,9 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     userVersion,
     schemaSha256: schemaHash(normalizedSchema),
     rowCounts,
-    invalidJsonPayloads
+    invalidJsonPayloads,
+    actorInstallationSecretValid,
+    actorPrivacyViolations
   };
 }
 
@@ -482,10 +660,20 @@ function syncDirectory(directoryPath) {
 }
 
 function verifyApplicationWrites(databasePath) {
+  let store;
   let database;
   let transactionStarted = false;
   try {
-    database = new DatabaseSync(databasePath);
+    const beforeRestartDatabase = new DatabaseSync(databasePath, { readOnly: true });
+    const beforeRestartRow = beforeRestartDatabase.prepare("SELECT secret FROM actor_installation WHERE id=1").get();
+    beforeRestartDatabase.close();
+    const actorSecretBeforeRestart = Buffer.from(beforeRestartRow.secret);
+    store = new Store(databasePath);
+    database = store.db;
+    const actorSecretBefore = store.actorPrivacySecret();
+    const actorSecretRestartStable = actorSecretBeforeRestart.equals(actorSecretBefore);
+    actorSecretBeforeRestart.fill(0);
+    if (!actorSecretRestartStable) fail("Database application write probe changed the actor installation secret on reopen");
     database.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
     const suffix = randomUUID();
@@ -546,11 +734,125 @@ function verifyApplicationWrites(databasePath) {
       .run(`restore-brief-${suffix}`, "daily", "1999-12-31T00:00:00.000Z", createdAt, "UTC",
         "restore-verification-v1", "deployment-local", createdAt,
         JSON.stringify({ source: "restore-verification", feedCoverage: "unmeasured" }), createdAt);
+
+    database.exec("DELETE FROM actor_summaries; DELETE FROM actor_observations; DELETE FROM actor_cohort");
+    const actorMint = `Actor${suffix.replaceAll("-", "").replaceAll("0", "2")}`;
+    const actorEvent = {
+      schemaVersion: 1,
+      mint: actorMint,
+      actor: "Actor 1",
+      side: "buy",
+      amounts: { native: null, token: 1 },
+      source: { name: "solana-mainnet-rpc", evidenceClass: "on-chain-finalized" },
+      timestamps: { source: { state: "missing", value: null }, observedAt: createdAt },
+      transactionProvenance: {
+        state: "internal-only", evidenceClass: "locally-derived", slot: { state: "available", value: 1 }
+      }
+    };
+    const actorEventKey = `restore-actor-${suffix}`;
+    const admitted = store.admitActorMint({
+      mint: actorMint,
+      launchObservedAt: createdAt,
+      admittedAt: createdAt,
+      nextAttemptAt: createdAt,
+      limit: 64
+    });
+    if (!admitted.admitted) fail("Database application write probe could not admit its disposable actor mint");
+    const observation = store.saveActorObservation({
+      eventKey: actorEventKey,
+      mint: actorMint,
+      event: actorEvent,
+      observedAt: createdAt,
+      retainedUntil: "2100-01-01T00:00:00.000Z"
+    });
+    if (!observation.written) fail("Database application write probe could not persist its actor observation");
+    const duplicate = store.saveActorObservation({
+      eventKey: actorEventKey,
+      mint: actorMint,
+      event: actorEvent,
+      observedAt: createdAt,
+      retainedUntil: "2100-01-01T00:00:00.000Z"
+    });
+    if (duplicate.written) fail("Database application write probe did not deduplicate its actor observation");
+    let actorConflictRejected = false;
+    try {
+      store.saveActorObservation({
+        eventKey: actorEventKey,
+        mint: actorMint,
+        event: { ...actorEvent, side: "sell" },
+        observedAt: createdAt,
+        retainedUntil: "2100-01-01T00:00:00.000Z"
+      });
+    } catch (error) {
+      if (!/dedupe key conflicts/.test(error?.message || "")) throw error;
+      actorConflictRejected = true;
+    }
+    if (!actorConflictRejected) fail("Database application write probe accepted conflicting actor evidence");
+    let rawIdentityRejected = false;
+    try {
+      store.saveActorObservation({
+        eventKey: `restore-raw-actor-${suffix}`,
+        mint: actorMint,
+        event: { ...actorEvent, actorAddress: "So11111111111111111111111111111111111111112" },
+        observedAt: createdAt,
+        retainedUntil: "2100-01-01T00:00:00.000Z"
+      });
+    } catch (error) {
+      if (!/raw identity/.test(error?.message || "")) throw error;
+      rawIdentityRejected = true;
+    }
+    if (!rawIdentityRejected) fail("Database application write probe persisted a raw actor identity");
+    const expiredEvent = {
+      ...actorEvent,
+      timestamps: { ...actorEvent.timestamps, observedAt: "1999-12-30T00:00:00.000Z" }
+    };
+    store.saveActorObservation({
+      eventKey: `restore-expired-actor-${suffix}`,
+      mint: actorMint,
+      event: expiredEvent,
+      observedAt: "1999-12-30T00:00:00.000Z",
+      retainedUntil: "1999-12-31T00:00:00.000Z"
+    });
+    const retention = store.pruneActorObservations({ now: createdAt, maximum: 1 });
+    if (retention.expired !== 1 || retention.excess !== 0 || retention.retained !== 1) {
+      fail("Database application write probe could not enforce actor-observation retention");
+    }
+    const actorSummary = store.saveActorSummary(actorMint, {
+      schemaVersion: 1,
+      mint: actorMint,
+      coverage: { state: "insufficient-sample", eventCount: 1, uniqueActorCount: 1 },
+      metrics: null
+    });
+    if (actorSummary.mint !== actorMint || !store.actorSummary(actorMint)) {
+      fail("Database application write probe could not persist its actor summary");
+    }
+    const actorSecretAfter = store.actorPrivacySecret();
+    const actorSecretStable = actorSecretBefore.equals(actorSecretAfter);
+    actorSecretBefore.fill(0);
+    actorSecretAfter.fill(0);
+    if (!actorSecretStable) fail("Database application write probe changed the actor installation secret");
+    const actorPrivacyViolations = verifyActorPrivacyRows(database);
     const inserted = Number(database.prepare("SELECT count(*) AS count FROM tokens WHERE mint=?").get(mint).count);
     if (inserted !== 1) fail("Database application write probe could not read its disposable token row");
     database.exec("ROLLBACK");
     transactionStarted = false;
-    return { verified: true, rolledBack: true, telegramOutboxDue: true, invalidPendingRejected: true };
+    return {
+      verified: true,
+      rolledBack: true,
+      telegramOutboxDue: true,
+      invalidPendingRejected: true,
+      actor: {
+        installationSecretStable: true,
+        admissionWritten: true,
+        observationWritten: true,
+        duplicateSuppressed: true,
+        conflictRejected: actorConflictRejected,
+        summaryWritten: true,
+        retentionEnforced: true,
+        rawIdentityRejected,
+        rawIdentityViolations: actorPrivacyViolations
+      }
+    };
   } catch (error) {
     if (transactionStarted) {
       try { database?.exec("ROLLBACK"); } catch {}
@@ -558,7 +860,7 @@ function verifyApplicationWrites(databasePath) {
     if (error instanceof DatabaseVerificationError) throw error;
     fail(`Database application write probe failed: ${error.message}`, error);
   } finally {
-    try { database?.close(); } catch {}
+    try { store?.db.close(); } catch {}
   }
 }
 
@@ -592,7 +894,9 @@ function assertSameRestore(original, restored) {
   }
   if (original.schemaSha256 !== restored.schemaSha256 ||
       JSON.stringify(original.rowCounts) !== JSON.stringify(restored.rowCounts) ||
-      JSON.stringify(original.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads)) {
+      JSON.stringify(original.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads) ||
+      original.actorInstallationSecretValid !== restored.actorInstallationSecretValid ||
+      original.actorPrivacyViolations !== restored.actorPrivacyViolations) {
     fail("Disposable restore does not match the backup schema and row counts");
   }
 }
@@ -612,7 +916,8 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
     chmodSync(restoredPath, 0o600);
     let restored = inspectDatabaseFile(restoredPath, { allowLegacy: true });
     assertSameRestore(artifact, restored);
-    const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION].includes(restored.userVersion)
+    const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION,
+      ACTION_SCHEMA_VERSION, HARDENED_ACTION_SCHEMA_VERSION].includes(restored.userVersion)
       ? restored.userVersion
       : null;
     if (migratedFromSchemaVersion !== null) {
@@ -624,7 +929,9 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
     const afterProbe = inspectDatabaseFile(restoredPath);
     if (afterProbe.schemaSha256 !== restored.schemaSha256 ||
         JSON.stringify(afterProbe.rowCounts) !== JSON.stringify(restored.rowCounts) ||
-        JSON.stringify(afterProbe.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads)) {
+        JSON.stringify(afterProbe.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads) ||
+        afterProbe.actorInstallationSecretValid !== restored.actorInstallationSecretValid ||
+        afterProbe.actorPrivacyViolations !== restored.actorPrivacyViolations) {
       fail("Disposable application write probe did not roll back cleanly");
     }
     assertStandaloneArtifact(backup.realPath);
@@ -648,7 +955,9 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
         bytes: restored.bytes,
         schemaSha256: restored.schemaSha256,
         rowCounts: restored.rowCounts,
-        invalidJsonPayloads: restored.invalidJsonPayloads
+        invalidJsonPayloads: restored.invalidJsonPayloads,
+        actorInstallationSecretValid: restored.actorInstallationSecretValid,
+        actorPrivacyViolations: restored.actorPrivacyViolations
       }
     };
   } catch (error) {
