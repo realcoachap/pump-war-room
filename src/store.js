@@ -585,6 +585,13 @@ export class Store {
     this.riskIdentityStatusCoverageStmt = this.db.prepare(`SELECT status,count(*) AS count
       FROM risk_identity_enrichment WHERE (? IS NULL OR provider=?) AND (? IS NULL OR status=?)
       GROUP BY status ORDER BY status ASC`);
+    this.riskIdentityErrorCoverageStmt = this.db.prepare(`SELECT error_code,count(*) AS count
+      FROM risk_identity_enrichment WHERE (? IS NULL OR provider=?) AND (? IS NULL OR status=?)
+        AND error_code IS NOT NULL
+      GROUP BY error_code ORDER BY error_code ASC`);
+    this.riskIdentityInvalidAcquisitionCoverageStmt = this.db.prepare(`SELECT count(*) AS count
+      FROM risk_identity_enrichment WHERE (? IS NULL OR provider=?) AND (? IS NULL OR status=?)
+        AND (status='invalid-response' OR error_code LIKE 'invalid-%' OR error_code='token-mismatch')`);
     this.riskIdentityDueTokensStmt = this.db.prepare(`SELECT tokens.payload,tokens.created_at
       FROM risk_identity_enrichment
       JOIN tokens ON tokens.mint=risk_identity_enrichment.mint
@@ -720,6 +727,8 @@ export class Store {
     const bindings = [normalizedProvider, normalizedProvider, normalizedStatus, normalizedStatus];
     const row = this.riskIdentityCoverageStmt.get(...bindings);
     const statusCounts = Object.fromEntries(this.riskIdentityStatusCoverageStmt.all(...bindings).map(({ status: name, count }) => [name, Number(count)]));
+    const errorCodeCounts = Object.fromEntries(this.riskIdentityErrorCoverageStmt.all(...bindings).map(({ error_code: name, count }) => [name, Number(count)]));
+    const invalidAcquisitionCount = Number(this.riskIdentityInvalidAcquisitionCoverageStmt.get(...bindings).count);
     return {
       provider: normalizedProvider,
       status: normalizedStatus,
@@ -727,7 +736,9 @@ export class Store {
       successCount: Number(row.success_count || 0),
       firstUpdatedAt: row.first_updated_at,
       lastUpdatedAt: row.last_updated_at,
-      statusCounts
+      statusCounts,
+      errorCodeCounts,
+      invalidAcquisitionCount
     };
   }
   dueRiskIdentityTokens({ provider, now = new Date().toISOString(), limit = 100 } = {}) {

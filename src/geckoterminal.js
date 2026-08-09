@@ -4,6 +4,8 @@ const DEFAULT_MIN_INTERVAL_MS = 6_500;
 const PROVIDER_VERSION = "20230203";
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const REQUEST_PRIORITY = Object.freeze({ poolSelection: 0, outcome: 1, tokenInfo: 2 });
+const RESPONSE_PARSER = Object.freeze({ standard: "standard", tokenInfo: "token-info" });
+const TOKEN_INFO_PERCENTAGE_FIELDS = new Set(["developer_holding_percentage", "top_10"]);
 
 export const GECKOTERMINAL_PROVIDER = Object.freeze({
   id: "geckoterminal",
@@ -60,6 +62,18 @@ function retryAfterMilliseconds(response) {
   if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null;
+}
+
+function parseTokenInfoJson(source) {
+  return JSON.parse(source, (key, value, context) => {
+    if (TOKEN_INFO_PERCENTAGE_FIELDS.has(key) && typeof value === "number") {
+      if (typeof context?.source !== "string") {
+        throw new TypeError("runtime did not expose the token-info percentage source decimal");
+      }
+      return context.source;
+    }
+    return value;
+  });
 }
 
 export function selectGeckoTerminalPool(payload, mintValue, {
@@ -216,9 +230,9 @@ export class GeckoTerminalClient {
     this.drainingRequests = false;
   }
 
-  #request(pathname, parameters = {}, priority = REQUEST_PRIORITY.outcome) {
+  #request(pathname, parameters = {}, priority = REQUEST_PRIORITY.outcome, responseParser = RESPONSE_PARSER.standard) {
     return new Promise((resolve, reject) => {
-      this.pendingRequests.push({ pathname, parameters, priority, sequence: this.requestSequence++, resolve, reject });
+      this.pendingRequests.push({ pathname, parameters, priority, responseParser, sequence: this.requestSequence++, resolve, reject });
       this.#drainRequests();
     });
   }
@@ -233,7 +247,7 @@ export class GeckoTerminalClient {
         this.pendingRequests.sort((left, right) => left.priority - right.priority || left.sequence - right.sequence);
         const request = this.pendingRequests.shift();
         this.nextRequestAt = Math.max(this.nextRequestAt, this.now()) + this.minIntervalMs;
-        try { request.resolve(await this.#executeRequest(request.pathname, request.parameters)); }
+        try { request.resolve(await this.#executeRequest(request.pathname, request.parameters, request.responseParser)); }
         catch (error) { request.reject(error); }
       }
     } finally {
@@ -242,7 +256,7 @@ export class GeckoTerminalClient {
     }
   }
 
-  async #executeRequest(pathname, parameters) {
+  async #executeRequest(pathname, parameters, responseParser) {
     const url = new URL(`${this.baseUrl}${pathname}`);
     for (const [name, value] of Object.entries(parameters)) {
       if (value !== null && value !== undefined) url.searchParams.set(name, String(value));
@@ -274,7 +288,9 @@ export class GeckoTerminalClient {
       throw new GeckoTerminalError(code, `GeckoTerminal returned HTTP ${status ?? "unknown"}`, { status, retryAfterMs });
     }
     try {
-      const payload = await response.json();
+      const payload = responseParser === RESPONSE_PARSER.tokenInfo
+        ? parseTokenInfoJson(await response.text())
+        : await response.json();
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new TypeError("response was not an object");
       return payload;
     } catch (error) {
@@ -296,7 +312,12 @@ export class GeckoTerminalClient {
 
   async tokenInfo(mintValue) {
     const mint = requireMint(mintValue);
-    return this.#request(`/networks/solana/tokens/${encodeURIComponent(mint)}/info`, {}, REQUEST_PRIORITY.tokenInfo);
+    return this.#request(
+      `/networks/solana/tokens/${encodeURIComponent(mint)}/info`,
+      {},
+      REQUEST_PRIORITY.tokenInfo,
+      RESPONSE_PARSER.tokenInfo
+    );
   }
 
   async currentPoolForToken(mintValue) {

@@ -17,7 +17,11 @@ import { GECKOTERMINAL_PROVIDER, GeckoTerminalClient } from "./geckoterminal.js"
 import { VerifiedOutcomeIngestor } from "./outcome-ingest.js";
 import { aggregateOutcomeCohorts, OUTCOME_REVISION_POLICY, summarizeVerifiedOutcomes, unavailableProviderOutcome, validateProviderObservedOutcome } from "./outcomes.js";
 import { RiskIdentityIngestor } from "./risk-ingest.js";
-import { RISK_IDENTITY_EVIDENCE_CLASSES } from "./risk-identity.js";
+import {
+  RISK_IDENTITY_EVIDENCE_CLASSES,
+  RISK_IDENTITY_METHOD_VERSION,
+  RISK_IDENTITY_PARSER_REVISION
+} from "./risk-identity.js";
 import { attachRiskIdentityEvidence } from "./risk-public.js";
 import { normalizePersistedLiveToken } from "./live-token.js";
 
@@ -320,6 +324,8 @@ function snapshot() {
         id: GECKOTERMINAL_PROVIDER.id,
         label: "GeckoTerminal token-info provider observations",
         apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
+        parserRevision: RISK_IDENTITY_PARSER_REVISION,
+        fingerprintMethodVersion: RISK_IDENTITY_METHOD_VERSION,
         endpoint: "/networks/solana/tokens/{mint}/info",
         attributionUrl: GECKOTERMINAL_PROVIDER.attributionUrl,
         poweredByUrl: "https://www.coingecko.com/",

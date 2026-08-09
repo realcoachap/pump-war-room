@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.7.1**
+Current release: **v0.7.2**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, and exposes holder, liquidity, lifecycle, creator/deployer, and exact identity-reuse evidence without presenting an uncalibrated risk probability.
 
@@ -79,7 +79,11 @@ npm run outcomes:purge -- --provider geckoterminal --confirm DELETE-geckotermina
 
 v0.7.0 reuses the same singleton, conservatively paced GeckoTerminal client but maintains an independent fixed prospective risk cohort of at most 120 launches. It does not reuse or backfill the already-full v0.6 outcome cohort: new PumpPortal observations are durably admitted while the v0.7 worker is active, with a 20-minute replay-age ceiling, and the dashboard keeps those cohort rows inspectable after they leave the latest-token tape. Token info is attempted no earlier than 15 minutes after launch. Missing or stale evidence gets at most one retry about one hour later; a weaker retry cannot erase stronger earlier factors. This is bounded one-time acquisition, not an ongoing freshness promise, so each factor's fetch/observation timestamp is authoritative. The provider contract is pinned to API version `20230203`. GeckoTerminal describes this public-beta data as not vetted by CoinGecko, so the UI says **provider observed**, never on-chain verified.
 
-v0.7.1 hardens that parser against provider-observed representation drift without broadening the retained data contract. Decimal-string developer-holding percentages are normalized with the same finite 0–100 bounds as numeric percentages, and declared X/Telegram identifiers may use exact official profile URLs or X post paths. Only the normalized exact handle is fingerprinted; off-domain URLs, reserved routes, malformed paths, raw profiles, and unrecognized fields remain rejected.
+v0.7.1 accepts bounded provider-observed representation drift without broadening the retained data contract: decimal-string percentages and exact official X/Telegram profile or X-post paths normalize into the same private exact-match domain as their direct forms.
+
+v0.7.2 separates parser revision provenance from the unchanged fingerprint method/hash domain. Token-info transport preserves the exact JSON source decimal for the two percentage fields; quoted and unquoted decimals are bounded before numeric conversion and rejected when their exact mathematical value exceeds 100. A tested, explicitly non-exhaustive platform-navigation policy rejects known non-profile routes in direct, URL, and X-post forms; known route digests already retained by v0.7.1 are excluded from duplicate aggregation without exposing the normalized identifiers. The first 16 mints in the fixed cohort form the deterministic current-parser audit sample. Successful and failed audit dispositions are persisted separately from the ordinary two-attempt schedule, so restarts neither rotate through the remainder of the cohort nor repeatedly select the same failures. Stronger earlier factors remain authoritative, with separate successful-audit provenance when a weaker current parse succeeds and explicit attempt provenance when an audit fails.
+
+Production smoke requires all 120 fixed-cohort states and 120 unique inspectable observations, reconciled persisted/public coverage, at least 50% successful acquisition coverage, and no more than 25% latest parser-invalid acquisitions. It also requires the 16-row parser sample to have a complete current-revision disposition and at least one successful current-parser acquisition. A fresh process-local success proves the initial rollout; after a routine restart, the same gate accepts the complete persisted sample rather than manufacturing an otherwise impossible request.
 
 The separate `risk_identity_enrichment` table retains only allowlisted scalars, minimal pool provenance, and domain-separated SHA-256 digests: holder count, GeckoTerminal-reported top-10 distribution, provider-reported developer holding, provider update/fetch times, a current provider-ranked page-1 pool reserve snapshot, and digests derived from normalized declared X, Telegram, registrable website-domain, and name/symbol values. The reserve is timestamped when fetched—never presented as launch-time liquidity—and is not locked-liquidity evidence. The normalized identifiers themselves are not retained. The ingestion parser rejects raw responses, descriptions, images, provider prices/volumes, opaque provider scores, honeypot labels, and unrecognized fields. Public snapshot rows expose factor values, bounded acquisition failure states, and duplicate counts, not stored digests, raw errors, or raw provider profiles. Provider purge removes both outcome and risk/identity rows before verified secure deletion and vacuuming.
 
@@ -95,7 +99,7 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 
 - Live/demo launch stream with local SQLite persistence
 - Production uptime, verified-feed staleness, source-scoped counters, structured redacted error telemetry, and runtime mount evidence
-- Railway readiness gating plus deterministic smoke checks run by release automation; both fail closed on stale/degraded feeds, version or mode disagreement, missing mount evidence, unexpected HTTP 5xx telemetry, and unsafe response headers
+- Railway readiness fails closed on stale/degraded feeds or missing mount evidence. Deterministic release smoke additionally enforces version/mode agreement, zero observed HTTP 5xx responses, safe response headers, complete fixed-cohort risk coverage, bounded parser-invalid acquisitions, and current-parser audit evidence
 - Online-consistent SQLite backups plus a non-destructive disposable restore-verification drill
 - Live-mode startup cleanup that removes legacy synthetic demo rows without touching verified live records or callouts
 - Feed telemetry that distinguishes an open socket from verified mint activity and reports stale or malformed upstream data
@@ -131,7 +135,7 @@ The snapshot includes versioned `leaderboard`, `outcomes`, and `riskIntelligence
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.7.1 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.7.2 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

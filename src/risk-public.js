@@ -1,4 +1,7 @@
-import { aggregateRiskIdentityEvidence, validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
+import {
+  aggregateRiskIdentityEvidence,
+  validateRiskIdentityPersistenceEvidence
+} from "./risk-identity.js";
 
 const PUBLIC_METHOD_VERSION = "risk-identity-exact-match-v1";
 
@@ -76,6 +79,12 @@ function demoIdentity(token) {
   return {
     schemaVersion: 1,
     methodVersion: "synthetic-demo-v1",
+    parserRevision: null,
+    parserAuditRevision: null,
+    parserAuditAt: null,
+    parserAttemptRevision: null,
+    parserAttemptAt: null,
+    parserAttemptStatus: null,
     overallEvidence: "synthetic",
     rankingImpact: "synthetic-demo-only",
     factors: {
@@ -229,6 +238,15 @@ function liveIdentity(token, providerDocument, providerState, aggregate, outcome
   return {
     schemaVersion: 1,
     methodVersion: PUBLIC_METHOD_VERSION,
+    parserRevision: providerDocument?.parserRevision ?? null,
+    parserAuditRevision: providerDocument?.parserAuditRevision ?? null,
+    parserAuditAt: providerDocument?.parserAuditAt ?? null,
+    parserAttemptRevision: providerDocument?.parserAttemptRevision
+      ?? providerState?.evidence?.parserAttemptRevision ?? null,
+    parserAttemptAt: providerDocument?.parserAttemptAt
+      ?? providerState?.evidence?.parserAttemptAt ?? null,
+    parserAttemptStatus: providerDocument?.parserAttemptStatus
+      ?? providerState?.evidence?.parserAttemptStatus ?? null,
     overallEvidence,
     rankingImpact: "none-uncalibrated",
     factors,

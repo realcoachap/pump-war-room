@@ -2,8 +2,47 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
+import {
+  RISK_IDENTITY_METHOD_VERSION,
+  RISK_IDENTITY_PARSER_REVISION
+} from "../src/risk-identity.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const RISK_COHORT_LIMIT = 120;
+const RISK_PARSER_AUDIT_SAMPLE_LIMIT = 16;
+const RISK_MINIMUM_SUCCESS_COVERAGE_RATIO = 0.5;
+const RISK_MAXIMUM_INVALID_RESPONSE_RATIO = 0.25;
+
+const PUBLIC_RISK_IDENTITY_KEYS = new Set([
+  "schemaVersion", "methodVersion", "parserRevision", "parserAuditRevision", "parserAuditAt",
+  "parserAttemptRevision", "parserAttemptAt", "parserAttemptStatus", "overallEvidence", "rankingImpact",
+  "factors", "duplicateEvidence", "providerObservation", "missing"
+]);
+const PUBLIC_RISK_FACTOR_KEYS = Object.freeze({
+  concentration: new Set(["evidenceClass", "limitation", "sourceStatus", "missingReasonCode", "lastAttemptAt", "nextAttemptAt", "holderCount", "top10Percentage", "providerUpdatedAt", "fetchedAt", "source", "sourceFields"]),
+  developer: new Set(["evidenceClass", "limitation", "sourceStatus", "missingReasonCode", "lastAttemptAt", "nextAttemptAt", "holdingPercentage", "fetchedAt", "source", "sourceField"]),
+  creatorHistory: new Set(["evidenceClass", "limitation", "observedLaunchCount", "role", "source", "sourceFields", "calculatedAt", "scope"]),
+  identity: new Set(["evidenceClass", "limitation", "sourceStatus", "missingReasonCode", "lastAttemptAt", "nextAttemptAt", "exactDuplicateCount", "exactDuplicateCounts", "nameSymbolCollisionCount", "basis", "source", "sourceFields", "calculatedAt", "scope"]),
+  liquidity: new Set(["evidenceClass", "limitation", "sourceStatus", "missingReasonCode", "lastAttemptAt", "nextAttemptAt", "liquidityUsd", "observedAt", "source", "sourceField", "basis", "endpoint", "pool", "providerPage", "providerRank"]),
+  curve: new Set(["evidenceClass", "limitation", "virtualSolReserve", "launchSolAmount", "observedAt", "source", "sourceFields"]),
+  lifecycle: new Set(["evidenceClass", "limitation", "migrationObserved", "observedAt", "source", "sourceField"])
+});
+const PUBLIC_RISK_ENGINE_KEYS = new Set([
+  "schemaVersion", "source", "status", "queueDepth", "lastAttemptAt", "lastSuccessAt",
+  "runtimeLastSuccessAt", "persistedLastSuccessAt", "lastSuccessAgeSeconds", "successStaleAfterSeconds",
+  "lastSuccessIsStale", "evidenceAcquisition", "ongoingFreshnessRequired", "lastErrorAt", "lastErrorCode",
+  "schedule", "parserRevisionAudit", "persistence", "counters"
+]);
+const PUBLIC_RISK_COVERAGE_KEYS = new Set([
+  "provider", "status", "stateCount", "successCount", "firstUpdatedAt", "lastUpdatedAt", "statusCounts",
+  "errorCodeCounts", "invalidAcquisitionCount", "evidenceRowCount", "providerEvidenceMintCount", "tokenRowCount",
+  "tokenEvidenceMintCount", "prospectivelyObservedTokenMintCount", "outputMintCount", "evidenceClass"
+]);
+const PUBLIC_RISK_SUMMARY_KEYS = new Set([
+  "totalTracked", "holderEvidenceCount", "developerEvidenceCount", "exactDuplicateTokenCount",
+  "identityHistoryCount", "liquidityEvidenceCount", "curveEvidenceCount", "migrationObservationCount"
+]);
+const RAW_PROFILE_VALUE = /^(?:@[A-Za-z0-9_]{1,32}|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s]+)$/i;
 
 export class SmokeCheckError extends Error {
   constructor(check, message) {
@@ -15,6 +54,62 @@ export class SmokeCheckError extends Error {
 
 function requireValue(condition, check, message) {
   if (!condition) throw new SmokeCheckError(check, message);
+}
+
+function requireAllowedKeys(value, allowed, path) {
+  requireValue(value && typeof value === "object" && !Array.isArray(value), "snapshot", `${path} was not an object`);
+  for (const key of Object.keys(value)) {
+    requireValue(allowed.has(key), "snapshot", `${path}.${key} was outside the public risk-identity schema`);
+  }
+}
+
+function rejectRawIdentityValues(value, path) {
+  if (typeof value === "string") {
+    requireValue(!RAW_PROFILE_VALUE.test(value), "snapshot", `${path} exposed a raw social profile value`);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => rejectRawIdentityValues(entry, `${path}[${index}]`));
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    rejectRawIdentityValues(entry, `${path}.${key}`);
+  }
+}
+
+function validatePublicRiskIdentity(identity, path) {
+  requireAllowedKeys(identity, PUBLIC_RISK_IDENTITY_KEYS, path);
+  requireAllowedKeys(identity.factors, new Set(Object.keys(PUBLIC_RISK_FACTOR_KEYS)), `${path}.factors`);
+  for (const [factorName, factor] of Object.entries(identity.factors)) {
+    requireAllowedKeys(factor, PUBLIC_RISK_FACTOR_KEYS[factorName], `${path}.factors.${factorName}`);
+    if (factor.exactDuplicateCounts !== undefined) {
+      requireAllowedKeys(factor.exactDuplicateCounts, new Set(["xHandle", "telegramHandle", "websiteDomain", "nameSymbol"]), `${path}.factors.${factorName}.exactDuplicateCounts`);
+    }
+  }
+  requireAllowedKeys(identity.duplicateEvidence, new Set(["exactDeclaredIdentifierReuse", "duplicateContent", "likelyController", "maliciousness"]), `${path}.duplicateEvidence`);
+  for (const [key, envelope] of Object.entries(identity.duplicateEvidence)) {
+    requireAllowedKeys(envelope, new Set(["value", "evidenceClass"]), `${path}.duplicateEvidence.${key}`);
+  }
+  if (identity.providerObservation !== undefined) {
+    requireAllowedKeys(identity.providerObservation, new Set(["sourceStatus", "missingReasonCode", "lastAttemptAt", "nextAttemptAt"]), `${path}.providerObservation`);
+  } else {
+    requireValue(identity.methodVersion === "synthetic-demo-v1", "snapshot", `${path}.providerObservation was missing from live evidence`);
+  }
+  requireValue(Array.isArray(identity.missing) && identity.missing.every((entry) => typeof entry === "string"), "snapshot", `${path}.missing was invalid`);
+  rejectRawIdentityValues(identity, path);
+}
+
+function validateEmbeddedRiskIdentities(value, path = "snapshot") {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => validateEmbeddedRiskIdentities(entry, `${path}[${index}]`));
+    return;
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === "riskIdentity" && entry !== null) validatePublicRiskIdentity(entry, `${path}.${key}`);
+    else validateEmbeddedRiskIdentities(entry, `${path}.${key}`);
+  }
 }
 
 async function request(baseUrl, pathname, { timeoutMs, fetchImpl }) {
@@ -109,12 +204,40 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(allowedRiskStates.includes(health.riskIntelligence?.status), "health", `risk identity engine state ${health.riskIntelligence?.status ?? "missing"} was not explicit`);
   requireValue(Number.isFinite(health.riskIntelligence?.queueDepth) && health.riskIntelligence.queueDepth >= 0, "health", "risk identity queue telemetry was missing");
   if (expectedMode === "live") {
-    const attempted = Number.isFinite(health.riskIntelligence?.counters?.attempts) && health.riskIntelligence.counters.attempts >= 1;
-    const persisted = Number.isFinite(health.riskIntelligence?.persistence?.successfulStateCount) && health.riskIntelligence.persistence.successfulStateCount >= 1;
-    const succeeded = Number.isFinite(health.riskIntelligence?.counters?.successes) && health.riskIntelligence.counters.successes >= 1;
-    requireValue(attempted || persisted, "health", "risk identity provider was never attempted in runtime or persisted state");
-    requireValue(succeeded || persisted, "health", "risk identity provider has no successful runtime or persisted refresh");
-    requireValue(typeof health.riskIntelligence?.lastSuccessAt === "string", "health", "risk identity provider has no successful acquisition timestamp");
+    const attempts = health.riskIntelligence?.counters?.attempts;
+    const successes = health.riskIntelligence?.counters?.successes;
+    requireValue(
+      Number.isSafeInteger(attempts) && attempts >= 0
+        && Number.isSafeInteger(successes) && successes >= 0 && attempts >= successes,
+      "health", "risk identity process-local acquisition counters were missing or inconsistent"
+    );
+    const serviceStartedAt = Date.parse(health.service?.startedAt);
+    const runtimeLastSuccessAt = Date.parse(health.riskIntelligence?.runtimeLastSuccessAt);
+    requireValue(Number.isFinite(serviceStartedAt), "health", "service start timestamp was missing for post-deploy risk evidence");
+    const audit = health.riskIntelligence?.parserRevisionAudit;
+    requireValue(
+      audit && audit.currentRevision === RISK_IDENTITY_PARSER_REVISION
+        && audit.fullCohortAtStart === true
+        && audit.targetStateCount === RISK_PARSER_AUDIT_SAMPLE_LIMIT
+        && audit.sampleStateCount === RISK_PARSER_AUDIT_SAMPLE_LIMIT
+        && Number.isSafeInteger(audit.currentDispositionCountAtStart)
+        && audit.currentDispositionCountAtStart >= 0
+        && audit.currentDispositionCountAtStart <= RISK_PARSER_AUDIT_SAMPLE_LIMIT
+        && audit.currentDispositionCount === RISK_PARSER_AUDIT_SAMPLE_LIMIT
+        && Number.isSafeInteger(audit.currentAcquisitionCount) && audit.currentAcquisitionCount >= 1
+        && audit.currentAcquisitionCount <= audit.currentDispositionCount
+        && ["complete", "complete-with-failures"].includes(audit.status),
+      "health", "risk identity current-parser audit sample was incomplete or had no successful acquisition"
+    );
+    const freshRuntimeAcquisition = successes >= 1
+      && Number.isFinite(runtimeLastSuccessAt) && runtimeLastSuccessAt >= serviceStartedAt;
+    const completePersistedRestartProof = audit.currentDispositionCountAtStart === RISK_PARSER_AUDIT_SAMPLE_LIMIT
+      && audit.eligibleStateCountAtStart === 0
+      && audit.selectedStateCount === 0 && audit.attempts === 0;
+    requireValue(freshRuntimeAcquisition || completePersistedRestartProof, "health",
+      "risk identity parser acquisition was neither fresh in this process nor a complete persisted restart proof");
+    requireValue(typeof health.riskIntelligence?.persistedLastSuccessAt === "string", "health",
+      "risk identity persisted successful acquisition timestamp was missing");
     requireValue(health.riskIntelligence?.ongoingFreshnessRequired === false
       && health.riskIntelligence?.evidenceAcquisition === "bounded-one-time-15m-with-one-missing-or-stale-retry", "health", "risk identity bounded acquisition policy was missing");
   }
@@ -153,17 +276,126 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   }
   requireValue(Array.isArray(snapshot.outcomes?.cohorts?.narrative?.cohorts) && Array.isArray(snapshot.outcomes?.cohorts?.lifecycle?.cohorts), "snapshot", "outcome cohort contracts were missing");
   requireValue(snapshot.riskIntelligence?.schemaVersion === 1, "snapshot", "risk identity schema was missing");
+  requireAllowedKeys(snapshot.riskIntelligence, new Set([
+    "schemaVersion", "generatedAt", "evidenceClasses", "rankingImpact", "source", "engine",
+    "coverage", "cohort", "summary", "disclaimer"
+  ]), "snapshot.riskIntelligence");
+  requireAllowedKeys(snapshot.riskIntelligence.source, new Set([
+    "id", "label", "apiVersion", "parserRevision", "fingerprintMethodVersion", "endpoint",
+    "attributionUrl", "poweredByUrl", "publicBeta", "unvetted", "rawResponsesPersisted",
+    "rawProfilesPersisted", "retention"
+  ]), "snapshot.riskIntelligence.source");
+  requireAllowedKeys(snapshot.riskIntelligence.cohort, new Set([
+    "policy", "limit", "admittedCount", "universe", "observations"
+  ]), "snapshot.riskIntelligence.cohort");
+  requireAllowedKeys(snapshot.riskIntelligence.engine, PUBLIC_RISK_ENGINE_KEYS, "snapshot.riskIntelligence.engine");
+  requireAllowedKeys(snapshot.riskIntelligence.coverage, PUBLIC_RISK_COVERAGE_KEYS, "snapshot.riskIntelligence.coverage");
+  requireAllowedKeys(snapshot.riskIntelligence.summary, PUBLIC_RISK_SUMMARY_KEYS, "snapshot.riskIntelligence.summary");
+  if (snapshot.riskIntelligence.engine.schedule !== undefined) {
+    requireAllowedKeys(snapshot.riskIntelligence.engine.schedule, new Set(["initialDelaySeconds", "retryDelaySeconds", "maxAttempts"]), "snapshot.riskIntelligence.engine.schedule");
+  }
+  if (snapshot.riskIntelligence.engine.parserRevisionAudit !== undefined) {
+    requireAllowedKeys(snapshot.riskIntelligence.engine.parserRevisionAudit, new Set([
+      "status", "currentRevision", "targetStateCount", "fullCohortAtStart", "sampleStateCount",
+      "currentDispositionCountAtStart", "currentDispositionCount", "currentAcquisitionCount",
+      "eligibleStateCountAtStart", "selectedStateCount", "queueDepth", "attempts", "successes",
+      "failures", "skippedCurrent"
+    ]), "snapshot.riskIntelligence.engine.parserRevisionAudit");
+  }
+  if (snapshot.riskIntelligence.engine.persistence !== undefined) {
+    requireAllowedKeys(snapshot.riskIntelligence.engine.persistence, new Set([
+      "stateCount", "cohortLimit", "admittedCount", "successfulStateCount", "dueStateCount",
+      "currentParserAcquisitionCount"
+    ]), "snapshot.riskIntelligence.engine.persistence");
+  }
+  if (snapshot.riskIntelligence.engine.counters !== undefined) {
+    requireAllowedKeys(snapshot.riskIntelligence.engine.counters, new Set([
+      "queued", "attempts", "successes", "unavailable", "failures", "rateLimited", "droppedQueue",
+      "droppedCohort", "droppedLate", "revisionAuditQueued", "revisionAuditAttempts",
+      "revisionAuditSuccesses", "revisionAuditFailures", "revisionAuditSkippedCurrent"
+    ]), "snapshot.riskIntelligence.engine.counters");
+  }
+  rejectRawIdentityValues(snapshot.riskIntelligence, "snapshot.riskIntelligence");
   requireValue(snapshot.riskIntelligence?.source?.id === "geckoterminal" && snapshot.riskIntelligence.source.apiVersion === "20230203", "snapshot", "pinned risk identity source evidence was missing");
+  requireValue(snapshot.riskIntelligence?.source?.parserRevision === RISK_IDENTITY_PARSER_REVISION
+    && snapshot.riskIntelligence?.source?.fingerprintMethodVersion === RISK_IDENTITY_METHOD_VERSION,
+  "snapshot", "current parser revision or stable fingerprint method marker was missing");
   requireValue(snapshot.riskIntelligence?.source?.rawResponsesPersisted === false && snapshot.riskIntelligence?.source?.rawProfilesPersisted === false, "snapshot", "risk identity retention boundary was missing");
   requireValue(snapshot.riskIntelligence?.rankingImpact === "none-uncalibrated", "snapshot", "risk identity ranking boundary was missing");
   requireValue(snapshot.riskIntelligence?.cohort?.policy === "risk-specific-prospective-fixed-admission-v1"
-    && snapshot.riskIntelligence?.cohort?.limit === 120
+    && snapshot.riskIntelligence?.cohort?.limit === RISK_COHORT_LIMIT
     && typeof snapshot.riskIntelligence?.cohort?.universe === "string"
     && (expectedMode !== "live" || snapshot.riskIntelligence.cohort.universe.includes("independent from the v0.6 outcome cohort"))
     && Array.isArray(snapshot.riskIntelligence?.cohort?.observations), "snapshot", "independent inspectable risk cohort contract was missing");
   requireValue(JSON.stringify(snapshot.riskIntelligence?.evidenceClasses) === JSON.stringify(["on-chain-finalized", "provider-observed", "feed-observed-processed", "locally-derived", "unavailable"]), "snapshot", "risk identity evidence classes were missing");
   requireValue(Number.isFinite(snapshot.riskIntelligence?.coverage?.stateCount) && Number.isFinite(snapshot.riskIntelligence?.coverage?.successCount), "snapshot", "risk identity coverage was missing");
+  if (expectedMode === "live") {
+    const admittedCount = snapshot.riskIntelligence.cohort.admittedCount;
+    const observations = snapshot.riskIntelligence.cohort.observations;
+    const stateCount = snapshot.riskIntelligence.coverage.stateCount;
+    const successCount = snapshot.riskIntelligence.coverage.successCount;
+    const statusCounts = snapshot.riskIntelligence.coverage.statusCounts;
+    requireValue(
+      Number.isSafeInteger(admittedCount) && admittedCount === RISK_COHORT_LIMIT
+        && Number.isSafeInteger(stateCount) && stateCount === RISK_COHORT_LIMIT,
+      "snapshot", `risk identity fixed cohort was incomplete: expected ${RISK_COHORT_LIMIT} admitted and persisted states, received ${admittedCount ?? "missing"} and ${stateCount ?? "missing"}`
+    );
+    const observationMints = observations.map((observation) => observation?.mint);
+    observations.forEach((observation, index) => requireAllowedKeys(
+      observation,
+      new Set(["mint", "name", "symbol", "createdAt", "riskIdentity"]),
+      `snapshot.riskIntelligence.cohort.observations[${index}]`
+    ));
+    requireValue(
+      observations.length === RISK_COHORT_LIMIT
+        && observations.every((observation) => observation && typeof observation.mint === "string" && observation.mint.length > 0
+          && observation.riskIdentity && typeof observation.riskIdentity === "object" && !Array.isArray(observation.riskIdentity))
+        && new Set(observationMints).size === RISK_COHORT_LIMIT,
+      "snapshot", "risk identity fixed cohort did not expose 120 unique inspectable observations"
+    );
+    requireValue(Number.isSafeInteger(successCount) && successCount >= 0 && successCount <= stateCount,
+      "snapshot", "risk identity successful acquisition coverage count was invalid");
+    requireValue(
+      statusCounts && typeof statusCounts === "object" && !Array.isArray(statusCounts)
+        && Object.values(statusCounts).every((count) => Number.isSafeInteger(count) && count >= 0)
+        && Object.values(statusCounts).reduce((total, count) => total + count, 0) === stateCount,
+      "snapshot", "risk identity status coverage did not account for the full fixed cohort"
+    );
+    const coverage = snapshot.riskIntelligence.coverage;
+    requireValue(
+      coverage.tokenRowCount === stateCount
+        && coverage.tokenEvidenceMintCount === stateCount
+        && coverage.prospectivelyObservedTokenMintCount === stateCount
+        && coverage.outputMintCount === stateCount
+        && coverage.evidenceRowCount === successCount
+        && coverage.providerEvidenceMintCount === successCount
+        && snapshot.riskIntelligence.summary?.totalTracked === stateCount,
+      "snapshot", "risk identity public evidence coverage did not reconcile with persisted fixed-cohort coverage"
+    );
+    requireValue(
+      health.riskIntelligence?.persistence?.stateCount === stateCount
+        && health.riskIntelligence?.persistence?.admittedCount === admittedCount
+        && health.riskIntelligence?.persistence?.successfulStateCount === successCount
+        && health.riskIdentityCoverage?.stateCount === stateCount
+        && health.riskIdentityCoverage?.successCount === successCount,
+      "snapshot", "risk identity health and snapshot coverage did not agree"
+    );
+    const minimumSuccessCount = Math.ceil(stateCount * RISK_MINIMUM_SUCCESS_COVERAGE_RATIO);
+    const invalidResponseCount = coverage.invalidAcquisitionCount;
+    const maximumInvalidResponseCount = Math.floor(stateCount * RISK_MAXIMUM_INVALID_RESPONSE_RATIO);
+    requireValue(successCount >= minimumSuccessCount, "snapshot",
+      `risk identity successful acquisition coverage ${successCount}/${stateCount} was below ${minimumSuccessCount}/${stateCount}`);
+    requireValue(Number.isSafeInteger(invalidResponseCount) && invalidResponseCount >= 0 && invalidResponseCount <= stateCount,
+      "snapshot", "risk identity latest parser-invalid acquisition count was invalid");
+    requireValue(invalidResponseCount <= maximumInvalidResponseCount, "snapshot",
+      `risk identity invalid-response coverage ${invalidResponseCount}/${stateCount} exceeded ${maximumInvalidResponseCount}/${stateCount}`);
+  }
   requireValue(!/"(?:fingerprint|normalizedName|normalizedSymbol|normalizedHandle|normalizedDomain|normalizedWebsite)"\s*:/i.test(JSON.stringify({ riskIntelligence: snapshot.riskIntelligence, tokens: snapshot.tokens, leaderboard: snapshot.leaderboard })), "snapshot", "private normalized identity values leaked into the public contract");
+  validateEmbeddedRiskIdentities({
+    cohort: snapshot.riskIntelligence?.cohort?.observations,
+    tokens: snapshot.tokens,
+    leaderboard: snapshot.leaderboard?.top100
+  });
   for (const entry of snapshot.leaderboard?.top100 || []) {
     for (const window of ["5m", "15m", "1h", "6h", "24h"]) {
       const outcome = entry?.outcome?.windows?.[window];
@@ -204,7 +436,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       riskIdentityState: health.riskIntelligence.status
     },
     http: { health: 200, snapshot: 200, html: 200, appJs: 200, styles: 200, terms: 200, privacy: 200 },
-    markers: { version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true, legalNotices: true }
+    markers: { version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true, parserRevision: true, legalNotices: true }
   };
 }
 

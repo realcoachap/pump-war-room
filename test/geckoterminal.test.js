@@ -6,6 +6,7 @@ import {
   parseGeckoTerminalOhlcv,
   selectGeckoTerminalPool
 } from "../src/geckoterminal.js";
+import { parseGeckoTerminalTokenInfo, RiskIdentityError } from "../src/risk-identity.js";
 
 const mint = "11111111111111111111111111111111";
 const quote = "So11111111111111111111111111111111111111112";
@@ -199,12 +200,45 @@ test("client requests documented token-info through the shared pinned-version qu
     timeoutMs: 500,
     fetchImpl: async (url, options) => {
       requests.push({ url: String(url), options });
-      return { ok: true, status: 200, headers: { get: () => null }, json: async () => payload };
+      return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify(payload) };
     }
   });
-  assert.equal(await client.tokenInfo(mint), payload);
+  assert.deepEqual(await client.tokenInfo(mint), payload);
   assert.match(requests[0].url, new RegExp(`/networks/solana/tokens/${mint}/info$`));
   assert.equal(requests[0].options.headers.accept, "application/json;version=20230203");
+});
+
+test("token-info preserves quoted and unquoted percentage decimals before validation", async () => {
+  const overLimit = `100.${"0".repeat(39)}1`;
+  const cases = [
+    { label: "quoted developer holding", field: `"developer_holding_percentage":${JSON.stringify(overLimit)}` },
+    { label: "unquoted developer holding", field: `"developer_holding_percentage":${overLimit}` },
+    { label: "quoted top-10 holding", field: `"holders":{"distribution_percentage":{"top_10":${JSON.stringify(overLimit)}}}` },
+    { label: "unquoted top-10 holding", field: `"holders":{"distribution_percentage":{"top_10":${overLimit}}}` }
+  ];
+
+  for (const { label, field } of cases) {
+    const body = `{"data":{"id":"solana_${mint}","type":"token","attributes":{"address":"${mint}",${field}}}}`;
+    const client = new GeckoTerminalClient({
+      minIntervalMs: 0,
+      timeoutMs: 500,
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => body
+      })
+    });
+    const payload = await client.tokenInfo(mint);
+    const exactValue = payload.data.attributes.developer_holding_percentage
+      ?? payload.data.attributes.holders.distribution_percentage.top_10;
+    assert.equal(exactValue, overLimit, `${label} lost its exact decimal representation`);
+    assert.throws(
+      () => parseGeckoTerminalTokenInfo(payload, { mint, fetchedAt: "2026-08-09T12:00:00Z" }),
+      (error) => error instanceof RiskIdentityError && error.code === "invalid-response",
+      `${label} should be rejected instead of rounding to 100`
+    );
+  }
 });
 
 test("client exposes a timestamped current pool snapshot without a launch-time selection claim", async () => {
@@ -244,7 +278,9 @@ test("shared pacing prioritizes prospective pool selection ahead of queued token
         ok: true,
         status: 200,
         headers: { get: () => null },
-        json: async () => isPool ? { data: [poolRow()] } : { data: { id: `solana_${mint}`, type: "token", attributes: { address: mint } } }
+        ...(isPool
+          ? { json: async () => ({ data: [poolRow()] }) }
+          : { text: async () => JSON.stringify({ data: { id: `solana_${mint}`, type: "token", attributes: { address: mint } } }) })
       };
     }
   });

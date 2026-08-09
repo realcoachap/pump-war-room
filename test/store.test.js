@@ -6,7 +6,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Store, STORE_SCHEMA_VERSION } from "../src/store.js";
-import { parseGeckoTerminalTokenInfo, RISK_IDENTITY_METHOD_VERSION } from "../src/risk-identity.js";
+import {
+  parseGeckoTerminalTokenInfo,
+  RISK_IDENTITY_METHOD_VERSION,
+  RISK_IDENTITY_PARSER_REVISION
+} from "../src/risk-identity.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
 const geckoMint = "11111111111111111111111111111111";
@@ -338,7 +342,7 @@ test("persists bounded risk identity evidence with due scheduling and explicit u
   assert.deepEqual(store.riskIdentityCoverage({ provider: "geckoterminal" }), {
     provider: "geckoterminal", status: null, stateCount: 1, successCount: 1,
     firstUpdatedAt: "2026-08-08T12:16:00.000Z", lastUpdatedAt: "2026-08-08T12:16:00.000Z",
-    statusCounts: { available: 1 }
+    statusCounts: { available: 1 }, errorCodeCounts: {}, invalidAcquisitionCount: 0
   });
   assert.throws(() => store.upsertRiskIdentityState({
     ...available,
@@ -355,6 +359,26 @@ test("persists bounded risk identity evidence with due scheduling and explicit u
     attemptCount: 3,
     updatedAt: "2026-08-08T12:17:00.000Z"
   }), /between 0 and 2/);
+  store.upsertRiskIdentityState({
+    ...available,
+    evidence: {
+      ...available.evidence,
+      parserAttemptRevision: RISK_IDENTITY_PARSER_REVISION,
+      parserAttemptAt: "2026-08-08T12:17:00.000Z",
+      parserAttemptStatus: "failed"
+    },
+    status: "degraded",
+    missingReason: "Last valid token-info factors were retained after a refresh failure",
+    errorCode: "invalid-json",
+    attemptCount: 2,
+    lastAttemptAt: "2026-08-08T12:17:00.000Z",
+    updatedAt: "2026-08-08T12:17:00.000Z"
+  });
+  assert.deepEqual(store.riskIdentityCoverage({ provider: "geckoterminal" }), {
+    provider: "geckoterminal", status: null, stateCount: 1, successCount: 1,
+    firstUpdatedAt: "2026-08-08T12:17:00.000Z", lastUpdatedAt: "2026-08-08T12:17:00.000Z",
+    statusCounts: { degraded: 1 }, errorCodeCounts: { "invalid-json": 1 }, invalidAcquisitionCount: 1
+  });
 });
 
 test("provider purge fails closed before deletion when another database reader is active", (t) => {

@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseGeckoTerminalTokenInfo } from "../src/risk-identity.js";
+import {
+  parseGeckoTerminalTokenInfo,
+  RISK_IDENTITY_PARSER_REVISION
+} from "../src/risk-identity.js";
 import { attachRiskIdentityEvidence } from "../src/risk-public.js";
 
 const mintA = "11111111111111111111111111111111";
@@ -48,6 +51,9 @@ test("publishes attributed factors and conservative exact-match counts without p
 
   assert.equal(first.overallEvidence, "provider-observed");
   assert.equal(first.rankingImpact, "none-uncalibrated");
+  assert.equal(first.parserRevision, RISK_IDENTITY_PARSER_REVISION);
+  assert.equal(first.parserAuditRevision, null);
+  assert.equal(first.parserAuditAt, null);
   assert.equal(first.factors.concentration.holderCount, 100);
   assert.equal(first.factors.concentration.top10Percentage, 31.5);
   assert.equal(first.factors.developer.holdingPercentage, 3.25);
@@ -118,10 +124,51 @@ test("omits malformed persisted provider factors before public assembly", () => 
   assert.equal(result.aggregateCoverage.evidenceRowCount, 0);
 });
 
+test("publishes current-parser audits without relabeling readable legacy factor provenance", () => {
+  const legacy = evidence(mintA);
+  delete legacy.parserRevision;
+  legacy.parserAuditRevision = RISK_IDENTITY_PARSER_REVISION;
+  legacy.parserAuditAt = "2026-08-09T12:05:00Z";
+  const result = attachRiskIdentityEvidence([token(mintA)], {
+    riskStates: [{ mint: mintA, status: "available", evidence: legacy }]
+  });
+  const identity = result.tokens[0].riskIdentity;
+  assert.equal(identity.parserRevision, null);
+  assert.equal(identity.parserAuditRevision, RISK_IDENTITY_PARSER_REVISION);
+  assert.equal(identity.parserAuditAt, "2026-08-09T12:05:00Z");
+  assert.equal(identity.factors.concentration.holderCount, 100);
+});
+
+test("publishes bounded parser-attempt provenance without discarding retained factors", () => {
+  const retained = evidence(mintA);
+  delete retained.parserRevision;
+  retained.parserAttemptRevision = RISK_IDENTITY_PARSER_REVISION;
+  retained.parserAttemptAt = "2026-08-09T12:05:00Z";
+  retained.parserAttemptStatus = "failed";
+  const result = attachRiskIdentityEvidence([token(mintA)], {
+    riskStates: [{
+      mint: mintA,
+      status: "invalid-response",
+      errorCode: "token-mismatch",
+      evidence: retained
+    }]
+  });
+  const identity = result.tokens[0].riskIdentity;
+  assert.equal(identity.parserRevision, null);
+  assert.equal(identity.parserAttemptRevision, RISK_IDENTITY_PARSER_REVISION);
+  assert.equal(identity.parserAttemptAt, "2026-08-09T12:05:00Z");
+  assert.equal(identity.parserAttemptStatus, "failed");
+  assert.equal(identity.factors.concentration.holderCount, 100);
+  assert.equal(identity.providerObservation.sourceStatus, "invalid-response");
+  assert.equal(identity.providerObservation.missingReasonCode, "token-mismatch");
+});
+
 test("demo factors remain explicitly synthetic", () => {
   const result = attachRiskIdentityEvidence([token(mintA, { source: "demo", top10Pct: 44, devHoldingPct: 8 })], { mode: "demo" });
   const identity = result.tokens[0].riskIdentity;
   assert.equal(identity.overallEvidence, "synthetic");
+  assert.equal(identity.parserRevision, null);
+  assert.equal(identity.parserAttemptRevision, null);
   assert.equal(identity.factors.concentration.top10Percentage, 44);
   assert.equal(identity.factors.concentration.evidenceClass, "synthetic");
   assert.equal(result.summary.holderEvidenceCount, 1);

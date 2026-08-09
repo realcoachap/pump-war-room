@@ -6,6 +6,8 @@ import {
   GECKOTERMINAL_INFO_API_VERSION,
   parseGeckoTerminalTokenInfo,
   RISK_IDENTITY_METHOD_VERSION,
+  RISK_IDENTITY_PARSER_REVISION,
+  validateRiskIdentityPersistenceEvidence,
   RiskIdentityError
 } from "../src/risk-identity.js";
 
@@ -62,6 +64,7 @@ test("parses the documented token-info fields into a strict persistence allowlis
   assert.equal(result.apiVersion, GECKOTERMINAL_INFO_API_VERSION);
   assert.equal(result.fetchedAt, "2026-08-09T12:00:00.000Z");
   assert.equal(result.methodVersion, RISK_IDENTITY_METHOD_VERSION);
+  assert.equal(result.parserRevision, RISK_IDENTITY_PARSER_REVISION);
   assert.deepEqual(result.factors.holderCount, {
     value: 42,
     evidenceClass: "provider-observed",
@@ -103,8 +106,17 @@ test("accepts the provider's observed decimal-string developer percentage drift"
 test("bounds decimal-string percentages without accepting alternate numeric syntaxes", () => {
   assert.equal(parse(firstMint, { developer_holding_percentage: "0" }).factors.developerHoldingPercentage.value, 0);
   assert.equal(parse(firstMint, { developer_holding_percentage: "100.000" }).factors.developerHoldingPercentage.value, 100);
+  assert.equal(
+    parse(firstMint, { developer_holding_percentage: `100.${"0".repeat(40)}` }).factors.developerHoldingPercentage.value,
+    100
+  );
   assert.equal(parse(firstMint, { developer_holding_percentage: " 4.5 " }).factors.developerHoldingPercentage.value, 4.5);
-  for (const value of ["00", "04.5", ".5", "4.", "+4.5", "4.5e0", "NaN", "Infinity", "100.001"]) {
+  for (const value of [
+    "00", "04.5", ".5", "4.", "+4.5", "4.5e0", "NaN", "Infinity", "100.001",
+    "100.0000000000000000000000000000000000000001",
+    `0.${"0".repeat(41)}`,
+    "1".repeat(49)
+  ]) {
     assert.throws(
       () => parse(firstMint, { developer_holding_percentage: value }),
       (error) => error instanceof RiskIdentityError && error.code === "invalid-response",
@@ -133,6 +145,143 @@ test("normalizes provider-declared official social URLs and X post paths to exac
   assert.equal(officialUrls.fingerprints.telegramHandle.fingerprint, direct.fingerprints.telegramHandle.fingerprint);
   assert.equal(alternateOfficialUrls.fingerprints.xHandle.fingerprint, direct.fingerprints.xHandle.fingerprint);
   assert.equal(alternateOfficialUrls.fingerprints.telegramHandle.fingerprint, direct.fingerprints.telegramHandle.fingerprint);
+  assert.equal(direct.fingerprints.xHandle.fingerprint, "5ce8b8804459f2ab559478ed86df31056725f2b0e0332b7315d5183478e4c3a2");
+});
+
+test("rejects the audited current platform-route policy in direct, URL, and provider-path forms", () => {
+  const xRoutes = [
+    "about", "account", "advertise", "ads", "analytics", "auth", "business", "careers",
+    "compose", "connect", "download", "explore", "hashtag", "help", "home", "i", "intent",
+    "jobs", "login", "logout", "messages", "notifications", "oauth", "oauth2", "privacy",
+    "search", "settings", "share", "signup", "tos", "widgets", "who_to_follow"
+  ];
+  const telegramRoutes = [
+    "addemoji", "addlist", "addstickers", "addtheme", "apps", "auth", "blog", "boost",
+    "confirmphone", "contact", "faq", "giftcode", "invoice", "iv", "joinchat", "login",
+    "proxy", "s", "setlanguage", "share", "socks"
+  ];
+  const invalidAttributes = [
+    ...xRoutes.flatMap((route, index) => [
+      { twitter_handle: index % 2 ? route.toUpperCase() : route },
+      { twitter_handle: `https://${index % 2 ? "twitter.com" : "x.com"}/${route}` },
+      { twitter_handle: `${route}/status/123` }
+    ]),
+    ...telegramRoutes.flatMap((route, index) => [
+      { telegram_handle: index % 2 ? `@${route.toUpperCase()}` : route },
+      { telegram_handle: `https://${index % 2 ? "telegram.me" : "t.me"}/${route}` }
+    ])
+  ];
+  for (const attributes of invalidAttributes) {
+    assert.throws(
+      () => parse(firstMint, attributes),
+      (error) => error instanceof RiskIdentityError && error.code === "invalid-response",
+      `expected platform route to be rejected: ${JSON.stringify(attributes)}`
+    );
+  }
+});
+
+test("reads known parser revisions, requires current provenance for new successes, and rejects unknown revisions", () => {
+  const current = parse();
+  const legacy = structuredClone(current);
+  delete legacy.parserRevision;
+  assert.equal(
+    validateRiskIdentityPersistenceEvidence(legacy, { mint: firstMint, status: "available" }),
+    legacy
+  );
+  assert.equal(aggregateRiskIdentityEvidence([legacy], []).coverage.evidenceRowCount, 1);
+
+  const auditedLegacy = {
+    ...legacy,
+    parserAuditRevision: RISK_IDENTITY_PARSER_REVISION,
+    parserAuditAt: "2026-08-09T12:05:00Z"
+  };
+  assert.equal(
+    validateRiskIdentityPersistenceEvidence(auditedLegacy, { mint: firstMint, status: "available" }),
+    auditedLegacy
+  );
+  const parserV1 = "geckoterminal-token-info-parser-v1";
+  const explicitV1 = { ...current, parserRevision: parserV1 };
+  const auditedV1 = { ...legacy, parserAuditRevision: parserV1, parserAuditAt: fetchedAt };
+  const failedV1 = {
+    ...legacy,
+    parserAttemptRevision: parserV1,
+    parserAttemptAt: fetchedAt,
+    parserAttemptStatus: "failed"
+  };
+  for (const readable of [explicitV1, auditedV1, failedV1]) {
+    assert.equal(
+      validateRiskIdentityPersistenceEvidence(readable, { mint: firstMint, status: "available" }),
+      readable
+    );
+  }
+  assert.equal(aggregateRiskIdentityEvidence([explicitV1], []).coverage.evidenceRowCount, 1);
+  for (const fresh of [current, auditedLegacy]) {
+    assert.equal(validateRiskIdentityPersistenceEvidence(fresh, {
+      mint: firstMint,
+      status: "available",
+      requireCurrentProvenance: true
+    }), fresh);
+  }
+  for (const stale of [legacy, explicitV1, auditedV1, failedV1]) {
+    assert.throws(
+      () => validateRiskIdentityPersistenceEvidence(stale, {
+        mint: firstMint,
+        status: "available",
+        requireCurrentProvenance: true
+      }),
+      /current parser provenance/
+    );
+  }
+  for (const malformed of [
+    { ...current, parserRevision: "geckoterminal-token-info-parser-v3" },
+    { ...current, parserRevision: "geckoterminal-token-info-parser-v02" },
+    { ...legacy, parserAuditRevision: RISK_IDENTITY_PARSER_REVISION },
+    { ...legacy, parserAuditRevision: "geckoterminal-token-info-parser-v3", parserAuditAt: fetchedAt },
+    { ...legacy, parserAuditRevision: RISK_IDENTITY_PARSER_REVISION, parserAuditAt: "not-a-time" },
+    { ...legacy, parserAttemptRevision: RISK_IDENTITY_PARSER_REVISION },
+    {
+      ...legacy,
+      parserAttemptRevision: "geckoterminal-token-info-parser-v3",
+      parserAttemptAt: fetchedAt,
+      parserAttemptStatus: "failed"
+    },
+    {
+      ...legacy,
+      parserAttemptRevision: RISK_IDENTITY_PARSER_REVISION,
+      parserAttemptAt: "not-a-time",
+      parserAttemptStatus: "failed"
+    },
+    {
+      ...legacy,
+      parserAttemptRevision: RISK_IDENTITY_PARSER_REVISION,
+      parserAttemptAt: fetchedAt,
+      parserAttemptStatus: "succeeded"
+    }
+  ]) {
+    assert.throws(
+      () => validateRiskIdentityPersistenceEvidence(malformed, { mint: firstMint, status: "available" }),
+      /parser|timestamp/
+    );
+  }
+});
+
+test("keeps ordinary legacy digests aggregatable but excludes known legacy platform-route digests", () => {
+  const ordinaryLegacy = [parse(firstMint), parse(secondMint)];
+  ordinaryLegacy.forEach((row) => { delete row.parserRevision; });
+  const ordinaryAggregate = aggregateRiskIdentityEvidence(ordinaryLegacy, []);
+  assert.equal(ordinaryAggregate.byMint[firstMint].exactDuplicateCounts.xHandle.value, 1);
+  assert.equal(ordinaryAggregate.byMint[firstMint].exactDuplicateCounts.telegramHandle.value, 1);
+
+  const routeLegacy = structuredClone(ordinaryLegacy);
+  const legacyXAboutFingerprint = "616c3eb93264876642d98fba9c7bc22fb3b025a09ea88c24d3341b4e8a6ef9e0";
+  const legacyTelegramSRouteFingerprint = "523830b3389a54382c5d41154878a6a4d8dc8dd109a7f277d486f9cc9cba6219";
+  for (const row of routeLegacy) {
+    row.fingerprints.xHandle.fingerprint = legacyXAboutFingerprint;
+    row.fingerprints.telegramHandle.fingerprint = legacyTelegramSRouteFingerprint;
+  }
+  const routeAggregate = aggregateRiskIdentityEvidence(routeLegacy, []);
+  assert.equal(routeAggregate.byMint[firstMint].exactDuplicateCounts.xHandle.value, null);
+  assert.equal(routeAggregate.byMint[firstMint].exactDuplicateCounts.telegramHandle.value, null);
 });
 
 test("missing provider fields remain explicit unavailable evidence", () => {
@@ -173,6 +322,10 @@ test("rejects malformed bounded factors, timestamps, handles, and websites", () 
     { twitter_handle: "https://example.com/not-a-handle" },
     { twitter_handle: "not_a_handle/status/not-a-number" },
     { twitter_handle: "https://x.com/home" },
+    { twitter_handle: "https://twitter.com/who_to_follow" },
+    { twitter_handle: "https://twitter.com/connect" },
+    { twitter_handle: "https://x.com/about" },
+    { twitter_handle: "https://x.com/help" },
     { twitter_handle: "https://x.com/i/status/123" },
     { twitter_handle: "https://twitter.com/intent" },
     { twitter_handle: "https://x.com/not_a_handle?ref=provider" },
@@ -182,6 +335,7 @@ test("rejects malformed bounded factors, timestamps, handles, and websites", () 
     { twitter_handle: "https://x.com%2fevil.example/not_a_handle" },
     { telegram_handle: "https://t.me/share" },
     { telegram_handle: "https://t.me/joinchat" },
+    { telegram_handle: "https://t.me/s" },
     { telegram_handle: "https://t.me/not_a_handle?start=secret" },
     { telegram_handle: "https://t.me/not_a_handle/extra" },
     { telegram_handle: "unicode-\u2603" },

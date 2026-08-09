@@ -5,6 +5,7 @@ import { getDomain } from "tldts";
 
 export const RISK_IDENTITY_SCHEMA_VERSION = 1;
 export const RISK_IDENTITY_METHOD_VERSION = "risk-identity-exact-fingerprint-v1";
+export const RISK_IDENTITY_PARSER_REVISION = "geckoterminal-token-info-parser-v2";
 export const GECKOTERMINAL_INFO_API_VERSION = "20230203";
 export const RISK_IDENTITY_EVIDENCE_CLASSES = Object.freeze([
   "on-chain-finalized",
@@ -23,6 +24,30 @@ const HEX_256 = /^[a-f0-9]{64}$/;
 const MAX_WEBSITES = 16;
 const MAX_ROWS = 1_000;
 const MAX_TEXT = 256;
+const MAX_PERCENTAGE_INPUT_LENGTH = 48;
+const MAX_PERCENTAGE_FRACTION_DIGITS = 40;
+const PARSER_REVISION_PATTERN = /^geckoterminal-token-info-parser-v([1-9]\d*)$/;
+const CURRENT_PARSER_REVISION_NUMBER = Number(PARSER_REVISION_PATTERN.exec(RISK_IDENTITY_PARSER_REVISION)?.[1]);
+const PARSER_ATTEMPT_STATUSES = new Set(["failed"]);
+
+// Official social URLs do not have a durable syntactic marker that separates
+// every profile from every platform route. This is an auditable policy for
+// currently known non-profile first segments, not a claim that a finite set
+// covers future platform routes. Direct provider values and URL/path forms all
+// pass through the same policy so a route cannot bypass it by changing form.
+const NON_PROFILE_ROUTES = Object.freeze({
+  x: new Set([
+    "about", "account", "advertise", "ads", "analytics", "auth", "business", "careers",
+    "compose", "connect", "download", "explore", "hashtag", "help", "home", "i", "intent",
+    "jobs", "login", "logout", "messages", "notifications", "oauth", "oauth2", "privacy",
+    "search", "settings", "share", "signup", "tos", "widgets", "who_to_follow"
+  ]),
+  telegram: new Set([
+    "addemoji", "addlist", "addstickers", "addtheme", "apps", "auth", "blog", "boost",
+    "confirmphone", "contact", "faq", "giftcode", "invoice", "iv", "joinchat", "login",
+    "proxy", "s", "setlanguage", "share", "socks"
+  ])
+});
 
 const SOURCE_FIELDS = Object.freeze({
   holderCount: "data.attributes.holders.count",
@@ -110,10 +135,22 @@ function percentage(value, label, { stringAllowed = false } = {}) {
   if (typeof value !== "number" && !(stringAllowed && typeof value === "string")) {
     fail("invalid-response", `${label} must be a percentage`);
   }
-  if (typeof value === "string" && !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value.trim())) {
-    fail("invalid-response", `${label} must be a decimal percentage`);
+  let normalized = value;
+  if (typeof value === "string") {
+    if (value.length > MAX_PERCENTAGE_INPUT_LENGTH) {
+      fail("invalid-response", `${label} decimal representation is too long`);
+    }
+    normalized = value.trim();
+    const match = new RegExp(`^(0|[1-9]\\d{0,2})(?:\\.(\\d{1,${MAX_PERCENTAGE_FRACTION_DIGITS}}))?$`).exec(normalized);
+    if (!match) fail("invalid-response", `${label} must be a bounded decimal percentage`);
+    const [, integer, fraction = ""] = match;
+    // Compare the decimal representation before Number conversion: values
+    // such as 100.000...0001 otherwise round to 100 in binary floating point.
+    if (Number(integer) > 100 || (integer === "100" && /[1-9]/.test(fraction))) {
+      fail("invalid-response", `${label} must be between 0 and 100`);
+    }
   }
-  const parsed = Number(value);
+  const parsed = Number(normalized);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) {
     fail("invalid-response", `${label} must be between 0 and 100`);
   }
@@ -148,6 +185,14 @@ function sha256(domain, ...parts) {
   return hash.digest("hex");
 }
 
+// v0.7.1 evidence may already contain a digest made from a platform route.
+// Keep the legacy document readable, but fail closed for duplicate aggregation
+// by deriving the disallowed digests in the unchanged private hash domain.
+const NON_PROFILE_FINGERPRINTS = Object.freeze({
+  xHandle: new Set([...NON_PROFILE_ROUTES.x].map((route) => sha256("x-handle", route))),
+  telegramHandle: new Set([...NON_PROFILE_ROUTES.telegram].map((route) => sha256("telegram-handle", route)))
+});
+
 function addressFingerprint(address) {
   return sha256("solana-address", requireMint(address, "declared address"));
 }
@@ -169,11 +214,8 @@ function normalizeHandle(value, platform) {
   const providerPostPath = platform === "x"
     ? declared.match(new RegExp(`^@?([A-Za-z0-9_]{1,${maximum}})/status/[0-9]+$`, "i"))
     : null;
-  const routeHandle = officialUrl?.[1] || providerPostPath?.[1] || null;
-  const reservedRoutes = platform === "x"
-    ? new Set(["compose", "explore", "hashtag", "home", "i", "intent", "login", "messages", "notifications", "privacy", "search", "settings", "share", "signup", "tos"])
-    : new Set(["addstickers", "blog", "faq", "iv", "joinchat", "login", "proxy", "share", "socks"]);
-  const handle = direct?.[1] || (routeHandle && !reservedRoutes.has(routeHandle.toLowerCase()) ? routeHandle : null);
+  const candidate = direct?.[1] || officialUrl?.[1] || providerPostPath?.[1] || null;
+  const handle = candidate && !NON_PROFILE_ROUTES[platform].has(candidate.toLowerCase()) ? candidate : null;
   if (!handle) {
     fail("invalid-response", `${platform} handle is not a conservative provider-declared handle`);
   }
@@ -315,6 +357,7 @@ export function parseGeckoTerminalTokenInfo(payload, {
     apiVersion: GECKOTERMINAL_INFO_API_VERSION,
     fetchedAt: fetchedIso,
     methodVersion: RISK_IDENTITY_METHOD_VERSION,
+    parserRevision: RISK_IDENTITY_PARSER_REVISION,
     factors: {
       holderCount: count === null ? unavailable(SOURCE_FIELDS.holderCount) : observed(count, SOURCE_FIELDS.holderCount),
       top10HolderPercentage: top10 === null ? unavailable(SOURCE_FIELDS.top10HolderPercentage) : observed(top10, SOURCE_FIELDS.top10HolderPercentage),
@@ -405,8 +448,12 @@ function validFingerprint(value) {
   return typeof value === "string" && HEX_256.test(value);
 }
 
+function aggregatableFingerprint(kind, fingerprint) {
+  return validFingerprint(fingerprint) && !NON_PROFILE_FINGERPRINTS[kind]?.has(fingerprint);
+}
+
 function addFingerprint(target, kind, fingerprint, mint) {
-  if (!validFingerprint(fingerprint)) return;
+  if (!aggregatableFingerprint(kind, fingerprint)) return;
   let byFingerprint = target.get(kind);
   if (!byFingerprint) {
     byFingerprint = new Map();
@@ -421,7 +468,7 @@ function addFingerprint(target, kind, fingerprint, mint) {
 }
 
 function mintFingerprintSet(target, kind, mint, fingerprint) {
-  if (!validFingerprint(fingerprint)) return;
+  if (!aggregatableFingerprint(kind, fingerprint)) return;
   let byMint = target.get(kind);
   if (!byMint) {
     byMint = new Map();
@@ -481,6 +528,7 @@ function assertEvidenceDocument(row) {
     || !plainObject(row.fingerprints)) {
     throw new TypeError("evidenceRows must contain normalized risk-identity parser objects");
   }
+  validateParserProvenance(row);
   const mint = requireMint(row.mint, "evidence mint");
   if (row.endpoint !== `/networks/${NETWORK}/tokens/${mint}/info`) {
     throw new TypeError("evidence endpoint did not match its mint");
@@ -495,6 +543,48 @@ function exactKeys(value, keys, label) {
   const expected = [...keys].sort();
   if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
     throw new TypeError(`${label} contains fields outside the persistence allowlist`);
+  }
+}
+
+function validateSupportedParserRevision(value, label) {
+  const match = typeof value === "string" ? PARSER_REVISION_PATTERN.exec(value) : null;
+  const revision = Number(match?.[1]);
+  if (!Number.isSafeInteger(revision) || revision < 1 || revision > CURRENT_PARSER_REVISION_NUMBER) {
+    throw new TypeError(`${label} is invalid`);
+  }
+}
+
+function hasCurrentSuccessfulParserProvenance(value) {
+  return value?.parserRevision === RISK_IDENTITY_PARSER_REVISION
+    || value?.parserAuditRevision === RISK_IDENTITY_PARSER_REVISION;
+}
+
+function validateParserProvenance(value, { requireCurrentProvenance = false } = {}) {
+  const hasParserRevision = Object.hasOwn(value, "parserRevision");
+  if (hasParserRevision) validateSupportedParserRevision(value.parserRevision, "risk identity parser revision");
+  const hasAuditRevision = Object.hasOwn(value, "parserAuditRevision");
+  const hasAuditAt = Object.hasOwn(value, "parserAuditAt");
+  if (hasAuditRevision !== hasAuditAt) {
+    throw new TypeError("risk identity parser audit provenance must be paired");
+  }
+  if (hasAuditRevision) {
+    validateSupportedParserRevision(value.parserAuditRevision, "risk identity parser audit revision");
+    timestamp(value.parserAuditAt, "risk identity parserAuditAt");
+  }
+  const attemptKeys = ["parserAttemptRevision", "parserAttemptAt", "parserAttemptStatus"];
+  const attemptFieldCount = attemptKeys.filter((key) => Object.hasOwn(value, key)).length;
+  if (attemptFieldCount !== 0 && attemptFieldCount !== attemptKeys.length) {
+    throw new TypeError("risk identity parser attempt provenance must be complete");
+  }
+  if (attemptFieldCount === attemptKeys.length) {
+    validateSupportedParserRevision(value.parserAttemptRevision, "risk identity parser attempt revision");
+    timestamp(value.parserAttemptAt, "risk identity parserAttemptAt");
+    if (!PARSER_ATTEMPT_STATUSES.has(value.parserAttemptStatus)) {
+      throw new TypeError("risk identity parser attempt status is invalid");
+    }
+  }
+  if (requireCurrentProvenance && !hasCurrentSuccessfulParserProvenance(value)) {
+    throw new TypeError("new successful risk identity evidence requires current parser provenance");
   }
 }
 
@@ -561,13 +651,24 @@ function validateLiquidityEnvelope(value, mint) {
  * worker. This rejects normalized identifiers and any provider field that the
  * ingestion parser did not explicitly allowlist.
  */
-export function validateRiskIdentityPersistenceEvidence(value, { mint: mintValue, status } = {}) {
+export function validateRiskIdentityPersistenceEvidence(value, {
+  mint: mintValue,
+  status,
+  requireCurrentProvenance = false
+} = {}) {
   const mint = requireMint(mintValue);
   if (status === "available" || plainObject(value?.factors)) {
     const keys = ["schemaVersion", "mint", "network", "provider", "source", "endpoint", "apiVersion", "fetchedAt", "methodVersion", "factors", "fingerprints"];
+    if (Object.hasOwn(value, "parserRevision")) keys.push("parserRevision");
+    if (Object.hasOwn(value, "parserAuditRevision")) keys.push("parserAuditRevision");
+    if (Object.hasOwn(value, "parserAuditAt")) keys.push("parserAuditAt");
+    if (Object.hasOwn(value, "parserAttemptRevision")) keys.push("parserAttemptRevision");
+    if (Object.hasOwn(value, "parserAttemptAt")) keys.push("parserAttemptAt");
+    if (Object.hasOwn(value, "parserAttemptStatus")) keys.push("parserAttemptStatus");
     if (Object.hasOwn(value, "liquidity")) keys.push("liquidity");
     exactKeys(value, keys, "risk identity evidence");
     assertEvidenceDocument(value);
+    validateParserProvenance(value, { requireCurrentProvenance });
     if (value.mint !== mint) throw new TypeError("risk identity evidence mint mismatch");
     exactKeys(value.factors, Object.keys(SOURCE_FIELDS).filter((key) => ["holderCount", "top10HolderPercentage", "providerLastUpdated", "developerHoldingPercentage"].includes(key)), "risk identity factors");
     for (const key of ["holderCount", "top10HolderPercentage", "providerLastUpdated", "developerHoldingPercentage"]) {
@@ -590,7 +691,11 @@ export function validateRiskIdentityPersistenceEvidence(value, { mint: mintValue
     return value;
   }
 
-  exactKeys(value, ["schemaVersion", "mint", "provider", "source", "endpoint", "apiVersion", "methodVersion", "evidenceClass", "fetchedAt", "attemptedAt", "missingReasonCode", "retention"], "unavailable risk identity evidence");
+  const keys = ["schemaVersion", "mint", "provider", "source", "endpoint", "apiVersion", "methodVersion", "evidenceClass", "fetchedAt", "attemptedAt", "missingReasonCode", "retention"];
+  if (Object.hasOwn(value, "parserAttemptRevision")) keys.push("parserAttemptRevision");
+  if (Object.hasOwn(value, "parserAttemptAt")) keys.push("parserAttemptAt");
+  if (Object.hasOwn(value, "parserAttemptStatus")) keys.push("parserAttemptStatus");
+  exactKeys(value, keys, "unavailable risk identity evidence");
   if (value.schemaVersion !== RISK_IDENTITY_SCHEMA_VERSION || value.mint !== mint || value.provider !== PROVIDER
     || value.source !== PROVIDER || value.endpoint !== `/networks/${NETWORK}/tokens/${mint}/info`
     || value.apiVersion !== GECKOTERMINAL_INFO_API_VERSION || value.methodVersion !== RISK_IDENTITY_METHOD_VERSION
@@ -599,6 +704,7 @@ export function validateRiskIdentityPersistenceEvidence(value, { mint: mintValue
     throw new TypeError("unavailable risk identity evidence contract is invalid");
   }
   timestamp(value.attemptedAt, "risk identity attemptedAt");
+  validateParserProvenance(value);
   if (typeof value.missingReasonCode !== "string" || !/^[a-z][a-z0-9-]{0,63}$/.test(value.missingReasonCode)) {
     throw new TypeError("unavailable risk identity missing reason is invalid");
   }

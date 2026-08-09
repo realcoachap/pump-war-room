@@ -1,10 +1,16 @@
 import { GECKOTERMINAL_PROVIDER, GeckoTerminalError } from "./geckoterminal.js";
-import { parseGeckoTerminalTokenInfo, RISK_IDENTITY_METHOD_VERSION } from "./risk-identity.js";
+import {
+  parseGeckoTerminalTokenInfo,
+  RISK_IDENTITY_METHOD_VERSION,
+  RISK_IDENTITY_PARSER_REVISION,
+  validateRiskIdentityPersistenceEvidence
+} from "./risk-identity.js";
 
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const INITIAL_DELAY_MS = 15 * 60_000;
 const RETRY_DELAY_MS = 60 * 60_000;
 const MAX_ATTEMPTS = 2;
+const PARSER_REVISION_AUDIT_SAMPLE_SIZE = 16;
 const DEFAULT_COHORT_LIMIT = 120;
 const DEFAULT_MAX_ADMISSION_AGE_MS = 20 * 60_000;
 const PROVIDER_DATA_STALE_AFTER_MS = 24 * 60 * 60_000;
@@ -25,6 +31,45 @@ function iso(milliseconds) {
 
 function validToken(token) {
   return token && typeof token === "object" && MINT_PATTERN.test(String(token.mint || "")) && timestamp(token.createdAt) !== null;
+}
+
+function hasCurrentParserAcquisition(evidence) {
+  return evidence?.parserRevision === RISK_IDENTITY_PARSER_REVISION
+    || evidence?.parserAuditRevision === RISK_IDENTITY_PARSER_REVISION;
+}
+
+function hasCurrentParserDisposition(evidence) {
+  return hasCurrentParserAcquisition(evidence)
+    || evidence?.parserAttemptRevision === RISK_IDENTITY_PARSER_REVISION;
+}
+
+function fixedParserRevisionSample(states, cohortLimit) {
+  return [...states]
+    .sort((left, right) => left.mint < right.mint ? -1 : left.mint > right.mint ? 1 : 0)
+    .slice(0, Math.min(PARSER_REVISION_AUDIT_SAMPLE_SIZE, cohortLimit));
+}
+
+function currentParserAuditEvidence(evidence, completedAt) {
+  const {
+    parserAttemptRevision: _parserAttemptRevision,
+    parserAttemptAt: _parserAttemptAt,
+    parserAttemptStatus: _parserAttemptStatus,
+    ...retained
+  } = evidence;
+  return {
+    ...retained,
+    parserAuditRevision: RISK_IDENTITY_PARSER_REVISION,
+    parserAuditAt: completedAt
+  };
+}
+
+function currentParserFailureEvidence(evidence, attemptedAt) {
+  return {
+    ...evidence,
+    parserAttemptRevision: RISK_IDENTITY_PARSER_REVISION,
+    parserAttemptAt: attemptedAt,
+    parserAttemptStatus: "failed"
+  };
 }
 
 function evidenceQuality(evidence, fetchedAt) {
@@ -139,7 +184,8 @@ export class RiskIdentityIngestor {
     if (!Number.isInteger(cohortLimit) || cohortLimit < 1 || cohortLimit > 200) throw new RangeError("cohortLimit must be between 1 and 200");
     if (!Number.isFinite(maxAdmissionAgeMs) || maxAdmissionAgeMs < 0) throw new RangeError("maxAdmissionAgeMs must be non-negative");
     Object.assign(this, { store, client, onStatus, now, setTimeoutFn, clearTimeoutFn, betweenTokensMs, maxQueue, cohortLimit, maxAdmissionAgeMs });
-    this.admittedMints = new Set(store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: cohortLimit }).map(({ mint }) => mint));
+    const existingStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+    this.admittedMints = new Set(existingStates.map(({ mint }) => mint));
     this.queue = [];
     this.queuedMints = new Set();
     this.timer = null;
@@ -150,20 +196,51 @@ export class RiskIdentityIngestor {
     this.lastSuccessAt = null;
     this.lastErrorAt = null;
     this.lastErrorCode = null;
+    this.activeQueueKind = null;
+    this.parserRevisionAudit = {
+      started: false,
+      fullCohort: false,
+      sampleStateCount: 0,
+      currentDispositionCountAtStart: 0,
+      eligibleStateCount: 0,
+      selectedStateCount: 0
+    };
     this.counters = {
       queued: 0, attempts: 0, successes: 0, unavailable: 0, failures: 0,
-      rateLimited: 0, droppedQueue: 0, droppedCohort: 0, droppedLate: 0
+      rateLimited: 0, droppedQueue: 0, droppedCohort: 0, droppedLate: 0,
+      revisionAuditQueued: 0, revisionAuditAttempts: 0, revisionAuditSuccesses: 0,
+      revisionAuditFailures: 0, revisionAuditSkippedCurrent: 0
     };
   }
 
   getStatus() {
     const states = this.store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+    const sampleStates = fixedParserRevisionSample(states, this.cohortLimit);
+    const currentDispositionCount = sampleStates.filter((state) => hasCurrentParserDisposition(state.evidence)).length;
+    const currentAcquisitionCount = sampleStates.filter((state) => hasCurrentParserAcquisition(state.evidence)).length;
+    const currentFailureDispositionCount = sampleStates.filter((state) =>
+      state.evidence?.parserAttemptRevision === RISK_IDENTITY_PARSER_REVISION
+      && !hasCurrentParserAcquisition(state.evidence)).length;
     const persistedSuccesses = states.map((state) => timestamp(state.lastSuccessAt)).filter(Number.isFinite);
     const persistedLastSuccessAt = persistedSuccesses.length ? iso(Math.max(...persistedSuccesses)) : null;
     const lastSuccessAt = [this.lastSuccessAt, persistedLastSuccessAt]
       .map((value) => timestamp(value)).filter(Number.isFinite).sort((a, b) => b - a)[0];
     const lastSuccessIso = Number.isFinite(lastSuccessAt) ? iso(lastSuccessAt) : null;
     const lastSuccessAgeSeconds = lastSuccessIso ? Math.floor((this.now() - lastSuccessAt) / 1_000) : null;
+    const revisionAuditQueueDepth = this.queue.filter(({ kind }) => kind === "parser-revision-audit").length;
+    const revisionAuditComplete = this.parserRevisionAudit.fullCohort
+      && sampleStates.length === Math.min(PARSER_REVISION_AUDIT_SAMPLE_SIZE, this.cohortLimit)
+      && currentDispositionCount === sampleStates.length;
+    const revisionAuditStatus = !this.parserRevisionAudit.started ? "not-started"
+      : !this.parserRevisionAudit.fullCohort ? "not-applicable"
+      : this.activeQueueKind === "parser-revision-audit" ? "running"
+      : revisionAuditQueueDepth > 0 ? "queued"
+      : this.counters.revisionAuditFailures > 0 && this.counters.revisionAuditSuccesses > 0 ? "complete-with-failures"
+      : this.counters.revisionAuditFailures > 0 ? "failed"
+      : revisionAuditComplete && currentFailureDispositionCount > 0 && currentAcquisitionCount > 0 ? "complete-with-failures"
+      : revisionAuditComplete && currentFailureDispositionCount > 0 ? "failed"
+      : revisionAuditComplete ? "complete"
+      : "incomplete";
     return {
       schemaVersion: 1,
       source: GECKOTERMINAL_PROVIDER.id,
@@ -171,6 +248,8 @@ export class RiskIdentityIngestor {
       queueDepth: this.queue.length,
       lastAttemptAt: this.lastAttemptAt,
       lastSuccessAt: lastSuccessIso,
+      runtimeLastSuccessAt: this.lastSuccessAt,
+      persistedLastSuccessAt,
       lastSuccessAgeSeconds,
       successStaleAfterSeconds: null,
       lastSuccessIsStale: null,
@@ -179,12 +258,30 @@ export class RiskIdentityIngestor {
       lastErrorAt: this.lastErrorAt,
       lastErrorCode: this.lastErrorCode,
       schedule: { initialDelaySeconds: INITIAL_DELAY_MS / 1_000, retryDelaySeconds: RETRY_DELAY_MS / 1_000, maxAttempts: MAX_ATTEMPTS },
+      parserRevisionAudit: {
+        status: revisionAuditStatus,
+        currentRevision: RISK_IDENTITY_PARSER_REVISION,
+        targetStateCount: Math.min(PARSER_REVISION_AUDIT_SAMPLE_SIZE, this.cohortLimit),
+        fullCohortAtStart: this.parserRevisionAudit.fullCohort,
+        sampleStateCount: sampleStates.length,
+        currentDispositionCountAtStart: this.parserRevisionAudit.currentDispositionCountAtStart,
+        currentDispositionCount,
+        currentAcquisitionCount,
+        eligibleStateCountAtStart: this.parserRevisionAudit.eligibleStateCount,
+        selectedStateCount: this.parserRevisionAudit.selectedStateCount,
+        queueDepth: revisionAuditQueueDepth,
+        attempts: this.counters.revisionAuditAttempts,
+        successes: this.counters.revisionAuditSuccesses,
+        failures: this.counters.revisionAuditFailures,
+        skippedCurrent: this.counters.revisionAuditSkippedCurrent
+      },
       persistence: {
         stateCount: states.length,
         cohortLimit: this.cohortLimit,
         admittedCount: this.admittedMints.size,
         successfulStateCount: states.filter((state) => state.lastSuccessAt !== null && state.lastSuccessAt !== undefined).length,
-        dueStateCount: states.filter((state) => timestamp(state.nextAttemptAt) !== null && timestamp(state.nextAttemptAt) <= this.now()).length
+        dueStateCount: states.filter((state) => timestamp(state.nextAttemptAt) !== null && timestamp(state.nextAttemptAt) <= this.now()).length,
+        currentParserAcquisitionCount: states.filter((state) => hasCurrentParserAcquisition(state.evidence)).length
       },
       counters: { ...this.counters }
     };
@@ -236,8 +333,42 @@ export class RiskIdentityIngestor {
 
   start(tokens = []) {
     if (this.closed) throw new Error("Risk identity ingestor is closed");
-    for (const token of Array.isArray(tokens) ? tokens : []) this.enqueue(token);
+    const tokenRows = Array.isArray(tokens) ? tokens : [];
+    if (!this.parserRevisionAudit.started) this.#enqueueParserRevisionAudit(tokenRows);
+    for (const token of tokenRows) this.enqueue(token);
     this.#schedule(0);
+  }
+
+  #enqueueParserRevisionAudit(tokens) {
+    this.parserRevisionAudit.started = true;
+    const states = this.store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+    this.parserRevisionAudit.fullCohort = states.length >= this.cohortLimit && this.admittedMints.size >= this.cohortLimit;
+    const sampleStates = fixedParserRevisionSample(states, this.cohortLimit);
+    this.parserRevisionAudit.sampleStateCount = sampleStates.length;
+    this.parserRevisionAudit.currentDispositionCountAtStart = sampleStates
+      .filter((state) => hasCurrentParserDisposition(state.evidence)).length;
+    const eligibleStates = sampleStates.filter((state) => !hasCurrentParserDisposition(state.evidence)
+      && (state.attemptCount >= MAX_ATTEMPTS || timestamp(state.nextAttemptAt) === null));
+    this.parserRevisionAudit.eligibleStateCount = eligibleStates.length;
+    if (!this.parserRevisionAudit.fullCohort) return;
+
+    const tokensByMint = new Map(tokens.filter(validToken).map((token) => [token.mint, token]));
+    const selectionLimit = Math.min(PARSER_REVISION_AUDIT_SAMPLE_SIZE, Math.max(0, this.maxQueue - this.queue.length));
+    for (const state of eligibleStates) {
+      if (this.parserRevisionAudit.selectedStateCount >= selectionLimit) break;
+      const token = tokensByMint.get(state.mint);
+      const current = this.store.riskIdentityState(state.mint);
+      if (!token || !current || hasCurrentParserDisposition(current.evidence) || this.queuedMints.has(state.mint)) continue;
+      this.queue.push({
+        mint: token.mint,
+        createdAt: new Date(timestamp(token.createdAt)).toISOString(),
+        kind: "parser-revision-audit"
+      });
+      this.queuedMints.add(token.mint);
+      this.parserRevisionAudit.selectedStateCount++;
+      this.counters.queued++;
+      this.counters.revisionAuditQueued++;
+    }
   }
 
   close() {
@@ -270,24 +401,40 @@ export class RiskIdentityIngestor {
     if (!token) return;
     this.queuedMints.delete(token.mint);
     this.running = true;
+    this.activeQueueKind = token.kind || "normal";
     this.status = "enriching";
-    try { await this.refreshToken(token); }
+    try { await this.#refreshToken(token, token.kind === "parser-revision-audit"); }
+    catch (error) {
+      if (token.kind === "parser-revision-audit") this.counters.revisionAuditFailures++;
+      throw error;
+    }
     finally {
       this.running = false;
+      this.activeQueueKind = null;
       if (!this.closed) this.#schedule(this.betweenTokensMs);
     }
   }
 
   async refreshToken(token) {
+    return this.#refreshToken(token, false);
+  }
+
+  async #refreshToken(token, parserRevisionAudit) {
     if (!validToken(token)) throw new TypeError("token must include a valid Solana mint and createdAt timestamp");
     const existing = this.store.riskIdentityState(token.mint);
     if (!existing) throw new TypeError("risk identity token must be admitted before refresh");
-    if (timestamp(existing.nextAttemptAt) > this.now()) return { status: "deferred", nextAttemptAt: existing.nextAttemptAt };
-    if (existing.attemptCount >= MAX_ATTEMPTS || timestamp(existing.nextAttemptAt) === null) return existing;
+    if (parserRevisionAudit && hasCurrentParserDisposition(existing.evidence)) {
+      this.counters.revisionAuditSkippedCurrent++;
+      return existing;
+    }
+    if (!parserRevisionAudit && timestamp(existing.nextAttemptAt) > this.now()) return { status: "deferred", nextAttemptAt: existing.nextAttemptAt };
+    if (!parserRevisionAudit && (existing.attemptCount >= MAX_ATTEMPTS || timestamp(existing.nextAttemptAt) === null)) return existing;
     const attemptedAt = iso(this.now());
-    const attemptCount = existing.attemptCount + 1;
+    const attemptCount = parserRevisionAudit ? existing.attemptCount : existing.attemptCount + 1;
+    const persistedLastAttemptAt = parserRevisionAudit && attemptCount === 0 ? existing.lastAttemptAt : attemptedAt;
     this.lastAttemptAt = attemptedAt;
     this.counters.attempts++;
+    if (parserRevisionAudit) this.counters.revisionAuditAttempts++;
     try {
       const payload = await this.client.tokenInfo(token.mint);
       const tokenFetchedAt = iso(Math.max(this.now(), (timestamp(existing.updatedAt) ?? 0) + 1));
@@ -312,63 +459,79 @@ export class RiskIdentityIngestor {
       const retainedPriorEvidence = Boolean(priorQuality?.components.length)
         && (priorQuality.evidenceCount > quality.evidenceCount
           || !priorQuality.components.every((component) => candidateComponents.has(component)));
-      const evidence = retainedPriorEvidence ? priorEvidence : candidateEvidence;
+      const evidence = retainedPriorEvidence
+        ? currentParserAuditEvidence(priorEvidence, completedAt)
+        : candidateEvidence;
       const effectiveQuality = retainedPriorEvidence ? priorQuality : quality;
-      const retry = attemptCount < MAX_ATTEMPTS && quality.needsRetry;
+      const retry = !parserRevisionAudit && attemptCount < MAX_ATTEMPTS && quality.needsRetry;
       const state = {
         mint: token.mint,
         provider: GECKOTERMINAL_PROVIDER.id,
         evidence,
         status: effectiveQuality.hasEvidence ? "available" : "unavailable",
         missingReason: retainedPriorEvidence
-          ? retry ? "A weaker token-info observation was received; prior factors were retained and one bounded retry remains"
-            : "The bounded retry returned weaker token-info coverage; prior factors were retained"
+          ? parserRevisionAudit ? "The current parser audit returned weaker token-info coverage; prior factors were retained"
+            : retry ? "A weaker token-info observation was received; prior factors were retained and one bounded retry remains"
+              : "The bounded retry returned weaker token-info coverage; prior factors were retained"
           : quality.needsRetry
-          ? retry ? "Provider token-info evidence was missing or stale; one bounded retry scheduled"
-            : "Provider token-info evidence remained missing or stale after the bounded retry"
+          ? parserRevisionAudit ? "Current parser audit evidence was missing or stale; the audit acquisition was bounded to one request"
+            : retry ? "Provider token-info evidence was missing or stale; one bounded retry scheduled"
+              : "Provider token-info evidence remained missing or stale after the bounded retry"
           : null,
         errorCode: null,
         attemptCount,
-        lastAttemptAt: attemptedAt,
-        nextAttemptAt: retry ? iso(this.now() + RETRY_DELAY_MS) : null,
+        lastAttemptAt: persistedLastAttemptAt,
+        nextAttemptAt: parserRevisionAudit ? existing.nextAttemptAt : retry ? iso(this.now() + RETRY_DELAY_MS) : null,
         lastSuccessAt: completedAt,
         updatedAt: completedAt
       };
+      validateRiskIdentityPersistenceEvidence(state.evidence, {
+        mint: state.mint,
+        status: state.status,
+        requireCurrentProvenance: true
+      });
       this.store.upsertRiskIdentityState(state);
       this.status = state.status;
       this.lastSuccessAt = completedAt;
       this.lastErrorAt = null;
       this.lastErrorCode = null;
       this.counters.successes++;
+      if (parserRevisionAudit) this.counters.revisionAuditSuccesses++;
       if (!effectiveQuality.hasEvidence) this.counters.unavailable++;
       this.onStatus(state.status, {
         mint: token.mint,
         nextAttemptAt: state.nextAttemptAt,
         missingCore: quality.missingCore,
         holderTimestampStale: quality.holderTimestampStale,
-        retainedPriorEvidence
+        retainedPriorEvidence,
+        parserRevisionAudit
       });
       return state;
     } catch (error) {
       const failedAt = iso(Math.max(this.now(), (timestamp(existing.updatedAt) ?? 0) + 1));
       const providerError = error instanceof GeckoTerminalError ? error : null;
       const boundedCode = boundedProviderErrorCode(error);
-      const retry = attemptCount < MAX_ATTEMPTS;
+      const retry = !parserRevisionAudit && attemptCount < MAX_ATTEMPTS;
       const unavailable = ["not-found", "token-info-missing"].includes(boundedCode);
       const retainPriorEvidence = existing.lastSuccessAt !== null && existing.lastSuccessAt !== undefined
         && existing.evidence && typeof existing.evidence === "object" && existing.evidence.factors && existing.evidence.fingerprints;
+      const baseEvidence = retainPriorEvidence ? existing.evidence : unavailableEvidence(token.mint, boundedCode, attemptedAt);
+      const invalidResponse = boundedCode.startsWith("invalid-") || boundedCode === "token-mismatch";
       const state = {
         mint: token.mint,
         provider: GECKOTERMINAL_PROVIDER.id,
-        evidence: retainPriorEvidence ? existing.evidence : unavailableEvidence(token.mint, boundedCode, attemptedAt),
-        status: retainPriorEvidence ? boundedCode === "rate-limited" ? "rate-limited" : "degraded"
-          : boundedCode === "rate-limited" ? "rate-limited" : unavailable ? "unavailable" : boundedCode.startsWith("invalid-") || boundedCode === "token-mismatch" ? "invalid-response" : "degraded",
-        missingReason: retainPriorEvidence ? "Last valid token-info factors were retained after a refresh failure"
-          : unavailable ? "Provider token-info was unavailable" : boundedCode.startsWith("invalid-") || boundedCode === "token-mismatch" ? "Provider token-info response was invalid" : "Provider token-info request failed",
+        evidence: currentParserFailureEvidence(baseEvidence, attemptedAt),
+        status: boundedCode === "rate-limited" ? "rate-limited"
+          : invalidResponse ? "invalid-response"
+            : retainPriorEvidence ? "degraded" : unavailable ? "unavailable" : "degraded",
+        missingReason: retainPriorEvidence ? parserRevisionAudit
+          ? "Last valid token-info factors were retained after the current parser audit failed"
+          : "Last valid token-info factors were retained after a refresh failure"
+          : unavailable ? "Provider token-info was unavailable" : invalidResponse ? "Provider token-info response was invalid" : "Provider token-info request failed",
         errorCode: boundedCode,
         attemptCount,
-        lastAttemptAt: attemptedAt,
-        nextAttemptAt: retry ? iso(this.now() + Math.max(RETRY_DELAY_MS, providerError?.retryAfterMs || 0)) : null,
+        lastAttemptAt: persistedLastAttemptAt,
+        nextAttemptAt: parserRevisionAudit ? existing.nextAttemptAt : retry ? iso(this.now() + Math.max(RETRY_DELAY_MS, providerError?.retryAfterMs || 0)) : null,
         lastSuccessAt: existing.lastSuccessAt,
         updatedAt: failedAt
       };
@@ -379,7 +542,8 @@ export class RiskIdentityIngestor {
       if (unavailable) this.counters.unavailable++;
       else if (boundedCode === "rate-limited") this.counters.rateLimited++;
       else this.counters.failures++;
-      this.onStatus(state.status, { mint: token.mint, errorCode: boundedCode, nextAttemptAt: state.nextAttemptAt });
+      if (parserRevisionAudit) this.counters.revisionAuditFailures++;
+      this.onStatus(state.status, { mint: token.mint, errorCode: boundedCode, nextAttemptAt: state.nextAttemptAt, parserRevisionAudit });
       return state;
     }
   }
