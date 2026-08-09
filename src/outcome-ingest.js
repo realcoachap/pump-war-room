@@ -36,6 +36,24 @@ function newestTimestamp(values) {
   return milliseconds.length ? iso(Math.max(...milliseconds)) : null;
 }
 
+function poolReserveEvidence(selection) {
+  const attemptedAt = timestamp(selection?.poolSelectedAt) === null ? null : iso(timestamp(selection.poolSelectedAt));
+  const reserveUsd = typeof selection?.reserveUsd === "number" && Number.isFinite(selection.reserveUsd)
+    && selection.reserveUsd >= 0 ? selection.reserveUsd : null;
+  const available = reserveUsd !== null && attemptedAt !== null;
+  return {
+    schemaVersion: 1,
+    source: GECKOTERMINAL_PROVIDER.id,
+    evidenceClass: available ? "provider-observed" : "unavailable",
+    attemptedAt,
+    observedAt: available ? attemptedAt : null,
+    liquidityUsd: available ? reserveUsd : null,
+    missingReasonCode: available ? null : "pool-reserve-missing",
+    basis: "provider-observed-pool-reserve",
+    limitation: "GeckoTerminal-observed pool reserve is not evidence of locked liquidity"
+  };
+}
+
 function mergeOutcomeHistory(previousValue, candidate) {
   let previous;
   try { previous = validateProviderObservedOutcome(previousValue, { requireProspectiveSelection: true }); }
@@ -293,6 +311,7 @@ export class VerifiedOutcomeIngestor {
           poolSelectedAt: existing.evidence?.poolSelectedAt || null,
           providerPage: existing.evidence?.providerPage ?? null,
           providerRank: existing.evidence?.providerRank ?? null,
+          reserveUsd: existing.evidence?.liquidity?.liquidityUsd ?? null,
           sourceUrl: existing.sourceUrl || existing.evidence?.sourceUrl || `https://www.geckoterminal.com/solana/pools/${existing.pool}`
         }
       : null;
@@ -333,6 +352,7 @@ export class VerifiedOutcomeIngestor {
             providerPage: selection.providerPage,
             providerRank: selection.providerRank,
             selectionScope: "provider-contemporaneously-ranked-page-1",
+            liquidity: poolReserveEvidence(selection),
             retention: "derived-metrics-and-minimal-provenance-only"
           }
         };
@@ -427,6 +447,7 @@ export class VerifiedOutcomeIngestor {
           poolSelectedAt: selection.poolSelectedAt,
           providerPage: selection.providerPage,
           providerRank: selection.providerRank,
+          liquidity: poolReserveEvidence(selection),
           received,
           rejected,
           incomplete,

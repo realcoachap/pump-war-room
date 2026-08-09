@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import { classifyPumpPortalEvent, PumpPortalIngestor } from "../src/ingest.js";
 
 const FIXED_TIME = Date.parse("2026-08-08T21:00:00.000Z");
+const MINT_ONE = "11111111111111111111111111111111";
+const MINT_TWO = "22222222222222222222222222222222";
+const MINT_THREE = "33333333333333333333333333333333";
+const CREATOR = "So11111111111111111111111111111111111111112";
+const USER = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
 
 function fakeWebSocketClass() {
   return class FakeWebSocket {
@@ -55,7 +60,11 @@ function fakeTimers() {
 
 const pendingTimers = (timers) => timers.tasks.filter((task) => !task.cleared);
 
-test("new live tokens remain risk-unverified until enrichment arrives", () => {
+test("rejects unapproved metered trade subscriptions", () => {
+  assert.throws(() => new PumpPortalIngestor({ url: "wss://example.invalid", watchTrades: true }), /trade subscriptions are disabled/);
+});
+
+test("new live tokens keep creator, deployer, curve inventory, and volume semantics separate", () => {
   let observed;
   const ingestor = new PumpPortalIngestor({
     url: "wss://example.invalid",
@@ -63,20 +72,71 @@ test("new live tokens remain risk-unverified until enrichment arrives", () => {
     onToken: (token) => { observed = token; }
   });
 
-  ingestor.handle({ mint: "LiveMintPump", name: "Same Name", symbol: "SAME", marketCapSol: 10 });
+  ingestor.handle({
+    mint: MINT_ONE, name: "Same Name", symbol: "SAME", marketCapSol: 10,
+    creator: CREATOR, traderPublicKey: USER,
+    vSolInBondingCurve: 30, solAmount: 1.5
+  });
 
-  assert.equal(observed.mint, "LiveMintPump");
+  assert.equal(observed.mint, MINT_ONE);
   assert.equal(observed.source, "pumpportal");
   assert.equal(observed.risk, null);
-  assert.equal(observed.riskConfidence, "unverified");
+  assert.equal(observed.riskConfidence, "unavailable");
+  assert.equal(observed.creator, CREATOR);
+  assert.equal(observed.deployer, USER);
+  assert.equal(observed.volume5m, null);
+  assert.equal(observed.priceChange5m, null);
+  assert.equal(observed.uniqueBuyers, null);
+  assert.equal(observed.buyRatio, null);
+  assert.equal(observed.bondingProgress, null);
+  assert.equal(observed.smartWallets, null);
+  assert.equal(observed.momentum, null);
+  assert.equal(observed.marketCap, null);
+  assert.deepEqual(observed.marketCapEvidence, { evidenceClass: "unavailable", basis: "operator-sol-usd-not-configured", solUsd: null });
+  assert.equal(observed.curveSol, 30);
+  assert.equal(observed.launchSolAmount, 1.5);
   assert.equal(observed.devHoldingPct, null);
   assert.equal(observed.top10Pct, null);
+});
+
+test("does not relabel a transaction user as a declared creator", () => {
+  let observed;
+  const ingestor = new PumpPortalIngestor({
+    url: "wss://example.invalid",
+    now: () => FIXED_TIME,
+    onToken: (token) => { observed = token; }
+  });
+  ingestor.handle({ mint: MINT_ONE, name: "No Creator", symbol: "NONE", traderPublicKey: USER });
+  assert.equal(observed.creator, null);
+  assert.equal(observed.deployer, USER);
+});
+
+test("prefers the documented transaction user while keeping it separate from the declared creator", () => {
+  let observed;
+  const ingestor = new PumpPortalIngestor({
+    url: "wss://example.invalid",
+    now: () => FIXED_TIME,
+    onToken: (token) => { observed = token; }
+  });
+  ingestor.handle({ mint: MINT_ONE, name: "User Field", symbol: "USER", creator: CREATOR, user: USER, traderPublicKey: MINT_TWO });
+  assert.equal(observed.creator, CREATOR);
+  assert.equal(observed.deployer, USER);
+});
+
+test("withholds malformed identities and negative or non-finite SOL quantities", () => {
+  let observed;
+  const ingestor = new PumpPortalIngestor({ url: "wss://example.invalid", now: () => FIXED_TIME, onToken: (token) => { observed = token; } });
+  ingestor.handle({ mint: MINT_ONE, name: "Invalid fields", symbol: "BAD", creator: "not-base58", user: "x".repeat(10_000), vSolInBondingCurve: -1, solAmount: "Infinity" });
+  assert.equal(observed.creator, null);
+  assert.equal(observed.deployer, null);
+  assert.equal(observed.curveSol, null);
+  assert.equal(observed.launchSolAmount, null);
 });
 
 test("classifies create frames with a pool as new tokens, not migrations", () => {
   const raw = {
     txType: "create",
-    mint: "NewMintPump",
+    mint: MINT_ONE,
     pool: "pump",
     name: "Actually New",
     symbol: "NEW"
@@ -93,7 +153,7 @@ test("classifies create frames with a pool as new tokens, not migrations", () =>
   assert.equal(classifyPumpPortalEvent(raw), "new-token");
   ingestor.handle(raw);
   assert.equal(tokens.length, 1);
-  assert.equal(tokens[0].mint, "NewMintPump");
+  assert.equal(tokens[0].mint, MINT_ONE);
   assert.equal(migrations.length, 0);
 });
 
@@ -107,11 +167,11 @@ test("classifies explicit migrations and ignores pool-bearing trade events", () 
     onMigration: (migration) => migrations.push(migration)
   });
 
-  ingestor.handle({ txType: "migrate", mint: "DoneMint", pool: "pump-amm" });
-  ingestor.handle({ txType: "buy", mint: "DoneMint", pool: "pump", solAmount: 1 });
+  ingestor.handle({ txType: "migrate", mint: MINT_ONE, pool: "pump-amm" });
+  ingestor.handle({ txType: "buy", mint: MINT_ONE, pool: "pump", solAmount: 1 });
   ingestor.handle({ mint: "PoolOnlyMint", pool: "raydium" });
 
-  assert.deepEqual(migrations.map(({ mint }) => mint), ["DoneMint"]);
+  assert.deepEqual(migrations.map(({ mint }) => mint), [MINT_ONE]);
   assert.equal(tokens.length, 0);
   assert.equal(ingestor.getStatus().counters.migrations, 1);
   assert.equal(ingestor.getStatus().counters.ignoredMessages, 2);
@@ -146,7 +206,7 @@ test("malformed websocket JSON is counted and the next valid event is processed"
   assert.equal(ingestor.getStatus().lastErrorAt, "2026-08-08T21:00:00.000Z");
 
   socket.emit("message", {
-    data: JSON.stringify({ txType: "create", mint: "RecoveredMint", pool: "pump", name: "Recovered", symbol: "OK" })
+    data: JSON.stringify({ txType: "create", mint: MINT_ONE, pool: "pump", name: "Recovered", symbol: "OK" })
   });
 
   const status = ingestor.getStatus();
@@ -275,11 +335,11 @@ test("getStatus exposes counters and raw-message age after repeated healthy traf
   ingestor.connect();
   const socket = WebSocketImpl.instances[0];
   socket.emit("open");
-  socket.emit("message", { data: JSON.stringify({ txType: "create", mint: "MintOne", name: "One", symbol: "ONE" }) });
+  socket.emit("message", { data: JSON.stringify({ txType: "create", mint: MINT_ONE, name: "One", symbol: "ONE" }) });
   tick += 1_000;
-  socket.emit("message", { data: JSON.stringify({ txType: "create", mint: "MintTwo", name: "Two", symbol: "TWO" }) });
+  socket.emit("message", { data: JSON.stringify({ txType: "create", mint: MINT_TWO, name: "Two", symbol: "TWO" }) });
   tick += 1_000;
-  socket.emit("message", { data: JSON.stringify({ txType: "buy", mint: "MintTwo" }) });
+  socket.emit("message", { data: JSON.stringify({ txType: "buy", mint: MINT_THREE }) });
 
   const live = ingestor.getStatus();
   assert.equal(live.status, "live");

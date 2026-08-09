@@ -56,7 +56,7 @@ test("persists provider-ranked derived outcome evidence without raw candles", as
   let calls = 0;
   const client = {
     minIntervalMs: 6500,
-    poolForToken: async () => ({ provider: "geckoterminal", pool, tokenSide: "base", dex: "pumpswap", poolCreatedAt: token.createdAt, poolSelectedAt: "2026-08-08T12:01:00.000Z", providerPage: 1, providerRank: 1, reserveUsd: 10000, volume24hUsd: 4000, sourceUrl: `https://www.geckoterminal.com/solana/pools/${pool}` }),
+    poolForToken: async () => ({ provider: "geckoterminal", pool, tokenSide: "base", dex: "pumpswap", poolCreatedAt: token.createdAt, poolSelectedAt: "2026-08-08T12:01:00.000Z", providerPage: 1, providerRank: 1, reserveUsd: 10000, sourceUrl: `https://www.geckoterminal.com/solana/pools/${pool}` }),
     ohlcv: async () => {
       calls++;
       const rows = [candle("2026-08-08T12:00:00.000Z", 1), candle("2026-08-08T12:04:00.000Z", 2)];
@@ -111,6 +111,37 @@ test("records missing-pool evidence and a bounded retry without inventing prices
   assert.equal(state.nextAttemptAt, "2026-08-08T12:02:00.000Z");
   assert.equal(store.states.get(mint).evidence.outcome, undefined);
   assert.equal(ingestor.getStatus().counters.noPool, 1);
+});
+
+test("marks a selected pool with no reserve value as unavailable liquidity evidence", async () => {
+  const launchAt = "2026-08-08T12:29:30.000Z";
+  const freshToken = { mint, createdAt: launchAt };
+  const store = memoryStore();
+  const client = {
+    poolForToken: async () => ({
+      provider: "geckoterminal", pool, tokenSide: "base", dex: "pumpswap",
+      poolCreatedAt: launchAt, poolSelectedAt: "2026-08-08T12:30:00.000Z",
+      providerPage: 1, providerRank: 1, reserveUsd: null,
+      sourceUrl: `https://www.geckoterminal.com/solana/pools/${pool}`
+    }),
+    ohlcv: async () => { throw new Error("selection stage must not fetch candles"); }
+  };
+  const ingestor = new VerifiedOutcomeIngestor({ store, client, now: () => NOW });
+  ingestor.enqueue(freshToken);
+  const selected = await ingestor.refreshToken(freshToken);
+  assert.equal(selected.status, "pool-selected");
+  assert.deepEqual(selected.evidence.liquidity, {
+    schemaVersion: 1,
+    source: "geckoterminal",
+    evidenceClass: "unavailable",
+    attemptedAt: "2026-08-08T12:30:00.000Z",
+    observedAt: null,
+    liquidityUsd: null,
+    missingReasonCode: "pool-reserve-missing",
+    basis: "provider-observed-pool-reserve",
+    limitation: "GeckoTerminal-observed pool reserve is not evidence of locked liquidity"
+  });
+  ingestor.close();
 });
 
 test("records a valid provider refresh as operational success even when completed candles are still missing", async () => {
@@ -457,6 +488,8 @@ test("real Store persists selection-first scheduling and a complete allowlisted 
   assert.equal(selected.status, "pool-selected");
   assert.equal(selected.nextAttemptAt, "2026-08-08T12:36:30.000Z");
   assert.equal(selected.evidence.selectionScope, "provider-contemporaneously-ranked-page-1");
+  assert.equal(selected.evidence.liquidity.evidenceClass, "unavailable");
+  assert.equal(selected.evidence.liquidity.missingReasonCode, "pool-reserve-missing");
   assert.equal(ohlcvCalls, 0, "selection stage consumed candle capacity");
   clock = Date.parse("2026-08-08T12:36:30.000Z");
   const measured = await ingestor.refreshToken(freshToken);

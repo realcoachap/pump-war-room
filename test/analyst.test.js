@@ -13,7 +13,7 @@ const token = (overrides = {}) => ({
   momentum: 71,
   narrative: "AI agents",
   risk: null,
-  riskConfidence: "unverified",
+  riskConfidence: "unavailable",
   status: "bonding",
   ...overrides
 });
@@ -91,39 +91,44 @@ test("narrative counts are derived only from eligible supplied tokens", () => {
   assert.ok(result.evidence.every((item) => item.citation === "snapshot.tokens.narrative"));
 });
 
-test("unverified risk numbers are withheld while reportable confidence stays qualified", () => {
+test("risk analysis reports evidence classes while withholding uncalibrated composites", () => {
   const result = analyzeSnapshot("Explain risk confidence", {
     mode: "live",
     tokens: [
-      token({ mint: "Unverified1111111111111111111111111111pump", symbol: "UNV", risk: 99, riskConfidence: "unverified" }),
-      token({ mint: "Verified111111111111111111111111111111pump", symbol: "VER", risk: 42, riskConfidence: "verified" })
+      token({ mint: "Unavailable111111111111111111111111111pump", symbol: "UNK", risk: 99, riskConfidence: "unavailable" }),
+      token({
+        mint: "Observed111111111111111111111111111111pump", symbol: "OBS", risk: 42,
+        riskConfidence: "provider-observed",
+        riskIdentity: { overallEvidence: "provider-observed", factors: { concentration: { top10Percentage: 51.2 } } }
+      })
     ]
   }, { now: NOW });
 
-  assert.doesNotMatch(result.answer, /99/);
-  assert.match(result.answer, /VER at 42\/100 \(verified\)/);
-  assert.match(result.answer, /do not establish safety/i);
-  const unverified = result.evidence.find((item) => item.mint?.startsWith("Unverified"));
-  assert.match(unverified.detail, /numeric risk withheld/);
-  assert.doesNotMatch(unverified.detail, /99/);
+  assert.doesNotMatch(result.answer, /99|42\/100/);
+  assert.match(result.answer, /provider-observed 1/);
+  assert.match(result.answer, /does not establish duplicate content, common control, fraud, or safety/i);
+  const observed = result.evidence.find((item) => item.mint?.startsWith("Observed"));
+  assert.match(observed.detail, /top-10: 51.2%/);
+  assert.match(observed.detail, /numeric composite withheld/);
 });
 
-test("graduation answers cite token mints or the snapshot aggregate without inventing details", () => {
+test("lifecycle answers cite token mints or the snapshot aggregate without claiming finalization", () => {
   const detailed = analyzeSnapshot("Any graduations?", {
     mode: "live",
-    stats: { graduations: 1 },
-    tokens: [token({ mint: "Graduate111111111111111111111111111111pump", symbol: "GRAD", status: "graduated" })]
+    stats: { migrationsObserved: 1 },
+    tokens: [token({ mint: "Graduate111111111111111111111111111111pump", symbol: "GRAD", status: "migration-observed", migrationEvidence: { evidenceClass: "feed-observed-processed" } })]
   }, { now: NOW });
   assert.match(detailed.answer, /GRAD/);
+  assert.match(detailed.answer, /not independently finalized proof/i);
   assert.equal(detailed.evidence[0].mint, "Graduate111111111111111111111111111111pump");
 
   const aggregateOnly = analyzeSnapshot("Any graduations?", {
     mode: "live",
-    stats: { graduations: 2 },
+    stats: { migrationsObserved: 2 },
     tokens: []
   }, { now: NOW });
   assert.match(aggregateOnly.answer, /mint-level details are unavailable/);
-  assert.equal(aggregateOnly.evidence[0].citation, "snapshot.stats.graduations");
+  assert.equal(aggregateOnly.evidence[0].citation, "snapshot.stats.migrationsObserved");
 });
 
 test("callouts remain explicitly third-party and mint-cited", () => {

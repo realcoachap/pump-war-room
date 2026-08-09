@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 
-const version = "0.6.0";
+const version = "0.7.0";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -27,6 +27,14 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         successStaleAfterSeconds: 22_500, lastSuccessIsStale: false,
         persistence: { attemptCount: 2, successfulStateCount: 1 },
         counters: { attempts: 2, successes: 1, consecutiveFailures: 0 }
+      },
+      riskIntelligence: {
+        source: "geckoterminal", status: "available", queueDepth: 0,
+        lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 30,
+        successStaleAfterSeconds: null, lastSuccessIsStale: null,
+        evidenceAcquisition: "bounded-one-time-15m-with-one-missing-or-stale-retry",
+        ongoingFreshnessRequired: false,
+        persistence: { successfulStateCount: 1 }, counters: { attempts: 1, successes: 1 }
       }
     }),
     "/api/snapshot": JSON.stringify({
@@ -36,7 +44,11 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       service: { uptimeSeconds: 30 },
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, freshnessBasis: "verified-feed-activity" },
-      leaderboard: { top100: [] },
+      leaderboard: {
+        schemaVersion: 2,
+        ranking: { metric: "evidence_score_or_recency_v2", scorePolicy: "withheld-without-substantive-input" },
+        top100: []
+      },
       outcomes: {
         schemaVersion: 1,
         revisionPolicy: "first-observed-derived-value-per-window-provider-revision",
@@ -48,13 +60,26 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         },
         summary: { windows: outcomeWindows() },
         cohorts: { narrative: { cohorts: [] }, lifecycle: { cohorts: [] } }
+      },
+      riskIntelligence: {
+        schemaVersion: 1,
+        source: { id: "geckoterminal", apiVersion: "20230203", rawResponsesPersisted: false, rawProfilesPersisted: false },
+        rankingImpact: "none-uncalibrated",
+        evidenceClasses: ["on-chain-finalized", "provider-observed", "feed-observed-processed", "locally-derived", "unavailable"],
+        coverage: { stateCount: 1, successCount: 1 },
+        cohort: {
+          policy: "risk-specific-prospective-fixed-admission-v1", limit: 120, admittedCount: 1,
+          universe: "PumpPortal launches admitted by the v0.7 risk worker while active; independent from the v0.6 outcome cohort",
+          observations: []
+        },
+        summary: { totalTracked: 1 }
       }
     }),
-    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section>`,
-    "/app.js": "function renderFeedObservability() {} function renderOutcomes() {} // raw candle retention off",
-    "/styles.css": ".outcome-source,footer{font-size:10px}",
-    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices</p>",
-    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses</p>",
+    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section>`,
+    "/app.js": "function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO",
+    "/styles.css": ".outcome-source,footer{font-size:10px}.risk-intelligence-source{}",
+    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control</p>",
+    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes</p>",
     ...overrides
   };
   const server = http.createServer((req, res) => {
@@ -80,7 +105,7 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
   assert.equal(result.ok, true);
   assert.deepEqual(result.http, { health: 200, snapshot: 200, html: 200, appJs: 200, styles: 200, terms: 200, privacy: 200 });
-  assert.deepEqual(result.markers, { version: true, readOnly: true, observability: true, outcomeEngine: true, legalNotices: true });
+  assert.deepEqual(result.markers, { version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true, legalNotices: true });
 });
 
 test("fails closed on version disagreement", async (t) => {
@@ -177,6 +202,14 @@ test("accepts fresh persisted provider evidence after a process restart with zer
       successStaleAfterSeconds: 22_500, lastSuccessIsStale: false,
       persistence: { attemptCount: 7, successfulStateCount: 1 },
       counters: { attempts: 0, successes: 0, consecutiveFailures: 0 }
+    },
+    riskIntelligence: {
+      source: "geckoterminal", status: "idle", queueDepth: 0,
+      lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 3_600,
+      successStaleAfterSeconds: null, lastSuccessIsStale: null,
+      evidenceAcquisition: "bounded-one-time-15m-with-one-missing-or-stale-retry",
+      ongoingFreshnessRequired: false,
+      persistence: { successfulStateCount: 1 }, counters: { attempts: 0, successes: 0 }
     }
   };
   const baseUrl = await fixture(t, { "/api/health": JSON.stringify(health) });

@@ -37,42 +37,65 @@ function outcome(token, outcomesByMint, now) {
     ...(matchingVerified || fallback),
     graduation: token.status === "graduated"
       ? { status: "observed", observedAt: token.graduatedAt || null }
-      : { status: "pending", observedAt: null }
+      : token.migrationEvidence?.evidenceClass === "feed-observed-processed"
+        ? { status: "feed-observed-processed", observedAt: token.migrationEvidence.observedAt || null }
+        : { status: "pending", observedAt: null }
   };
 }
 
 function publicToken(token) {
   const result = Object.fromEntries([
-    "mint", "name", "symbol", "createdAt", "status", "narrative", "marketCap", "volume5m",
-    "priceChange5m", "uniqueBuyers", "buyRatio", "bondingProgress", "momentum", "risk", "source"
+    "ingestSchemaVersion", "mint", "name", "symbol", "createdAt", "status", "narrative", "marketCap", "volume5m",
+    "priceChange5m", "uniqueBuyers", "buyRatio", "bondingProgress", "momentum", "risk", "source",
+    "creator", "deployer", "marketCapSol", "marketCapEvidence", "curveSol", "launchSolAmount", "migrationEvidence", "riskIdentity"
   ].filter((key) => token[key] !== undefined).map((key) => [key, token[key]]));
   for (const key of ["marketCap", "volume5m", "uniqueBuyers", "bondingProgress", "momentum", "risk"]) {
     const value = finite(result[key]);
     result[key] = value !== null && value >= 0 ? value : null;
   }
+  if (!Number.isSafeInteger(result.uniqueBuyers)) result.uniqueBuyers = null;
+  if (result.bondingProgress !== null && result.bondingProgress > 100) result.bondingProgress = null;
+  if (result.momentum !== null && result.momentum > 100) result.momentum = null;
+  if (result.risk !== null && result.risk > 100) result.risk = null;
   result.priceChange5m = finite(result.priceChange5m);
   result.buyRatio = finite(result.buyRatio);
   return result;
 }
 
 function scoreToken(token, now, outcomesByMint) {
-  const momentum = clamp(Math.max(0, finite(token.momentum) ?? 0));
-  const curve = clamp(Math.max(0, finite(token.bondingProgress) ?? 0));
-  const buyers = Math.max(0, finite(token.uniqueBuyers) ?? 0);
-  const confidence = token.riskConfidence || (token.source === "demo" ? "synthetic" : "unverified");
-  const risk = finite(token.risk);
+  const rawMomentum = finite(token.momentum);
+  const suppliedMomentum = rawMomentum !== null && rawMomentum >= 0 && rawMomentum <= 100 ? rawMomentum : null;
+  const momentum = clamp(Math.max(0, suppliedMomentum ?? 0));
+  const rawBuyers = finite(token.uniqueBuyers);
+  const suppliedBuyers = Number.isSafeInteger(rawBuyers) && rawBuyers >= 0 ? rawBuyers : null;
+  const buyers = Math.max(0, suppliedBuyers ?? 0);
+  const confidence = token.riskConfidence || (token.source === "demo" ? "synthetic" : "unavailable");
   const fresh = freshness(token.createdAt, now);
   const freshnessPoints = fresh.state === "fresh" ? 10 : fresh.state === "aging" ? 5 : 0;
   const buyerPoints = clamp(Math.log2(buyers + 1) * 2.5, 0, 12);
-  const riskPenalty = confidence === "verified" && risk !== null ? risk * .12 : 0;
-  const score = clamp(momentum * .62 + curve * .16 + buyerPoints + freshnessPoints - riskPenalty);
+  // Provider-observed risk factors are not outcome-calibrated and therefore
+  // cannot alter rank in v0.7.0.
+  const substantiveEvidenceAvailable = suppliedMomentum !== null || suppliedBuyers !== null;
+  const score = substantiveEvidenceAvailable
+    ? Math.round(clamp(momentum * .78 + buyerPoints + freshnessPoints) * 10) / 10
+    : null;
   const reasons = [
-    `Momentum ${Math.round(momentum)}/100`,
-    fresh.state === "unverified" ? "Freshness unverified" : `${fresh.state} observation`,
-    curve >= 75 ? "Near graduation" : curve > 0 ? `Curve ${Math.round(curve)}%` : "Curve unverified",
-    confidence === "verified" ? `Verified risk ${Math.round(risk ?? 0)}/100` : "Risk unverified"
+    suppliedMomentum === null ? "Momentum unavailable" : `Momentum ${Math.round(momentum)}/100`,
+    suppliedBuyers === null ? "Buyer breadth unavailable" : `${Math.round(buyers)} observed buyers`,
+    substantiveEvidenceAvailable
+      ? fresh.state === "unverified" ? "Freshness unverified" : `${fresh.state} observation`
+      : "Evidence score withheld; ordered by observation recency",
+    `${confidence} risk evidence; excluded from rank`
   ];
-  return { token: publicToken(token), score: Math.round(score * 10) / 10, reasons, freshness: fresh, riskConfidence: confidence, outcome: outcome(token, outcomesByMint, now) };
+  return {
+    token: publicToken(token),
+    score,
+    orderingBasis: substantiveEvidenceAvailable ? "evidence-score" : "observation-recency-no-substantive-inputs",
+    reasons,
+    freshness: fresh,
+    riskConfidence: confidence,
+    outcome: outcome(token, outcomesByMint, now)
+  };
 }
 
 export function createTop100(tokens, { now = Date.now(), mode = "live", outcomesByMint = null } = {}) {
@@ -82,7 +105,17 @@ export function createTop100(tokens, { now = Date.now(), mode = "live", outcomes
     .filter((token) => mode !== "live" || token.source === "pumpportal")
     .filter((token) => mode !== "live" || validLiveMint(token.mint))
     .map((token) => scoreToken(token, now, outcomesByMint))
-    .sort((a, b) => b.score - a.score || (timestamp(b.token.createdAt) ?? 0) - (timestamp(a.token.createdAt) ?? 0) || String(a.token.mint).localeCompare(String(b.token.mint)))
+    .sort((a, b) => {
+      const leftScore = finite(a.score);
+      const rightScore = finite(b.score);
+      if (leftScore !== null || rightScore !== null) {
+        if (leftScore === null) return 1;
+        if (rightScore === null) return -1;
+        if (rightScore !== leftScore) return rightScore - leftScore;
+      }
+      return (timestamp(b.token.createdAt) ?? 0) - (timestamp(a.token.createdAt) ?? 0)
+        || String(a.token.mint).localeCompare(String(b.token.mint));
+    })
     .slice(0, 100)
     .map((entry, index) => ({ rank: index + 1, mode, chain: "solana", ...entry }));
 }

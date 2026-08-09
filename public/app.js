@@ -1,4 +1,4 @@
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let refreshInFlight = false;
@@ -37,8 +37,8 @@ const exactTime = (iso) => {
 };
 const riskClass = (risk) => !hasNumber(risk) ? "risk-unverified" : number(risk) >= 70 ? "risk-high" : number(risk) >= 45 ? "risk-mid" : "risk-low";
 const shortMint = (mint = "") => String(mint).length > 12 ? `${String(mint).slice(0, 6)}…${String(mint).slice(-4)}` : String(mint);
-const riskConfidence = (token = {}) => token.riskConfidence || (token.source === "demo" ? "synthetic" : "unverified");
-const riskLabel = (token) => riskConfidence(token) === "unverified" || !hasNumber(token.risk) ? "—" : number(token.risk);
+const riskConfidence = (token = {}) => token.riskIdentity?.overallEvidence || token.riskConfidence || (token.source === "demo" ? "synthetic" : "unavailable");
+const riskLabel = (token) => token.source !== "demo" || !hasNumber(token.risk) ? "—" : number(token.risk);
 const fomoUrl = (mint) => `https://fomo.family/tokens/solana/${encodeURIComponent(mint)}`;
 const cappedText = (value, limit) => {
   const text = typeof value === "string" ? value.trim() : "";
@@ -118,7 +118,9 @@ function trustedStats() {
     mintedToday: serverStatsTrusted ? number(state.stats?.mintedToday) : countToday,
     lastHour: serverStatsTrusted ? number(state.stats?.lastHour) : countSince(3_600_000),
     last15m: serverStatsTrusted ? number(state.stats?.last15m) : countSince(900_000),
-    graduations: serverStatsTrusted ? number(state.stats?.graduations) : tokens.filter((token) => token.status === "graduated").length
+    graduations: serverStatsTrusted ? number(state.stats?.graduations) : tokens.filter((token) => token.status === "graduated").length,
+    migrationsObserved: serverStatsTrusted ? number(state.stats?.migrationsObserved)
+      : tokens.filter((token) => token.status === "migration-observed" || token.migrationEvidence?.evidenceClass === "feed-observed-processed").length
   };
 }
 
@@ -166,7 +168,7 @@ function renderStats() {
     ["Minted today", stats.mintedToday, "observed mint events"],
     ["Last 60 min", stats.lastHour, "launch observations"],
     ["Last 15 min", stats.last15m, "current feed pulse", stats.last15m > 0 ? "hot" : ""],
-    ["Graduations", stats.graduations, "observed migrations"]
+    ["Migrations", stats.migrationsObserved, "processed-feed observations"]
   ];
   $("#stats").innerHTML = cards.map(([label, value, note, cls = ""]) => `<div class="stat ${cls}"><label>${label}</label><strong>${nf.format(number(value))}</strong><small>${note}</small></div>`).join("");
 }
@@ -184,7 +186,7 @@ function emptyTape() {
 
 function renderTokens() {
   const tokens = rankedTokens().slice(0, 15);
-  $("#ranking-kicker").textContent = state.mode === "live" ? "REAL-MINT RANKING" : "SIMULATED RANKING";
+  $("#ranking-kicker").textContent = state.mode === "live" ? "REAL-MINT OBSERVATIONS" : "SIMULATED RANKING";
   if (!tokens.length) {
     $("#tokens").innerHTML = emptyTape();
     return;
@@ -192,13 +194,13 @@ function renderTokens() {
   $("#tokens").innerHTML = tokens.map((token) => {
     const momentum = hasNumber(token.momentum) ? number(token.momentum) : "—";
     const change = hasNumber(token.priceChange5m) ? `${number(token.priceChange5m) >= 0 ? "+" : ""}${Math.round(number(token.priceChange5m))}%` : "—";
-    const progress = Math.max(0, Math.min(100, number(token.bondingProgress)));
+    const virtualSolReserve = hasNumber(token.curveSol) ? Math.max(0, number(token.curveSol)) : null;
     const symbol = String(token.symbol || "??");
     return `<div class="token-row" data-mint="${esc(token.mint)}">
       <div class="coin"><div class="coin-icon">${esc(symbol.slice(0, 2))}</div><div class="coin-name"><strong>${esc(token.name || "Unnamed mint")}</strong><span>${esc(symbol)} · ${esc(shortMint(token.mint))} · ${esc(token.narrative || "Unclassified")}</span></div></div>
-      <div class="score">${momentum}<small>/100</small></div>
-      <div class="metric">${money(token.volume5m)}<small>${change}</small></div>
-      <div class="metric">${Math.round(progress)}%<div class="progress"><i style="width:${progress}%"></i></div></div>
+      <div class="score">${momentum}${momentum === "—" ? "" : "<small>/100</small>"}</div>
+      <div class="metric">${hasNumber(token.volume5m) ? money(token.volume5m) : "—"}<small>${change}</small></div>
+      <div class="metric">${virtualSolReserve === null ? "—" : `${nf.format(virtualSolReserve)} SOL`}<small>${virtualSolReserve === null ? "unavailable" : "processed feed"}</small></div>
       <div class="score ${riskClass(token.risk)}">${riskLabel(token)}<small>${esc(riskConfidence(token))}</small></div>
     </div>`;
   }).join("");
@@ -227,8 +229,17 @@ function leaderboardEntries() {
     const haystack = `${token.name || ""} ${token.symbol || ""} ${token.mint || ""}`.toLowerCase();
     return (!query || haystack.includes(query)) && (freshness === "all" || entry.freshness?.state === freshness) && (risk === "all" || entry.riskConfidence === risk);
   });
-  const value = (entry) => lens === "momentum" ? number(entry.token?.momentum, -1) : lens === "newest" ? (parseTime(entry.token?.createdAt) || 0) : lens === "curve" ? number(entry.token?.bondingProgress, -1) : number(entry.score, -1);
-  return filtered.sort((a, b) => value(b) - value(a) || number(a.rank) - number(b.rank));
+  return filtered.sort((a, b) => {
+    if (lens === "radar") {
+      const leftScored = hasNumber(a.score);
+      const rightScored = hasNumber(b.score);
+      if (leftScored !== rightScored) return rightScored - leftScored;
+      if (leftScored && number(a.score) !== number(b.score)) return number(b.score) - number(a.score);
+      return (parseTime(b.token?.createdAt) || 0) - (parseTime(a.token?.createdAt) || 0) || number(a.rank) - number(b.rank);
+    }
+    const value = (entry) => lens === "momentum" ? number(entry.token?.momentum, -1) : (parseTime(entry.token?.createdAt) || 0);
+    return value(b) - value(a) || number(a.rank) - number(b.rank);
+  });
 }
 
 function renderLeaderboard() {
@@ -250,7 +261,7 @@ function renderLeaderboard() {
     return `<button type="button" class="leaderboard-row" data-mint="${esc(token.mint)}" aria-label="Open ${esc(token.name || symbol)} details">
       <span class="leaderboard-rank">${number(entry.rank)}</span>
       <span class="leaderboard-asset"><i>${esc(symbol.slice(0, 2))}</i><span><b>${esc(token.name || "Unnamed mint")} <em>${esc(symbol)}</em></b><small>${esc(shortMint(token.mint))} · ${esc(reason)}</small></span></span>
-      <span class="leaderboard-score"><b>${number(entry.score).toFixed(1)}</b><small>/100</small></span>
+      <span class="leaderboard-score"><b>${hasNumber(entry.score) ? number(entry.score).toFixed(1) : "—"}</b><small>${hasNumber(entry.score) ? "/100" : "RECENCY"}</small></span>
       <span class="freshness ${esc(entry.freshness?.state || "unverified")}">${esc(entry.freshness?.state || "unverified")}<small>${entry.freshness?.ageSeconds === null ? "—" : ago(entry.freshness?.observedAt)}</small></span>
       <span class="confidence ${esc(entry.riskConfidence || "unverified")}">${esc(entry.riskConfidence || "unverified")}</span>
       ${outcomeCell(entry, "5m")}${outcomeCell(entry, "1h")}${outcomeCell(entry, "24h")}
@@ -263,6 +274,61 @@ function signedPct(value) {
   if (!hasNumber(value)) return "—";
   const rounded = Math.round(number(value) * 10) / 10;
   return `${rounded > 0 ? "+" : ""}${rounded}%`;
+}
+
+function renderRiskIntelligence() {
+  const risk = state.riskIntelligence && typeof state.riskIntelligence === "object" ? state.riskIntelligence : {};
+  const engine = risk.engine && typeof risk.engine === "object" ? risk.engine : {};
+  const syntheticDemo = state.mode === "demo";
+  $("#risk-engine-state").textContent = String(engine.status || (state.mode === "live" ? "acquiring" : "disabled")).toUpperCase();
+  const summary = risk.summary && typeof risk.summary === "object" ? risk.summary : {};
+  const total = number(summary.totalTracked ?? risk.coverage?.stateCount);
+  const ratio = (value) => total ? `${nf.format(number(value))}/${nf.format(total)}` : "0/0";
+  const cards = syntheticDemo ? [
+    ["SYNTHETIC HOLDER DEMO", ratio(summary.holderEvidenceCount), "Synthetic demonstration distribution; not a provider observation", summary.holderEvidenceCount],
+    ["SYNTHETIC DEVELOPER DEMO", ratio(summary.developerEvidenceCount), "Synthetic demonstration percentage; no creator identity claim", summary.developerEvidenceCount],
+    ["SYNTHETIC IDENTITY DEMO", nf.format(number(summary.exactDuplicateTokenCount)), "Synthetic demonstration reuse only; no control or fraud claim", summary.exactDuplicateTokenCount],
+    ["SYNTHETIC HISTORY DEMO", ratio(summary.identityHistoryCount), "Synthetic demonstration history; not an observed launch cohort", summary.identityHistoryCount],
+    ["SYNTHETIC RESERVE DEMO", ratio(summary.liquidityEvidenceCount), "No provider reserve is acquired in demo mode", summary.liquidityEvidenceCount],
+    ["SYNTHETIC CURVE DEMO", ratio(summary.curveEvidenceCount), "Synthetic demonstration value; not processed-feed evidence", summary.curveEvidenceCount]
+  ] : [
+    ["HOLDER DISTRIBUTION", ratio(summary.holderEvidenceCount), "GeckoTerminal-reported count + top-10 percentage", summary.holderEvidenceCount],
+    ["DEVELOPER HOLDING", ratio(summary.developerEvidenceCount), "Provider-reported address/percentage; creator identity unverified", summary.developerEvidenceCount],
+    ["EXACT IDENTITY REUSE", nf.format(number(summary.exactDuplicateTokenCount)), "Exact declared social or registrable-domain reuse; control unknown", summary.exactDuplicateTokenCount],
+    ["OBSERVED HISTORY", ratio(summary.identityHistoryCount), "Prospective declared-creator or deployer launches in this deployment", summary.identityHistoryCount],
+    ["POOL RESERVE", ratio(summary.liquidityEvidenceCount), "Provider-observed reserve; not locked-liquidity evidence", summary.liquidityEvidenceCount],
+    ["VIRTUAL SOL RESERVE", ratio(summary.curveEvidenceCount), "Processed-feed vSolInBondingCurve; not curve progress or migration proof", summary.curveEvidenceCount]
+  ];
+  $("#risk-factor-summary").innerHTML = cards.map(([label, value, note, observed]) => `<article class="risk-factor-card ${number(observed) ? "observed" : "waiting"}"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
+  const coverage = risk.coverage && typeof risk.coverage === "object" ? risk.coverage : {};
+  $("#risk-coverage").textContent = syntheticDemo
+    ? `${nf.format(total)} SYNTHETIC DEMO records · no provider acquisition or feed verification`
+    : `${nf.format(number(coverage.successCount))}/${nf.format(number(coverage.stateCount))} normalized provider records · ${nf.format(number(summary.migrationObservationCount))} processed-feed migration observations`;
+  const cohort = risk.cohort && typeof risk.cohort === "object" ? risk.cohort : {};
+  const observations = Array.isArray(cohort.observations) ? cohort.observations : [];
+  $("#risk-cohort-scope").textContent = syntheticDemo
+    ? `${nf.format(number(cohort.admittedCount))} SYNTHETIC DEMO rows · no provider cohort admission`
+    : `${nf.format(number(cohort.admittedCount))}/${nf.format(number(cohort.limit, 120))} admitted independently from the outcome cohort`;
+  $("#risk-cohort").innerHTML = observations.length ? observations.slice(0, 12).map((observation) => {
+    const factors = observation.riskIdentity?.factors || {};
+    const concentration = factors.concentration || {};
+    const developer = factors.developer || {};
+    const liquidity = factors.liquidity || {};
+    const identity = factors.identity || {};
+    const status = observation.riskIdentity?.providerObservation?.sourceStatus || observation.riskIdentity?.overallEvidence || "unavailable";
+    const evidence = [
+      hasNumber(concentration.top10Percentage) ? `TOP10 ${number(concentration.top10Percentage).toFixed(1)}%` : null,
+      hasNumber(developer.holdingPercentage) ? `DEV ${number(developer.holdingPercentage).toFixed(2)}%` : null,
+      hasNumber(liquidity.liquidityUsd) ? `RESERVE ${money(liquidity.liquidityUsd)}` : null,
+      hasNumber(identity.exactDuplicateCount) ? `REUSE ${nf.format(number(identity.exactDuplicateCount))}` : null
+    ].filter(Boolean).join(" · ") || `EVIDENCE ${String(status).toUpperCase()}`;
+    const displayEvidence = syntheticDemo ? `SYNTHETIC DEMO · ${evidence}` : evidence;
+    const timingLabel = syntheticDemo ? "synthetic launch" : "observed";
+    return `<button type="button" class="risk-cohort-row" data-risk-mint="${esc(observation.mint)}"><span><b>${esc(observation.name || "Unnamed mint")}</b><small>${esc(observation.symbol || "??")} · ${esc(shortMint(observation.mint))}</small></span><span><b>${esc(displayEvidence)}</b><small>${timingLabel} ${esc(observation.createdAt || "—")}</small></span></button>`;
+  }).join("") : syntheticDemo
+    ? '<div class="risk-cohort-empty">SYNTHETIC DEMO has no rows; no provider cohort admission is implied.</div>'
+    : '<div class="risk-cohort-empty">The independent v0.7 cohort admits new feed observations while the worker is active; no historical backfill is implied.</div>';
+  document.querySelectorAll(".risk-cohort-row").forEach((row) => row.addEventListener("click", () => openToken(row.dataset.riskMint)));
 }
 
 function renderOutcomes() {
@@ -304,14 +370,51 @@ function outcomeDetail(entry) {
   return `<div class="outcome-detail"><span class="kicker">PROVIDER-OBSERVED OUTCOMES // SOURCE EVIDENCE</span><p>${esc(baseline)}. Each horizon freezes its first derived value from a baseline and target returned together in that provider refresh; calculated timestamps disclose independently observed provider revisions. Returns never interpolate gaps.</p><div class="outcome-detail-grid">${rows}</div></div>`;
 }
 
+function riskIdentityDetail(token) {
+  const identity = token?.riskIdentity && typeof token.riskIdentity === "object" ? token.riskIdentity : {};
+  const factors = identity.factors && typeof identity.factors === "object" ? identity.factors : {};
+  const concentration = factors.concentration || {};
+  const developer = factors.developer || {};
+  const creator = factors.creatorHistory || {};
+  const duplicate = factors.identity || {};
+  const liquidity = factors.liquidity || {};
+  const curve = factors.curve || {};
+  const lifecycle = factors.lifecycle || {};
+  const holderValue = hasNumber(concentration.top10Percentage) ? `${number(concentration.top10Percentage).toFixed(1)}% top 10` : "—";
+  const developerValue = hasNumber(developer.holdingPercentage) ? `${number(developer.holdingPercentage).toFixed(2)}%` : "—";
+  const historyValue = hasNumber(creator.observedLaunchCount) ? `${nf.format(number(creator.observedLaunchCount))} observed` : "—";
+  const duplicateValue = hasNumber(duplicate.exactDuplicateCount) ? `${nf.format(number(duplicate.exactDuplicateCount))} exact` : "—";
+  const liquidityValue = hasNumber(liquidity.liquidityUsd) ? money(liquidity.liquidityUsd) : "—";
+  const curveValue = hasNumber(curve.virtualSolReserve) ? `${nf.format(number(curve.virtualSolReserve))} virtual SOL` : "—";
+  const migrationValue = lifecycle.migrationObserved ? "FEED OBSERVED" : "—";
+  const acquisition = concentration.sourceStatus
+    ? `${concentration.sourceStatus}${concentration.missingReasonCode ? `/${concentration.missingReasonCode}` : ""} · attempted ${concentration.lastAttemptAt || "—"} · next ${concentration.nextAttemptAt || "—"}`
+    : null;
+  const rows = [
+    ["Concentration", holderValue, `${concentration.evidenceClass || "unavailable"} · ${hasNumber(concentration.holderCount) ? nf.format(number(concentration.holderCount)) + " holders" : "holder count unknown"} · provider updated ${concentration.providerUpdatedAt || "—"} · fetched ${concentration.fetchedAt || "—"}${acquisition ? ` · ${acquisition}` : ""}`],
+    ["Developer holding", developerValue, `${developer.evidenceClass || "unavailable"} · fetched ${developer.fetchedAt || "—"} · not verified creator identity`],
+    ["Observed history", historyValue, `${creator.evidenceClass || "unavailable"} · ${creator.role || "identity unavailable"} · calculated ${creator.calculatedAt || "—"} · ${creator.scope || "prospective scope unavailable"}`],
+    ["Identity reuse", duplicateValue, `${duplicate.evidenceClass || "unavailable"} · name/symbol collision ${hasNumber(duplicate.nameSymbolCollisionCount) ? nf.format(number(duplicate.nameSymbolCollisionCount)) : "—"} (low confidence) · calculated ${duplicate.calculatedAt || "—"} · ${duplicate.scope || "scope unavailable"}`],
+    ["Pool reserve", liquidityValue, `${liquidity.evidenceClass || "unavailable"} · ${liquidity.missingReasonCode || "observed"} · timestamp ${liquidity.observedAt || liquidity.lastAttemptAt || "—"} · not locked or launch-time liquidity`],
+    ["Virtual SOL reserve", curveValue, `${curve.evidenceClass || "unavailable"} · create transaction SOL ${hasNumber(curve.launchSolAmount) ? nf.format(number(curve.launchSolAmount)) : "—"} · observed ${curve.observedAt || "—"} · neither proves curve progress or migration`],
+    ["Migration", migrationValue, `${lifecycle.evidenceClass || "unavailable"} · observed ${lifecycle.observedAt || "—"} · processed feed is not finalized proof`]
+  ].map(([label, value, note]) => `<div><b>${esc(label)}</b><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
+  const missing = Array.isArray(identity.missing) && identity.missing.length ? ` Explicit unknowns: ${identity.missing.join(", ")}.` : "";
+  return `<div class="risk-detail"><span class="kicker">RISK + IDENTITY FACTORS // ${esc(identity.overallEvidence || "unavailable")}</span><p>No composite risk probability is published and these factors do not affect rank. Exact declared-social or registrable-domain matches establish identifier reuse only—not duplicate content; likely controller and maliciousness remain unknown.${esc(missing)}</p><div class="risk-detail-grid">${rows}</div></div>`;
+}
+
 function narrativeRows() {
   return Object.values(rankedTokens().reduce((rows, token) => {
     const name = token.narrative || "Unclassified";
-    const row = rows[name] ||= { name, coins: 0, volume: 0 };
+    const row = rows[name] ||= { name, coins: 0, volume: null, volumeEvidenceCount: 0 };
     row.coins += 1;
-    row.volume += number(token.volume5m);
+    if (hasNumber(token.volume5m) && number(token.volume5m) >= 0) {
+      row.volume = (row.volume ?? 0) + number(token.volume5m);
+      row.volumeEvidenceCount++;
+    }
     return rows;
-  }, {})).sort((a, b) => b.volume - a.volume);
+  }, {})).sort((a, b) => b.volumeEvidenceCount - a.volumeEvidenceCount
+    || number(b.volume) - number(a.volume) || b.coins - a.coins || a.name.localeCompare(b.name));
 }
 
 function renderNarratives() {
@@ -320,8 +423,14 @@ function renderNarratives() {
     $("#narratives").innerHTML = '<div class="rail-empty">No real-mint narrative clusters yet.</div>';
     return;
   }
-  const max = Math.max(...narratives.map((narrative) => narrative.volume), 1);
-  $("#narratives").innerHTML = narratives.map((narrative) => `<div class="narrative"><div class="narrative-top"><span>${esc(narrative.name)}</span><span>${narrative.coins} coins · ${money(narrative.volume)}</span></div><div class="bar"><i style="width:${Math.max(5, narrative.volume / max * 100)}%"></i></div></div>`).join("");
+  const measuredVolumes = narratives.filter((narrative) => narrative.volumeEvidenceCount > 0).map((narrative) => narrative.volume);
+  const max = Math.max(...measuredVolumes, 1);
+  $("#narratives").innerHTML = narratives.map((narrative) => {
+    const measured = narrative.volumeEvidenceCount > 0;
+    const volume = measured ? money(narrative.volume) : "volume —";
+    const width = measured ? Math.max(5, narrative.volume / max * 100) : 0;
+    return `<div class="narrative"><div class="narrative-top"><span>${esc(narrative.name)}</span><span>${narrative.coins} coins · ${volume}</span></div><div class="bar"><i style="width:${width}%"></i></div></div>`;
+  }).join("");
 }
 
 function renderAlerts() {
@@ -519,6 +628,7 @@ function render() {
   renderFeedObservability();
   renderStats();
   renderLeaderboard();
+  renderRiskIntelligence();
   renderOutcomes();
   renderTokens();
   renderCallouts();
@@ -542,7 +652,8 @@ async function refresh() {
       narratives: Array.isArray(snapshot.narratives) ? snapshot.narratives : [],
       stats: snapshot.stats && typeof snapshot.stats === "object" ? snapshot.stats : {},
       leaderboard: snapshot.leaderboard && typeof snapshot.leaderboard === "object" ? snapshot.leaderboard : { top100: [] },
-      outcomes: snapshot.outcomes && typeof snapshot.outcomes === "object" ? snapshot.outcomes : {}
+      outcomes: snapshot.outcomes && typeof snapshot.outcomes === "object" ? snapshot.outcomes : {},
+      riskIntelligence: snapshot.riskIntelligence && typeof snapshot.riskIntelligence === "object" ? snapshot.riskIntelligence : {}
     };
     snapshotFailed = false;
     render();
@@ -561,18 +672,13 @@ function openToken(mint) {
   const leaderboardEntry = Array.isArray(state.leaderboard?.top100) ? state.leaderboard.top100.find((entry) => entry.token?.mint === mint) : null;
   const confidence = riskConfidence(token);
   const momentum = [];
-  const risks = [];
-  if (number(token.volume5m) > 7000) momentum.push("5m volume acceleration");
-  if (number(token.uniqueBuyers) >= 18) momentum.push("broad buyer participation");
+  if (hasNumber(token.volume5m) && number(token.volume5m) > 7000) momentum.push("5m volume acceleration");
+  if (hasNumber(token.uniqueBuyers) && number(token.uniqueBuyers) >= 18) momentum.push("broad buyer participation");
   if (hasNumber(token.buyRatio) && number(token.buyRatio) >= .64) momentum.push("buy-side pressure");
-  if (number(token.bondingProgress) >= 75) momentum.push("approaching graduation");
-  if (number(token.devHoldingPct) >= 12) risks.push("elevated dev holdings");
-  if (number(token.top10Pct) >= 50) risks.push("holder concentration");
-  if (hasNumber(token.buyRatio) && number(token.buyRatio) < .43) risks.push("sell-side pressure");
-  if (token.creatorRisk) risks.push("creator history flag");
+  if (hasNumber(token.bondingProgress) && number(token.bondingProgress) >= 75) momentum.push("approaching migration");
   $("#token-detail").innerHTML = `<div class="detail"><span class="kicker">${esc(token.narrative || "Unclassified")} // ${esc(token.status || "observed")}</span><h2>${esc(token.name || "Unnamed mint")} <span class="risk-low">${esc(token.symbol || "??")}</span></h2><div class="mint">${esc(token.mint)}</div>
-    <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? number(token.momentum) : "—"}/100</strong></div><div class="detail-card"><label>RISK · ${esc(confidence.toUpperCase())}</label><strong class="${riskClass(token.risk)}">${riskLabel(token)}${hasNumber(token.risk) ? "/100" : ""}</strong></div><div class="detail-card"><label>MARKET CAP</label><strong>${money(token.marketCap)}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${nf.format(number(token.uniqueBuyers))}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>SMART WALLETS</label><strong>${nf.format(number(token.smartWallets))}</strong></div></div>
-    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk read</strong><br>${esc((confidence === "unverified" ? ["awaiting holder, creator, and trade enrichment"] : risks.length ? risks : ["no major heuristic flags"]).join(" · "))}</div></div>${outcomeDetail(leaderboardEntry)}
+    <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>COMPOSITE RISK</label><strong class="risk-unverified">—</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>SMART WALLETS</label><strong>${hasNumber(token.smartWallets) ? nf.format(number(token.smartWallets)) : "—"}</strong></div></div>
+    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${riskIdentityDetail(token)}${outcomeDetail(leaderboardEntry)}
     <div class="detail-actions"><button class="primary" id="export-coin">EXPORT TO OBSIDIAN</button><a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
   $("#token-dialog").showModal();
   $("#export-coin").onclick = async () => {

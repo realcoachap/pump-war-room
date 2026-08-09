@@ -4,6 +4,8 @@ import { scoreReasons } from "./signals.js";
 
 const safeName = (value) => value.replace(/[\\/:*?"<>|]/g, "-").slice(0, 80);
 const yaml = (value) => JSON.stringify(value ?? "");
+const finite = (value) => typeof value === "number" && Number.isFinite(value);
+const integerOrUnknown = (value, suffix = "") => finite(value) ? `${Math.round(value).toLocaleString("en-US")}${suffix}` : "unknown";
 
 export function coinMarkdown(token, now = new Date()) {
   const reasons = scoreReasons(token);
@@ -15,34 +17,36 @@ created: ${yaml(token.createdAt)}
 updated: ${yaml(now.toISOString())}
 status: ${yaml(token.status)}
 narrative: ${yaml(token.narrative)}
-momentum_score: ${token.momentum}
-risk_score: ${token.risk}
-risk_confidence: ${yaml(token.riskConfidence || (token.source === "demo" ? "synthetic" : "unverified"))}
-market_cap_usd: ${Math.round(token.marketCap || 0)}
-bonding_progress: ${Math.round(token.bondingProgress || 0)}
+momentum_score: ${finite(token.momentum) ? Math.round(token.momentum) : "null"}
+risk_score: null
+risk_evidence: ${yaml(token.riskIdentity?.overallEvidence || token.riskConfidence || (token.source === "demo" ? "synthetic" : "unavailable"))}
+market_cap_usd: ${finite(token.marketCap) ? Math.round(token.marketCap) : "null"}
+bonding_progress: ${finite(token.bondingProgress) ? Math.round(token.bondingProgress) : "null"}
+virtual_sol_reserve: ${finite(token.curveSol) ? token.curveSol : "null"}
 ---
 
 # ${token.name} (${token.symbol})
 
-> Read-only research note. Scores are heuristics, not investment advice.
+> Read-only observational research, not investment advice or a safety claim.
 
 ## Snapshot
 
 - **Contract:** \`${token.mint}\`
 - **Creator:** \`${token.creator || "unknown"}\`
+- **Deployer/user:** \`${token.deployer || "unknown"}\`
 - **Status:** ${token.status}
 - **Narrative:** [[${token.narrative}]]
-- **Market cap:** $${Math.round(token.marketCap || 0).toLocaleString("en-US")}
-- **5m volume:** $${Math.round(token.volume5m || 0).toLocaleString("en-US")}
-- **Bonding curve:** ${Math.round(token.bondingProgress || 0)}%
+- **Market cap:** ${finite(token.marketCap) ? `$${integerOrUnknown(token.marketCap)}` : "unknown"}
+- **5m volume:** ${finite(token.volume5m) ? `$${integerOrUnknown(token.volume5m)}` : "unknown"}
+- **Virtual SOL reserve:** ${finite(token.curveSol) ? `${token.curveSol.toLocaleString("en-US")} SOL` : "unknown"} (processed-feed observation; not curve progress or migration proof)
 - **Pump.fun:** https://pump.fun/coin/${token.mint}
 - **DEX Screener:** https://dexscreener.com/solana/${token.mint}
 
 ## Signal explanation
 
-**Momentum ${token.momentum}/100:** ${reasons.momentum.join(", ")}.
+**Momentum ${finite(token.momentum) ? `${Math.round(token.momentum)}/100` : "unavailable"}:** ${reasons.momentum.join(", ")}.
 
-**Risk ${Number.isFinite(token.risk) ? `${token.risk}/100` : "unverified"} (${reasons.riskConfidence}):** ${reasons.risk.join(", ")}.
+**Risk probability withheld (${reasons.riskConfidence}):** ${reasons.risk.join(", ")}.
 
 ## Research timeline
 
@@ -50,7 +54,7 @@ bonding_progress: ${Math.round(token.bondingProgress || 0)}
 
 ## Human notes
 
-- Add verified context, social evidence, and eventual outcome here.
+- Add source-attributed context and eventual outcome evidence here.
 `;
 }
 
@@ -73,8 +77,11 @@ export async function exportDaily(vaultPath, snapshot, now = new Date()) {
   await mkdir(dir, { recursive: true });
   const date = now.toISOString().slice(0, 10);
   const pathName = path.join(dir, `${date} Pump Brief.md`);
-  const movers = snapshot.tokens.slice(0, 7).map((t, i) => `${i + 1}. [[${t.symbol} - ${t.mint.slice(0, 8)}]] — momentum ${t.momentum}, risk ${t.risk}`).join("\n");
-  const body = `---\ntype: pump-daily-brief\ndate: ${date}\nindexed: ${snapshot.stats.indexed}\nminted_today: ${snapshot.stats.mintedToday}\n---\n\n# Pump Brief — ${date}\n\n## Tape\n\n- Indexed: **${snapshot.stats.indexed.toLocaleString("en-US")}**\n- New today: **${snapshot.stats.mintedToday.toLocaleString("en-US")}**\n- Graduations: **${snapshot.stats.graduations.toLocaleString("en-US")}**\n\n## Movers\n\n${movers || "No signals yet."}\n\n## Analyst notes\n\n- Add conclusions after evidence review.\n`;
+  const movers = snapshot.tokens.slice(0, 7).map((t, i) => `${i + 1}. [[${t.symbol} - ${t.mint.slice(0, 8)}]] — momentum ${finite(t.momentum) ? t.momentum : "unknown"}, risk probability withheld`).join("\n");
+  const indexed = Number(snapshot.stats?.indexed || 0);
+  const mintedToday = Number(snapshot.stats?.mintedToday || 0);
+  const migrationsObserved = Number(snapshot.stats?.migrationsObserved || 0);
+  const body = `---\ntype: pump-daily-brief\ndate: ${date}\nindexed: ${indexed}\nminted_today: ${mintedToday}\n---\n\n# Pump Brief — ${date}\n\n## Tape\n\n- Indexed: **${indexed.toLocaleString("en-US")}**\n- New today: **${mintedToday.toLocaleString("en-US")}**\n- Processed-feed migration observations: **${migrationsObserved.toLocaleString("en-US")}**\n\n## Movers\n\n${movers || "No signals yet."}\n\n## Analyst notes\n\n- Add conclusions after evidence review.\n`;
   await writeFile(pathName, body, "utf8");
   return pathName;
 }

@@ -1,8 +1,8 @@
 # Pump War Room
 
-Current release: **v0.6.0**
+Current release: **v0.7.0**
 
-A read-only Pump.fun intelligence radar for OpenCaesar. It indexes activated onchain launches, ranks momentum and risk with inspectable heuristics, surfaces narrative velocity and graduations, emits Telegram-ready alerts, and exports curated notes to an Obsidian-compatible vault.
+A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, and exposes holder, liquidity, lifecycle, creator/deployer, and exact identity-reuse evidence without presenting an uncalibrated risk probability.
 
 ## Deploy to Railway
 
@@ -30,7 +30,7 @@ Re-run the restore drill on an existing artifact without touching `DB_PATH`:
 npm run db:restore:verify -- --backup /app/data/backups/pump-war-room-2026-08-08.db
 ```
 
-The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Exact v0.5.1/schema-501 artifacts remain drillable: the verifier proves the original copy, migrates only its disposable restore copy to schema 600, then runs the current application write probe without changing the artifact. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
+The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Exact v0.5.1/schema-501 and v0.6.0/schema-600 artifacts remain drillable: the verifier proves the original copy, migrates only its disposable restore copy to schema 700, then runs the current application write probe without changing the artifact. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
 
 ## Quick look
 
@@ -49,7 +49,9 @@ set -a && source .env && set +a
 npm run live
 ```
 
-Live mode subscribes once to PumpPortal's documented `subscribeNewToken` and `subscribeMigration` streams and stores every observed mint. Keep `WATCH_TRADES=false` until you intentionally accept the provider's trade-event pricing. `SOL_USD` can be supplied for approximate SOL-to-USD conversion.
+Live mode subscribes once to PumpPortal's documented `subscribeNewToken` and `subscribeMigration` streams and stores every observed mint. It does not subscribe to metered trade streams. Pump's declared creator and the transaction user/deployer are retained separately. The feed's `vSolInBondingCurve` is labeled virtual SOL reserve and `solAmount` is labeled create-transaction SOL amount; neither is relabeled as five-minute volume, curve progress, or migration proof.
+
+`SOL_USD` is optional. When absent, the app withholds a USD market-cap conversion instead of using a guessed exchange rate; when present, it labels the conversion as locally derived from the feed's SOL-denominated market cap and the operator-supplied rate.
 
 This MVP uses public onchain events. It does not scrape undocumented Pump.fun frontend endpoints.
 
@@ -73,6 +75,16 @@ The public [Terms of Use](/terms.html) and [Privacy Notice](/privacy.html) ident
 npm run outcomes:purge -- --provider geckoterminal --confirm DELETE-geckoterminal --database /app/data/pump-war-room.db
 ```
 
+### Risk and identity evidence
+
+v0.7.0 reuses the same singleton, conservatively paced GeckoTerminal client but maintains an independent fixed prospective risk cohort of at most 120 launches. It does not reuse or backfill the already-full v0.6 outcome cohort: new PumpPortal observations are durably admitted while the v0.7 worker is active, with a 20-minute replay-age ceiling, and the dashboard keeps those cohort rows inspectable after they leave the latest-token tape. Token info is attempted no earlier than 15 minutes after launch. Missing or stale evidence gets at most one retry about one hour later; a weaker retry cannot erase stronger earlier factors. This is bounded one-time acquisition, not an ongoing freshness promise, so each factor's fetch/observation timestamp is authoritative. The provider contract is pinned to API version `20230203`. GeckoTerminal describes this public-beta data as not vetted by CoinGecko, so the UI says **provider observed**, never on-chain verified.
+
+The separate `risk_identity_enrichment` table retains only allowlisted scalars, minimal pool provenance, and domain-separated SHA-256 digests: holder count, GeckoTerminal-reported top-10 distribution, provider-reported developer holding, provider update/fetch times, a current provider-ranked page-1 pool reserve snapshot, and digests derived from normalized declared X, Telegram, registrable website-domain, and name/symbol values. The reserve is timestamped when fetched—never presented as launch-time liquidity—and is not locked-liquidity evidence. The normalized identifiers themselves are not retained. The ingestion parser rejects raw responses, descriptions, images, provider prices/volumes, opaque provider scores, honeypot labels, and unrecognized fields. Public snapshot rows expose factor values, bounded acquisition failure states, and duplicate counts, not stored digests, raw errors, or raw provider profiles. Provider purge removes both outcome and risk/identity rows before verified secure deletion and vacuuming.
+
+Exact matching is deliberately narrow: X and Telegram handles are case-folded; URLs use the WHATWG parser, IDNA normalization, and the open-source `tldts` public/private suffix list (`allowPrivateDomains: true`) to compare registrable domains; names and symbols use NFKC/case-fold normalization. The headline identity-reuse count includes only exact declared X, Telegram, or registrable-domain matches. Name/symbol collisions are disclosed separately as low-confidence content warnings. Equality proves identifier or registrable-domain reuse only, not duplicate content. It does **not** establish a shared controller, fraud, maliciousness, or safety. Creator/deployer-user history counts only launches observed prospectively in the fixed cohort by this deployment and identifies which role was counted; it is not an all-time chain history. A provider developer address contributes only when it exactly matches an observed creator/deployer identity. Provider-reported developer holding is not verified creator identity. Top-10 methodology and custody exclusions are unpublished and may include curve or liquidity custody. GeckoTerminal pool reserve is shown as provider-observed reserve, not locked liquidity.
+
+Evidence classes are explicit: `on-chain-finalized`, `provider-observed`, `feed-observed-processed`, `locally-derived`, and `unavailable`. A PumpPortal migration frame is labeled processed-feed evidence and no longer forces 100% curve progress or a finalized graduation claim. Missing factors stay unknown. v0.7.0 publishes no probability-like composite risk score and makes no risk-based leaderboard adjustment because no labeled holdout calibration exists.
+
 ## Pump.fun Callouts
 
 Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter connects to Bark's documented `wss://news.bark.gg/ws`, accepts only `PUMPFUN_CALLOUT` events, persists them by external event ID, and surfaces third-party provenance in the dashboard. Without a key, the rest of the War Room continues normally and the panel remains explicitly disabled. No Pump.fun JWT, wallet connection, or undocumented frontend scraping is used.
@@ -88,13 +100,13 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 - Provider-observed outcome evidence for 5m/15m/1h/6h/24h, with fixed-pool provenance, completed-candle timestamps, explicit missing reasons, hit rate, median return, observed-close drawdown, and narrative/lifecycle cohorts
 - Conservative GeckoTerminal rate pacing, pinned API contract, visible GeckoTerminal/CoinGecko attribution, and derived-only persistence with raw candle retention disabled
 - Caesar Intel, a zero-cost in-app analyst grounded only in the current War Room snapshot, with evidence links and no execution capabilities
-- Top 100 Radar, scoped to coins observed by this War Room, with searchable ranking lenses, explicit freshness and risk confidence, and honest 5m/15m/1h/6h/24h outcome states
+- Top 100 Radar, scoped to coins observed by this War Room, with searchable ranking lenses, explicit freshness and evidence classes, and honest 5m/15m/1h/6h/24h outcome states
 - Mint counters for today, 60 minutes, and 15 minutes
-- Transparent momentum and risk scores—open `src/signals.js` to inspect the formula
+- Evidence scores are withheld when momentum and buyer breadth are unavailable; those rows are explicitly ordered by observation recency, while uncalibrated risk factors remain excluded from score and order
 - Mint fingerprints on every row so same-name launches cannot be mistaken for the same contract
-- Risk provenance labels: synthetic demo scores are marked, and unenriched live scores remain unverified instead of implying false precision
+- Provider-observed holder/developer evidence, locally derived exact-identity duplicate counts, prospective creator/deployer history, pool-reserve and feed-observed virtual-SOL evidence, and explicit unknowns
 - Optional real-time Pump.fun Callouts stream with caller, mint, callout price, multiple, max price, and market cap
-- Graduation, velocity, wallet-convergence, and risk alerts
+- Processed-feed migration observations plus threshold alerts only when their underlying numeric input is actually available; material factor-change alerts remain a v0.8 target
 - Optional Telegram delivery with `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 - Coin dossiers, narrative pages, and daily briefs exported under `vault/`
 - Mobile and desktop command-center UI
@@ -106,7 +118,7 @@ Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter 
 - `GET /api/health`
 - `GET /api/snapshot`
 
-The snapshot includes versioned `leaderboard` and `outcomes` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns.
+The snapshot includes versioned `leaderboard`, `outcomes`, and `riskIntelligence` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability.
 - `GET /api/stream` (server-sent events)
 - `POST /api/agent/chat` with JSON `{ "question": "What is moving?" }`
 - `POST /api/export/daily`
@@ -117,18 +129,18 @@ The snapshot includes versioned `leaderboard` and `outcomes` envelopes. In live 
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.6.0 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.7.0 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.
 
 ## Safety boundary
 
-There is no wallet connection, private-key handling, trade execution, token creation, funding, liquidity, or automated promotion code. Caesar Intel has no tools or external model access and can only summarize the bounded snapshot supplied by the server. Scores and analyst responses are research heuristics—not financial advice or a recommendation to trade.
+There is no wallet connection, private-key handling, trade execution, token creation, funding, liquidity action, or automated promotion code. Caesar Intel has no tools or external model access and can only summarize the bounded snapshot supplied by the server. Rankings, factors, outcomes, and analyst responses are observational research—not financial advice, safety claims, or a recommendation to trade.
 
 ## Known MVP limits
 
 - “Total indexed” means the count this local database has observed; exact all-time Pump.fun totals require a historical index/backfill provider.
-- Demo data is synthetic and labeled. Live trade acceleration requires `WATCH_TRADES=true` or a separate documented market-data feed.
+- Demo data is synthetic and labeled. Live trade acceleration requires a separately reviewed documented market-data feed; creation frames do not contain a five-minute traded-volume window.
 - GeckoTerminal indexing and candles are provider-observed public-beta evidence, not an immutable archive or price guarantee. A missing pool or candle stays missing.
-- Holder concentration, creator history, and smart-wallet labels need Helius/Bitquery or another verified enrichment source before they are production signals.
+- GeckoTerminal holder/developer fields are provider observations with unpublished methodology, not finalized on-chain proofs. Exact full holder aggregation, creator-event history, and finalized migration validation require an approved production Solana RPC/indexer and pinned program decoders.

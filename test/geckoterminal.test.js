@@ -48,7 +48,6 @@ test("selects the first prospectively provider-ranked eligible pool and records 
     providerPage: 1,
     providerRank: 2,
     reserveUsd: 12000,
-    volume24hUsd: 3400,
     sourceUrl: `https://www.geckoterminal.com/solana/pools/${pool}`
   });
 });
@@ -190,6 +189,74 @@ test("client validates bounds before contacting the provider", async () => {
   await assert.rejects(client.ohlcv({ mint, pool, tokenSide: "base", limit: 1001 }), /between 1 and 1000/);
   await assert.rejects(client.ohlcv({ mint, pool, tokenSide: "wrong", limit: 1 }), /base or quote/);
   assert.equal(calls, 0);
+});
+
+test("client requests documented token-info through the shared pinned-version queue", async () => {
+  const requests = [];
+  const payload = { data: { id: `solana_${mint}`, type: "token", attributes: { address: mint } } };
+  const client = new GeckoTerminalClient({
+    minIntervalMs: 0,
+    timeoutMs: 500,
+    fetchImpl: async (url, options) => {
+      requests.push({ url: String(url), options });
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => payload };
+    }
+  });
+  assert.equal(await client.tokenInfo(mint), payload);
+  assert.match(requests[0].url, new RegExp(`/networks/solana/tokens/${mint}/info$`));
+  assert.equal(requests[0].options.headers.accept, "application/json;version=20230203");
+});
+
+test("client exposes a timestamped current pool snapshot without a launch-time selection claim", async () => {
+  const requests = [];
+  const now = Date.parse("2026-08-09T12:15:00Z");
+  const client = new GeckoTerminalClient({
+    now: () => now,
+    minIntervalMs: 0,
+    timeoutMs: 500,
+    fetchImpl: async (url) => {
+      requests.push(String(url));
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ data: [poolRow({ createdAt: "2026-08-08T10:00:30Z" })] }) };
+    }
+  });
+  const selection = await client.currentPoolForToken(mint);
+  assert.equal(selection.reserveUsd, 12_000);
+  assert.equal(selection.poolSelectedAt, "2026-08-09T12:15:00.000Z");
+  assert.match(requests[0], new RegExp(`/networks/solana/tokens/${mint}/pools\\?page=1&sort=h24_volume_usd_liquidity_desc$`));
+});
+
+test("shared pacing prioritizes prospective pool selection ahead of queued token info", async () => {
+  let now = 1_000;
+  let releaseFirst;
+  let calls = 0;
+  const paths = [];
+  const client = new GeckoTerminalClient({
+    now: () => now,
+    sleep: async (milliseconds) => { now += milliseconds; },
+    minIntervalMs: 6_500,
+    timeoutMs: 500,
+    fetchImpl: async (url) => {
+      paths.push(new URL(url).pathname);
+      calls++;
+      if (calls === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+      const isPool = new URL(url).pathname.endsWith("/pools");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => isPool ? { data: [poolRow()] } : { data: { id: `solana_${mint}`, type: "token", attributes: { address: mint } } }
+      };
+    }
+  });
+  const firstInfo = client.tokenInfo(mint);
+  await new Promise((resolve) => setImmediate(resolve));
+  const queuedInfo = client.tokenInfo(mint);
+  const urgentSelection = client.poolForToken(mint);
+  releaseFirst();
+  await Promise.all([firstInfo, queuedInfo, urgentSelection]);
+  assert.match(paths[0], /\/info$/);
+  assert.match(paths[1], /\/pools$/);
+  assert.match(paths[2], /\/info$/);
 });
 
 test("a provider Retry-After pauses the shared request stream, not only one token", async () => {

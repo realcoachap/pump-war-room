@@ -3,6 +3,7 @@ const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_MIN_INTERVAL_MS = 6_500;
 const PROVIDER_VERSION = "20230203";
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const REQUEST_PRIORITY = Object.freeze({ poolSelection: 0, outcome: 1, tokenInfo: 2 });
 
 export const GECKOTERMINAL_PROVIDER = Object.freeze({
   id: "geckoterminal",
@@ -100,7 +101,6 @@ export function selectGeckoTerminalPool(payload, mintValue, {
       if (createdTimestamp < observedTimestamp - clockSkewMs || createdTimestamp > observedTimestamp + maxPoolCreationDelayMs) return [];
     }
     const reserveUsd = finite(row.attributes?.reserve_in_usd);
-    const volume24hUsd = finite(row.attributes?.volume_usd?.h24);
     return [{
       provider: GECKOTERMINAL_PROVIDER.id,
       network: GECKOTERMINAL_PROVIDER.network,
@@ -112,7 +112,6 @@ export function selectGeckoTerminalPool(payload, mintValue, {
       providerPage: 1,
       providerRank: rank + 1,
       reserveUsd: reserveUsd !== null && reserveUsd >= 0 ? reserveUsd : null,
-      volume24hUsd: volume24hUsd !== null && volume24hUsd >= 0 ? volume24hUsd : null,
       sourceUrl: `https://www.geckoterminal.com/solana/pools/${address}`
     }];
   });
@@ -199,7 +198,7 @@ export class GeckoTerminalClient {
     minIntervalMs = DEFAULT_MIN_INTERVAL_MS,
     now = () => Date.now(),
     sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
-    userAgent = "PumpWarRoom/0.6.0 (+https://pump-war-room-production.up.railway.app)"
+    userAgent = "PumpWarRoom/0.7.0 (+https://pump-war-room-production.up.railway.app)"
   } = {}) {
     if (typeof fetchImpl !== "function") throw new TypeError("fetchImpl must be a function");
     if (!Number.isFinite(timeoutMs) || timeoutMs < 100) throw new RangeError("timeoutMs must be at least 100");
@@ -212,58 +211,75 @@ export class GeckoTerminalClient {
     this.sleep = sleep;
     this.userAgent = userAgent;
     this.nextRequestAt = 0;
-    this.requestQueue = Promise.resolve();
+    this.pendingRequests = [];
+    this.requestSequence = 0;
+    this.drainingRequests = false;
   }
 
-  async #request(pathname, parameters = {}) {
-    const execute = async () => {
-      const delay = Math.max(0, this.nextRequestAt - this.now());
-      if (delay) await this.sleep(delay);
-      this.nextRequestAt = Math.max(this.nextRequestAt, this.now()) + this.minIntervalMs;
-      const url = new URL(`${this.baseUrl}${pathname}`);
-      for (const [name, value] of Object.entries(parameters)) {
-        if (value !== null && value !== undefined) url.searchParams.set(name, String(value));
+  #request(pathname, parameters = {}, priority = REQUEST_PRIORITY.outcome) {
+    return new Promise((resolve, reject) => {
+      this.pendingRequests.push({ pathname, parameters, priority, sequence: this.requestSequence++, resolve, reject });
+      this.#drainRequests();
+    });
+  }
+
+  async #drainRequests() {
+    if (this.drainingRequests) return;
+    this.drainingRequests = true;
+    try {
+      while (this.pendingRequests.length) {
+        const delay = Math.max(0, this.nextRequestAt - this.now());
+        if (delay) await this.sleep(delay);
+        this.pendingRequests.sort((left, right) => left.priority - right.priority || left.sequence - right.sequence);
+        const request = this.pendingRequests.shift();
+        this.nextRequestAt = Math.max(this.nextRequestAt, this.now()) + this.minIntervalMs;
+        try { request.resolve(await this.#executeRequest(request.pathname, request.parameters)); }
+        catch (error) { request.reject(error); }
       }
-      let response;
-      try {
-        response = await this.fetchImpl(url, {
-          headers: {
-            accept: `application/json;version=${PROVIDER_VERSION}`,
-            "user-agent": this.userAgent
-          },
-          signal: AbortSignal.timeout(this.timeoutMs)
-        });
-      } catch (error) {
-        const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
-        throw new GeckoTerminalError(timedOut ? "timeout" : "network-error", timedOut ? "GeckoTerminal request timed out" : "GeckoTerminal request failed", { cause: error });
+    } finally {
+      this.drainingRequests = false;
+      if (this.pendingRequests.length) this.#drainRequests();
+    }
+  }
+
+  async #executeRequest(pathname, parameters) {
+    const url = new URL(`${this.baseUrl}${pathname}`);
+    for (const [name, value] of Object.entries(parameters)) {
+      if (value !== null && value !== undefined) url.searchParams.set(name, String(value));
+    }
+    let response;
+    try {
+      response = await this.fetchImpl(url, {
+        headers: {
+          accept: `application/json;version=${PROVIDER_VERSION}`,
+          "user-agent": this.userAgent
+        },
+        signal: AbortSignal.timeout(this.timeoutMs)
+      });
+    } catch (error) {
+      const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+      throw new GeckoTerminalError(timedOut ? "timeout" : "network-error", timedOut ? "GeckoTerminal request timed out" : "GeckoTerminal request failed", { cause: error });
+    }
+    if (!response?.ok) {
+      const status = Number.isInteger(response?.status) ? response.status : null;
+      const retryAfterMs = retryAfterMilliseconds(response) ?? (status === 429 ? 60_000 : null);
+      if (retryAfterMs !== null && (status === 429 || status === 503)) {
+        this.nextRequestAt = Math.max(this.nextRequestAt, this.now() + retryAfterMs);
       }
-      if (!response?.ok) {
-        const status = Number.isInteger(response?.status) ? response.status : null;
-        const retryAfterMs = retryAfterMilliseconds(response) ?? (status === 429 ? 60_000 : null);
-        if (retryAfterMs !== null && (status === 429 || status === 503)) {
-          this.nextRequestAt = Math.max(this.nextRequestAt, this.now() + retryAfterMs);
-        }
-        const code = status === 429 ? "rate-limited"
-          : status === 404 ? "not-found"
-            : status === 408 || (status !== null && status >= 500) ? "provider-unavailable"
-              : [400, 401, 403, 422].includes(status) ? "provider-request-rejected"
-                : "provider-http-error";
-        throw new GeckoTerminalError(code, `GeckoTerminal returned HTTP ${status ?? "unknown"}`, {
-          status,
-          retryAfterMs
-        });
-      }
-      try {
-        const payload = await response.json();
-        if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new TypeError("response was not an object");
-        return payload;
-      } catch (error) {
-        throw new GeckoTerminalError("invalid-json", "GeckoTerminal returned invalid JSON", { status: response.status, cause: error });
-      }
-    };
-    const pending = this.requestQueue.then(execute, execute);
-    this.requestQueue = pending.catch(() => {});
-    return pending;
+      const code = status === 429 ? "rate-limited"
+        : status === 404 ? "not-found"
+          : status === 408 || (status !== null && status >= 500) ? "provider-unavailable"
+            : [400, 401, 403, 422].includes(status) ? "provider-request-rejected"
+              : "provider-http-error";
+      throw new GeckoTerminalError(code, `GeckoTerminal returned HTTP ${status ?? "unknown"}`, { status, retryAfterMs });
+    }
+    try {
+      const payload = await response.json();
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new TypeError("response was not an object");
+      return payload;
+    } catch (error) {
+      throw new GeckoTerminalError("invalid-json", "GeckoTerminal returned invalid JSON", { status: response.status, cause: error });
+    }
   }
 
   async poolForToken(mintValue, options = {}) {
@@ -271,10 +287,26 @@ export class GeckoTerminalClient {
     const payload = await this.#request(`/networks/solana/tokens/${encodeURIComponent(mint)}/pools`, {
       page: 1,
       sort: "h24_volume_usd_liquidity_desc"
-    });
+    }, REQUEST_PRIORITY.poolSelection);
     return selectGeckoTerminalPool(payload, mint, {
       ...options,
       poolSelectedAt: options.poolSelectedAt ?? new Date(this.now()).toISOString()
+    });
+  }
+
+  async tokenInfo(mintValue) {
+    const mint = requireMint(mintValue);
+    return this.#request(`/networks/solana/tokens/${encodeURIComponent(mint)}/info`, {}, REQUEST_PRIORITY.tokenInfo);
+  }
+
+  async currentPoolForToken(mintValue) {
+    const mint = requireMint(mintValue);
+    const payload = await this.#request(`/networks/solana/tokens/${encodeURIComponent(mint)}/pools`, {
+      page: 1,
+      sort: "h24_volume_usd_liquidity_desc"
+    }, REQUEST_PRIORITY.tokenInfo);
+    return selectGeckoTerminalPool(payload, mint, {
+      poolSelectedAt: new Date(this.now()).toISOString()
     });
   }
 
@@ -291,7 +323,7 @@ export class GeckoTerminalClient {
       currency: "usd",
       token: mint,
       include_empty_intervals: false
-    });
+    }, REQUEST_PRIORITY.outcome);
     return parseGeckoTerminalOhlcv(payload, { mint, pool, tokenSide, fetchedAt: new Date(this.now()).toISOString() });
   }
 }

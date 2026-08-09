@@ -16,6 +16,10 @@ import { createRuntimeTelemetry, FEED_STALE_AFTER_MS, observeFeed, observeStorag
 import { GECKOTERMINAL_PROVIDER, GeckoTerminalClient } from "./geckoterminal.js";
 import { VerifiedOutcomeIngestor } from "./outcome-ingest.js";
 import { aggregateOutcomeCohorts, OUTCOME_REVISION_POLICY, summarizeVerifiedOutcomes, unavailableProviderOutcome, validateProviderObservedOutcome } from "./outcomes.js";
+import { RiskIdentityIngestor } from "./risk-ingest.js";
+import { RISK_IDENTITY_EVIDENCE_CLASSES } from "./risk-identity.js";
+import { attachRiskIdentityEvidence } from "./risk-public.js";
+import { normalizePersistedLiveToken } from "./live-token.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
@@ -50,6 +54,8 @@ let feedMessages = 0;
 let feedParseErrors = 0;
 let pumpPortalIngestor = null;
 let outcomeIngestor = null;
+let riskIdentityIngestor = null;
+let geckoTerminalClient = null;
 
 function feedObservation() {
   const telemetry = pumpPortalIngestor?.getStatus?.() || null;
@@ -93,7 +99,9 @@ const send = (kind, payload) => {
 
 function alertFor(token, previous) {
   let alert = null;
-  if (token.status === "graduated" && previous?.status !== "graduated") {
+  if (token.status === "migration-observed" && previous?.status !== "migration-observed") {
+    alert = { level: "hot", title: "Migration observed", message: `${token.symbol} appeared in the processed migration feed; finalization is unverified`, mint: token.mint };
+  } else if (token.status === "graduated" && previous?.status !== "graduated") {
     alert = { level: "hot", title: "Graduated", message: `${token.symbol} reached migration`, mint: token.mint };
   } else if (token.momentum >= 78 && (!previous || previous.momentum < 78)) {
     alert = { level: "signal", title: "Velocity spike", message: `${token.symbol} momentum crossed ${token.momentum}`, mint: token.mint };
@@ -125,6 +133,7 @@ function upsert(token) {
   const previous = store.token(token.mint);
   store.upsertToken(token); store.addEvent(previous ? "update" : "mint", token);
   outcomeIngestor?.enqueue(token);
+  riskIdentityIngestor?.enqueue(token);
   alertFor(token, previous); send(previous ? "token-update" : "new-token", token);
 }
 
@@ -134,32 +143,81 @@ function addCallout(callout) {
   send("callout", callout);
 }
 
+function normalizeLiveToken(token) {
+  return normalizePersistedLiveToken(token, { mode });
+}
+
 function snapshot() {
   const generatedAt = new Date().toISOString();
   const callouts = store.callouts(200);
   const calloutCounts = callouts.reduce((counts, callout) => counts.set(callout.mint, (counts.get(callout.mint) || 0) + 1), new Map());
-  const tokens = store.tokens(120)
+  const latestTokens = store.tokens(120)
     .filter((token) => mode !== "live" || token.source === "pumpportal")
+    .map(normalizeLiveToken)
     .map((token) => ({ ...token, calloutCount: calloutCounts.get(token.mint) || 0 }))
     .sort((a, b) => b.momentum - a.momentum);
   const start = new Date(); start.setHours(0, 0, 0, 0);
   const hour = new Date(Date.now() - 3_600_000).toISOString();
   const fifteen = new Date(Date.now() - 900_000).toISOString();
-  const narratives = Object.values(tokens.reduce((acc, token) => {
-    const row = acc[token.narrative] ||= { name: token.narrative, coins: 0, volume: 0, momentum: 0 };
-    row.coins++; row.volume += token.volume5m || 0; row.momentum += token.momentum || 0;
-    return acc;
-  }, {})).map((row) => ({ ...row, momentum: Math.round(row.momentum / row.coins) })).sort((a, b) => b.volume - a.volume);
   const enrichmentStates = store.enrichmentStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
   const enrichmentByMint = new Map(enrichmentStates
     .map((state) => [state.mint, state]));
+  const riskIdentityStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+  const riskCohortTokens = mode === "demo" ? latestTokens : riskIdentityStates
+    .map(({ mint }) => normalizeLiveToken(store.token(mint)))
+    .filter((token) => token?.source === "pumpportal");
+  const combinedTokens = new Map(latestTokens.map((token) => [token.mint, token]));
+  for (const token of riskCohortTokens) {
+    if (!combinedTokens.has(token.mint)) combinedTokens.set(token.mint, {
+      ...token,
+      calloutCount: calloutCounts.get(token.mint) || 0
+    });
+  }
+  let tokens = [...combinedTokens.values()];
+  const riskView = attachRiskIdentityEvidence(tokens, {
+    mode,
+    riskStates: riskIdentityStates,
+    outcomeStates: enrichmentStates,
+    tokenEvidenceRows: riskCohortTokens,
+    generatedAt
+  });
+  tokens = riskView.tokens;
+  const latestMints = new Set(latestTokens.map(({ mint }) => mint));
+  const latestEnrichedTokens = tokens.filter((token) => latestMints.has(token.mint));
+  const riskCohortView = attachRiskIdentityEvidence(riskCohortTokens, {
+    mode,
+    riskStates: riskIdentityStates,
+    outcomeStates: enrichmentStates,
+    tokenEvidenceRows: riskCohortTokens,
+    generatedAt
+  });
+  const narratives = Object.values(latestEnrichedTokens.reduce((acc, token) => {
+    const row = acc[token.narrative] ||= {
+      name: token.narrative, coins: 0, volume: null, volumeEvidenceCount: 0,
+      momentum: null, momentumEvidenceCount: 0
+    };
+    row.coins++;
+    if (typeof token.volume5m === "number" && Number.isFinite(token.volume5m) && token.volume5m >= 0) {
+      row.volume = (row.volume ?? 0) + token.volume5m;
+      row.volumeEvidenceCount++;
+    }
+    if (typeof token.momentum === "number" && Number.isFinite(token.momentum) && token.momentum >= 0) {
+      row.momentum = (row.momentum ?? 0) + token.momentum;
+      row.momentumEvidenceCount++;
+    }
+    return acc;
+  }, {})).map((row) => ({
+    ...row,
+    momentum: row.momentumEvidenceCount ? Math.round(row.momentum / row.momentumEvidenceCount) : null
+  })).sort((a, b) => b.volumeEvidenceCount - a.volumeEvidenceCount
+    || (b.volume ?? 0) - (a.volume ?? 0) || b.coins - a.coins || a.name.localeCompare(b.name));
   const outcomesByMint = new Map(tokens.flatMap((token) => {
     const enrichment = enrichmentByMint.get(token.mint);
     return enrichment ? [[token.mint, enrichment]] : [];
   }));
-  const top100 = createTop100(tokens, { mode, outcomesByMint });
+  const top100 = createTop100(latestEnrichedTokens, { mode, outcomesByMint });
   const cohortEntries = enrichmentStates.flatMap((enrichment) => {
-    const token = store.token(enrichment.mint);
+    const token = normalizeLiveToken(store.token(enrichment.mint));
     if (!token || token.source !== "pumpportal") return [];
     const launchAt = Number.isFinite(Date.parse(token.createdAt)) ? new Date(Date.parse(token.createdAt)).toISOString() : generatedAt;
     let outcome;
@@ -168,7 +226,7 @@ function snapshot() {
     return [{
       outcome,
       narrative: token.narrative || "Unclassified",
-      lifecycle: token.status === "graduated" ? "Graduated" : "Bonding / observed"
+      lifecycle: token.status === "graduated" ? "Graduation status (unverified)" : token.status === "migration-observed" ? "Migration feed-observed" : "Bonding / observed"
     }];
   });
   const cohortOutcomes = cohortEntries.map(({ outcome }) => outcome);
@@ -192,11 +250,12 @@ function snapshot() {
       lastHour: countSince(hour),
       last15m: countSince(fifteen),
       graduations: tokens.filter((t) => t.status === "graduated").length,
+      migrationsObserved: tokens.filter((t) => ["migration-observed", "graduated"].includes(t.status)).length,
       calloutsLastHour: store.calloutCountSince(hour)
     },
     tokens,
     leaderboard: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       mode,
       generatedAt,
       sourceObservedAt: lastMintAt,
@@ -204,8 +263,15 @@ function snapshot() {
       source: mode === "live" ? "pumpportal" : "demo",
       universe: mode === "live" ? "Pump.fun tokens observed by this service" : "simulated tokens observed by this service",
       scope: mode === "live" ? "observed-by-this-war-room" : "simulated-feed",
-      rankingBasis: "momentum, curve progress, buyer breadth, freshness, and verified-risk adjustment",
-      ranking: { metric: "radar_score_v1", eligibilityVersion: "observed_feed_v1", eligibleCount: top100.length, limit: 100 },
+      rankingBasis: "numeric evidence score uses observed momentum, buyer breadth, and freshness only when a substantive input exists; otherwise score is withheld and observations are ordered by recency; uncalibrated risk factors do not affect rank",
+      ranking: {
+        metric: "evidence_score_or_recency_v2",
+        scorePolicy: "withheld-without-substantive-input",
+        fallbackOrder: "observation-recency",
+        eligibilityVersion: "observed_feed_v1",
+        eligibleCount: top100.length,
+        limit: 100
+      },
       outcomeTracking: "Returns use GeckoTerminal-observed completed pool candles; missing targets remain unavailable.",
       top100
     },
@@ -245,17 +311,65 @@ function snapshot() {
       cohorts: { narrative: narrativeCohorts, lifecycle: lifecycleCohorts },
       disclaimer: "Provider-observed on-chain pool data can be delayed, incomplete, revised, or manipulated; outcomes are descriptive research, not price guarantees or financial advice."
     },
+    riskIntelligence: {
+      schemaVersion: 1,
+      generatedAt,
+      evidenceClasses: [...RISK_IDENTITY_EVIDENCE_CLASSES],
+      rankingImpact: "none-uncalibrated",
+      source: {
+        id: GECKOTERMINAL_PROVIDER.id,
+        label: "GeckoTerminal token-info provider observations",
+        apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
+        endpoint: "/networks/solana/tokens/{mint}/info",
+        attributionUrl: GECKOTERMINAL_PROVIDER.attributionUrl,
+        poweredByUrl: "https://www.coingecko.com/",
+        publicBeta: true,
+        unvetted: true,
+        rawResponsesPersisted: false,
+        rawProfilesPersisted: false,
+        retention: "allowlisted scalars, exact-match digests, and minimal provenance only"
+      },
+      engine: riskIdentityIngestor?.getStatus() || {
+        schemaVersion: 1,
+        source: GECKOTERMINAL_PROVIDER.id,
+        status: mode === "live" ? "disabled" : "simulation-disabled",
+        queueDepth: 0
+      },
+      coverage: {
+        ...store.riskIdentityCoverage({ provider: GECKOTERMINAL_PROVIDER.id }),
+        ...riskCohortView.aggregateCoverage
+      },
+      cohort: {
+        policy: "risk-specific-prospective-fixed-admission-v1",
+        limit: 120,
+        admittedCount: mode === "demo" ? riskCohortTokens.length : riskIdentityStates.length,
+        universe: mode === "demo" ? "Synthetic demonstration cohort"
+          : "PumpPortal launches admitted by the v0.7 risk worker while active; independent from the v0.6 outcome cohort",
+        observations: riskCohortView.tokens.map((token) => ({
+          mint: token.mint,
+          name: token.name,
+          symbol: token.symbol,
+          createdAt: token.createdAt,
+          riskIdentity: token.riskIdentity
+        }))
+      },
+      summary: riskCohortView.summary,
+      disclaimer: "Provider and feed observations can be incomplete, delayed, or wrong. Exact declared-identifier or registrable-domain reuse does not establish duplicate content, common control, maliciousness, safety, or a probability of harm."
+    },
     narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
   };
 }
 
-if (mode === "live" && process.env.OUTCOME_ENRICHMENT !== "false") {
-  const outcomeClient = new GeckoTerminalClient({
+if (mode === "live" && (process.env.OUTCOME_ENRICHMENT !== "false" || process.env.RISK_IDENTITY_ENRICHMENT !== "false")) {
+  geckoTerminalClient = new GeckoTerminalClient({
     userAgent: `PumpWarRoom/${appVersion} (+https://pump-war-room-production.up.railway.app)`
   });
+}
+
+if (mode === "live" && process.env.OUTCOME_ENRICHMENT !== "false") {
   outcomeIngestor = new VerifiedOutcomeIngestor({
     store,
-    client: outcomeClient,
+    client: geckoTerminalClient,
     onStatus: (status, telemetry = {}) => {
       const details = { status, mint: telemetry.mint, errorCode: telemetry.errorCode, nextAttemptAt: telemetry.nextAttemptAt };
       if (["degraded", "rate-limited"].includes(status)) runtimeTelemetry.warn("outcomes.status", details);
@@ -273,6 +387,30 @@ if (mode === "live" && process.env.OUTCOME_ENRICHMENT !== "false") {
       now: new Date().toISOString(),
       limit: 120
     })) outcomeIngestor.enqueue(token);
+  }, 60_000).unref();
+}
+
+if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
+  riskIdentityIngestor = new RiskIdentityIngestor({
+    store,
+    client: geckoTerminalClient,
+    onStatus: (status, telemetry = {}) => {
+      const details = { status, mint: telemetry.mint, errorCode: telemetry.errorCode, nextAttemptAt: telemetry.nextAttemptAt };
+      if (telemetry.error) runtimeTelemetry.error("risk_identity.worker_failed", telemetry.error, details);
+      else if (["degraded", "rate-limited", "invalid-response"].includes(status)) runtimeTelemetry.warn("risk_identity.status", details);
+      else if (["available", "unavailable"].includes(status)) runtimeTelemetry.info("risk_identity.status", details);
+    }
+  });
+  const cohortTokens = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 120 })
+    .map(({ mint }) => store.token(mint))
+    .filter((token) => token?.source === "pumpportal");
+  riskIdentityIngestor.start(cohortTokens);
+  setInterval(() => {
+    for (const token of store.dueRiskIdentityTokens({
+      provider: GECKOTERMINAL_PROVIDER.id,
+      now: new Date().toISOString(),
+      limit: 120
+    })) riskIdentityIngestor.enqueue(token);
   }, 60_000).unref();
 }
 
@@ -301,18 +439,28 @@ if (mode === "demo") {
 } else {
   const ingestor = new PumpPortalIngestor({
     url: process.env.PUMPPORTAL_URL || "wss://pumpportal.fun/api/data",
-    watchTrades: process.env.WATCH_TRADES === "true",
+    watchTrades: false,
     onToken: (token) => {
       lastMintAt = token.createdAt || new Date().toISOString();
       feedLastMessageAt = lastMintAt;
       feedLastActivityAt = lastMintAt;
       upsert(token);
     },
-    onMigration: ({ mint, observedAt }) => {
+    onMigration: ({ mint, observedAt, raw }) => {
       feedLastActivityAt = observedAt || new Date().toISOString();
       feedLastMessageAt = feedLastActivityAt;
       const token = store.token(mint);
-      if (token) upsert({ ...token, status: "graduated", bondingProgress: 100 });
+      if (token) upsert({
+        ...token,
+        status: "migration-observed",
+        migrationEvidence: {
+          evidenceClass: "feed-observed-processed",
+          source: "pumpportal",
+          observedAt: observedAt || new Date().toISOString(),
+          pool: typeof raw?.pool === "string" ? raw.pool : null,
+          limitation: "Feed observation is processed-commitment evidence, not independently finalized migration proof."
+        }
+      });
     },
     onStatus: (status, telemetry = {}) => {
       feedStatus = status;
@@ -361,7 +509,9 @@ const server = http.createServer(async (req, res) => {
       reconnects: feed.counters.reconnects, feedMessages: feed.counters.messages, feedParseErrors: feed.counters.malformedMessages,
       analyst: { status: "ready", engine: "local-grounded-v1" },
       outcomes: outcomeIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
-      outcomeCoverage: store.outcomeCoverage({ provider: GECKOTERMINAL_PROVIDER.id })
+      outcomeCoverage: store.outcomeCoverage({ provider: GECKOTERMINAL_PROVIDER.id }),
+      riskIntelligence: riskIdentityIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
+      riskIdentityCoverage: store.riskIdentityCoverage({ provider: GECKOTERMINAL_PROVIDER.id })
     });
     }
     if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
@@ -395,7 +545,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/api/export/daily") { await exportDaily(vaultPath, snapshot()); return json(res, 200, { ok: true }); }
     if (req.method === "POST" && url.pathname.startsWith("/api/export/coin/")) {
-      const mint = decodeURIComponent(url.pathname.split("/").pop()); const token = store.token(mint);
+      const mint = decodeURIComponent(url.pathname.split("/").pop());
+      const token = snapshot().tokens.find((candidate) => candidate.mint === mint);
       if (!token) return json(res, 404, { error: "Token not found" });
       await exportCoin(vaultPath, token); return json(res, 200, { ok: true });
     }
@@ -445,6 +596,12 @@ server.listen(port, "0.0.0.0", () => {
       enabled: Boolean(outcomeIngestor),
       apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
       rawCandlesPersisted: false
+    },
+    riskIdentity: {
+      source: GECKOTERMINAL_PROVIDER.id,
+      enabled: Boolean(riskIdentityIngestor),
+      apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
+      rawProfilesPersisted: false
     }
   });
   if (cleanup.tokens) runtimeTelemetry.info("database.demo_cleanup", cleanup);

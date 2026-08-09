@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Store, STORE_SCHEMA_VERSION } from "../src/store.js";
+import { parseGeckoTerminalTokenInfo, RISK_IDENTITY_METHOD_VERSION } from "../src/risk-identity.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
 const geckoMint = "11111111111111111111111111111111";
@@ -175,7 +176,27 @@ test("writes one bounded, secret-free enrichment state per mint without stale re
   assert.throws(() => store.upsertEnrichmentState({ ...geckoValidationState, evidence: { source: "geckoterminal", providerStatus: [[1720000000, 1, 2, 0.5, 1.5, 999]] } }), /non-negative integer/);
   assert.throws(() => store.upsertEnrichmentState({ ...geckoValidationState, evidence: { source: "geckoterminal", retention: "[[1720000000,1,2,0.5,1.5,999]]" } }), /must not encode structured provider data/);
   assert.throws(() => store.upsertEnrichmentState({ ...geckoValidationState, missingReason: "1720000000,1,2,0.5,1.5,999", evidence: { source: "geckoterminal" } }), /missingReason is invalid/);
-
+  const liquidityBase = {
+    schemaVersion: 1,
+    source: "geckoterminal",
+    attemptedAt: "2026-08-08T12:03:00.000Z",
+    basis: "provider-observed-pool-reserve",
+    limitation: "GeckoTerminal-observed pool reserve is not evidence of locked liquidity"
+  };
+  assert.throws(() => store.upsertEnrichmentState({
+    ...geckoValidationState,
+    evidence: { liquidity: {
+      ...liquidityBase, evidenceClass: "provider-observed", observedAt: null,
+      liquidityUsd: null, missingReasonCode: "pool-reserve-missing"
+    } }
+  }), /provider-observed liquidity evidence requires/);
+  assert.throws(() => store.upsertEnrichmentState({
+    ...geckoValidationState,
+    evidence: { liquidity: {
+      ...liquidityBase, evidenceClass: "unavailable", observedAt: "2026-08-08T12:03:00.000Z",
+      liquidityUsd: 123, missingReasonCode: null
+    } }
+  }), /unavailable liquidity evidence requires/);
   const awaiting = store.upsertEnrichmentState({
     mint: secondGeckoMint, provider: "geckoterminal", pool: null, tokenSide: null, dex: null,
     sourceUrl: null, evidence: { providerStatus: 404 }, status: "awaiting-pool",
@@ -203,7 +224,7 @@ test("writes one bounded, secret-free enrichment state per mint without stale re
   assert.deepEqual(store.dueEnrichmentTokens({ provider: "geckoterminal", now: "2026-08-08T12:18:00.000Z" }).map(({ mint }) => mint), [secondGeckoMint]);
   assert.throws(() => store.dueEnrichmentTokens({ provider: "geckoterminal", now: "bad" }), /RFC 3339/);
   assert.deepEqual(store.deleteEnrichmentByProvider("dexscreener"), {
-    provider: "dexscreener", removed: 1, exclusiveAccessVerified: true, secureDelete: true,
+    provider: "dexscreener", removed: 1, removedOutcomes: 1, removedRiskIdentity: 0, exclusiveAccessVerified: true, secureDelete: true,
     vacuumed: true, freelistCount: 0, walTruncated: true, journalModeRestored: "wal"
   });
   assert.equal(store.enrichmentState("OutcomeMintPump"), null);
@@ -219,6 +240,7 @@ test("provider purge securely scrubs deleted bytes, truncates WAL, and keeps dat
     rmSync(directory, { recursive: true, force: true });
   });
   const marker = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
+  const riskMarker = "ab".repeat(32);
   store.upsertToken({ mint: geckoMint, source: "pumpportal", createdAt });
   store.upsertEnrichmentState({
     mint: geckoMint, provider: "geckoterminal", pool: marker, tokenSide: "base",
@@ -227,18 +249,112 @@ test("provider purge securely scrubs deleted bytes, truncates WAL, and keeps dat
     attemptCount: 0, lastAttemptAt: null, nextAttemptAt: createdAt, lastSuccessAt: null, updatedAt: createdAt,
     evidence: { source: "geckoterminal", retention: "derived-metrics-and-minimal-provenance-only" }
   });
+  const riskEvidence = parseGeckoTerminalTokenInfo({ data: {
+    id: `solana_${geckoMint}`,
+    type: "token",
+    attributes: {
+      address: geckoMint, name: "Purge", symbol: "PURGE",
+      holders: { count: 1, distribution_percentage: { top_10: "100" }, last_updated: createdAt },
+      developer_address: null, developer_holding_percentage: null,
+      twitter_handle: "purge_marker", telegram_handle: null, websites: []
+    }
+  } }, { mint: geckoMint, fetchedAt: createdAt });
+  riskEvidence.fingerprints.xHandle.fingerprint = riskMarker;
+  store.upsertRiskIdentityState({
+    mint: geckoMint, provider: "geckoterminal", evidence: riskEvidence, status: "available",
+    missingReason: null, errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
+    nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
+  });
   store.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true, "probe marker never reached the database file");
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(riskMarker)), true, "risk marker never reached the database file");
   assert.deepEqual(store.deleteEnrichmentByProvider("geckoterminal"), {
-    provider: "geckoterminal", removed: 1, exclusiveAccessVerified: true, secureDelete: true,
+    provider: "geckoterminal", removed: 2, removedOutcomes: 1, removedRiskIdentity: 1, exclusiveAccessVerified: true, secureDelete: true,
     vacuumed: true, freelistCount: 0, walTruncated: true, journalModeRestored: "wal"
   });
   assert.equal(store.enrichmentState(geckoMint), null);
   for (const candidate of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
     if (!existsSync(candidate)) continue;
     assert.equal(readFileSync(candidate).includes(Buffer.from(marker)), false, `${path.basename(candidate)} retained deleted provider bytes`);
+    assert.equal(readFileSync(candidate).includes(Buffer.from(riskMarker)), false, `${path.basename(candidate)} retained deleted risk bytes`);
     assert.equal(statSync(candidate).mode & 0o777, 0o600, `${path.basename(candidate)} was not owner-only`);
   }
+});
+
+test("persists bounded risk identity evidence with due scheduling and explicit unknowns", (t) => {
+  const store = temporaryStore(t);
+  store.upsertToken({ mint: geckoMint, source: "pumpportal", createdAt });
+  const queued = store.upsertRiskIdentityState({
+    mint: geckoMint,
+    provider: "geckoterminal",
+    evidence: {
+      schemaVersion: 1, mint: geckoMint, provider: "geckoterminal", source: "geckoterminal",
+      endpoint: `/networks/solana/tokens/${geckoMint}/info`, apiVersion: "20230203",
+      methodVersion: RISK_IDENTITY_METHOD_VERSION, evidenceClass: "unavailable", fetchedAt: null,
+      attemptedAt: createdAt, missingReasonCode: "pending",
+      retention: "normalized-scalars-and-domain-separated-fingerprints-only"
+    },
+    status: "queued",
+    missingReason: "Provider token-info evidence pending",
+    errorCode: null,
+    attemptCount: 0,
+    lastAttemptAt: null,
+    nextAttemptAt: "2026-08-08T12:15:00.000Z",
+    lastSuccessAt: null,
+    updatedAt: createdAt
+  }).state;
+  assert.equal(queued.status, "queued");
+  assert.deepEqual(store.dueRiskIdentityTokens({ provider: "geckoterminal", now: "2026-08-08T12:14:59.000Z" }), []);
+  assert.equal(store.dueRiskIdentityTokens({ provider: "geckoterminal", now: "2026-08-08T12:15:00.000Z" })[0].mint, geckoMint);
+
+  const available = store.upsertRiskIdentityState({
+    mint: geckoMint,
+    provider: "geckoterminal",
+    evidence: parseGeckoTerminalTokenInfo({ data: {
+      id: `solana_${geckoMint}`,
+      type: "token",
+      attributes: {
+        address: geckoMint, name: "Observed", symbol: "OBS",
+        holders: { count: 42, distribution_percentage: { top_10: "51.2" }, last_updated: "2026-08-08T12:15:00.000Z" },
+        developer_address: null, developer_holding_percentage: null,
+        twitter_handle: null, telegram_handle: null, websites: []
+      }
+    } }, { mint: geckoMint, fetchedAt: "2026-08-08T12:16:00.000Z" }),
+    status: "available",
+    missingReason: null,
+    errorCode: null,
+    attemptCount: 1,
+    lastAttemptAt: "2026-08-08T12:16:00.000Z",
+    nextAttemptAt: null,
+    lastSuccessAt: "2026-08-08T12:16:00.000Z",
+    updatedAt: "2026-08-08T12:16:00.000Z"
+  }).state;
+  assert.equal(available.evidence.factors.top10HolderPercentage.value, 51.2);
+  assert.throws(() => store.upsertRiskIdentityState({
+    ...available,
+    updatedAt: "2026-08-08T12:17:00.000Z",
+    evidence: { ...available.evidence, description: "unrecognized provider field" }
+  }), /outside the persistence allowlist/);
+  assert.deepEqual(store.riskIdentityCoverage({ provider: "geckoterminal" }), {
+    provider: "geckoterminal", status: null, stateCount: 1, successCount: 1,
+    firstUpdatedAt: "2026-08-08T12:16:00.000Z", lastUpdatedAt: "2026-08-08T12:16:00.000Z",
+    statusCounts: { available: 1 }
+  });
+  assert.throws(() => store.upsertRiskIdentityState({
+    ...available,
+    updatedAt: "2026-08-08T12:17:00.000Z",
+    evidence: { rawResponse: { secret: "bulk provider payload" } }
+  }), /outside the persistence allowlist/);
+  assert.throws(() => store.upsertRiskIdentityState({
+    ...available,
+    updatedAt: "2026-08-08T12:17:00.000Z",
+    evidence: { ...available.evidence, liquidity: { volumeUsd: 99_999 } }
+  }), /persistence allowlist|liquidity evidence/);
+  assert.throws(() => store.upsertRiskIdentityState({
+    ...available,
+    attemptCount: 3,
+    updatedAt: "2026-08-08T12:17:00.000Z"
+  }), /between 0 and 2/);
 });
 
 test("provider purge fails closed before deletion when another database reader is active", (t) => {
@@ -320,7 +436,9 @@ test("migrates an existing v0.5.1 database in place while preserving rows and WA
   assert.equal(store.db.prepare("PRAGMA user_version").get().user_version, STORE_SCHEMA_VERSION);
   assert.equal(store.db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name='outcome_enrichment'").get().count, 1);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='table' AND name='risk_identity_enrichment'").get().count, 1);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name='price_observations'").get().count, 0);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name='outcome_enrichment_provider_status_updated'").get().count, 1);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name='outcome_enrichment_provider_due'").get().count, 1);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name='risk_identity_provider_due'").get().count, 1);
 });

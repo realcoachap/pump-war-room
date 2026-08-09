@@ -207,48 +207,40 @@ function narrativeAnswer(snapshot, tokens) {
 }
 
 function riskAnswer(tokens) {
-  const groups = { verified: [], partial: [], unverified: [], synthetic: [], undeclared: [] };
+  const groups = {
+    "on-chain-finalized": [], "provider-observed": [], "feed-observed-processed": [],
+    "locally-derived": [], unavailable: [], synthetic: [], undeclared: []
+  };
   for (const token of tokens) {
-    const confidence = cleanText(token.riskConfidence, 24).toLowerCase();
+    const confidence = cleanText(token.riskIdentity?.overallEvidence || token.riskConfidence, 32).toLowerCase();
     (groups[confidence] || groups.undeclared).push(token);
   }
 
   if (!tokens.length) {
     return {
-      answer: "No eligible token rows are available for a risk-confidence assessment. Risk is never inferred as safety.",
+      answer: "No eligible token rows are available for a risk-evidence assessment. Missing evidence is never inferred as safety.",
       evidence: [citation("snapshot.tokens", "No eligible token rows")]
     };
   }
 
-  const summary = ["verified", "partial", "unverified", "synthetic", "undeclared"]
+  const summary = ["on-chain-finalized", "provider-observed", "feed-observed-processed", "locally-derived", "unavailable", "synthetic", "undeclared"]
     .filter((name) => groups[name].length)
     .map((name) => `${name} ${groups[name].length}`)
     .join(", ");
-  let answer = `Declared risk confidence across ${tokens.length} eligible tokens: ${summary}.`;
-
-  if (groups.unverified.length || groups.undeclared.length) {
-    answer += " Numeric risk is withheld for unverified or undeclared rows because holder, creator, and trade enrichment may be unavailable.";
-  }
+  let answer = `Risk-evidence classes across ${tokens.length} eligible tokens: ${summary}.`;
+  answer += " Holder and developer values are provider observations; duplicate matches and launch counts are local derivations. They are not calibrated maliciousness probabilities and do not alter the leaderboard rank.";
+  if (groups.unavailable.length || groups.undeclared.length) answer += " Missing evidence remains explicitly unavailable.";
   if (groups.synthetic.length) answer += " Synthetic scores are simulation data, not live risk evidence.";
-
-  const reportable = [...groups.verified, ...groups.partial]
-    .filter((token) => finiteNumber(token.risk) !== null)
-    .sort((a, b) => finiteNumber(b.risk) - finiteNumber(a.risk));
-  if (reportable.length) {
-    const token = reportable[0];
-    answer += ` Highest reportable heuristic risk is ${tokenLabel(token)} at ${numberLabel(finiteNumber(token.risk))}/100 (${cleanText(token.riskConfidence, 24).toLowerCase()}).`;
-  }
-  answer += " These heuristics do not establish safety and are not trade advice.";
+  answer += " Exact declared-social or registrable-domain reuse shows identifier reuse only; it does not establish duplicate content, common control, fraud, or safety. This is not trade advice.";
 
   const evidence = [];
-  for (const confidence of ["unverified", "undeclared", "verified", "partial", "synthetic"]) {
+  for (const confidence of ["unavailable", "undeclared", "provider-observed", "feed-observed-processed", "locally-derived", "on-chain-finalized", "synthetic"]) {
     for (const token of groups[confidence].slice(0, 3)) {
-      const risk = ["verified", "partial"].includes(confidence) && finiteNumber(token.risk) !== null
-        ? `; heuristic risk: ${numberLabel(finiteNumber(token.risk))}/100`
-        : "; numeric risk withheld";
+      const top10 = finiteNumber(token.riskIdentity?.factors?.concentration?.top10Percentage);
+      const factor = top10 === null ? "; concentration unknown" : `; provider-reported top-10: ${numberLabel(top10)}%`;
       evidence.push(citation(
         `token:${safeMint(token.mint)}`,
-        `${tokenLabel(token)} risk confidence: ${confidence}${risk}`,
+        `${tokenLabel(token)} risk evidence: ${confidence}${factor}; numeric composite withheld`,
         token.mint
       ));
     }
@@ -257,15 +249,19 @@ function riskAnswer(tokens) {
 }
 
 function graduationAnswer(snapshot, tokens) {
-  const graduated = tokens.filter((token) => ["graduated", "migrated"].includes(cleanText(token.status, 24).toLowerCase()));
-  const reported = isRecord(snapshot.stats) ? finiteNumber(snapshot.stats.graduations) : null;
+  const lifecycle = tokens.filter((token) => ["migration-observed", "graduated", "migrated"].includes(cleanText(token.status, 32).toLowerCase()));
+  const stats = isRecord(snapshot.stats) ? snapshot.stats : {};
+  const migrationReported = finiteNumber(stats.migrationsObserved);
+  const legacyReported = finiteNumber(stats.graduations);
+  const reported = migrationReported ?? legacyReported;
+  const citationKey = migrationReported !== null ? "snapshot.stats.migrationsObserved" : "snapshot.stats.graduations";
 
-  if (graduated.length) {
+  if (lifecycle.length) {
     return {
-      answer: `${graduated.length} eligible token${graduated.length === 1 ? " is" : "s are"} marked graduated in the supplied rows: ${graduated.slice(0, 5).map(tokenLabel).join(", ")}.`,
-      evidence: graduated.slice(0, 5).map((token) => citation(
+      answer: `${lifecycle.length} eligible token${lifecycle.length === 1 ? " has" : "s have"} a supplied migration/graduation status: ${lifecycle.slice(0, 5).map(tokenLabel).join(", ")}. A processed-feed migration observation is not independently finalized proof.`,
+      evidence: lifecycle.slice(0, 5).map((token) => citation(
         `token:${safeMint(token.mint)}`,
-        `${tokenLabel(token)} status: ${cleanText(token.status, 24)}`,
+        `${tokenLabel(token)} supplied lifecycle status: ${cleanText(token.status, 32)}`,
         token.mint
       ))
     };
@@ -273,13 +269,13 @@ function graduationAnswer(snapshot, tokens) {
 
   if (reported !== null && reported > 0) {
     return {
-      answer: `Snapshot stats report ${numberLabel(reported)} graduations, but no eligible supplied token row is marked graduated, so mint-level details are unavailable.`,
-      evidence: [citation("snapshot.stats.graduations", `Reported graduations: ${numberLabel(reported)}`)]
+      answer: `Snapshot stats report ${numberLabel(reported)} migration/graduation observations, but no eligible supplied token row has a matching status, so mint-level details are unavailable.`,
+      evidence: [citation(citationKey, `Reported migration/graduation observations: ${numberLabel(reported)}`)]
     };
   }
   return {
-    answer: "No eligible supplied token row is marked graduated in this snapshot.",
-    evidence: [citation(reported === null ? "snapshot.tokens.status" : "snapshot.stats.graduations", reported === null ? "No eligible graduated token rows" : `Reported graduations: ${numberLabel(reported)}`)]
+    answer: "No eligible supplied token row has a migration or graduation status in this snapshot.",
+    evidence: [citation(reported === null ? "snapshot.tokens.status" : citationKey, reported === null ? "No eligible migration/graduation rows" : `Reported migration/graduation observations: ${numberLabel(reported)}`)]
   };
 }
 
@@ -322,15 +318,15 @@ function overviewAnswer(snapshot, tokens, now) {
   const feed = feedAnswer(snapshot, now);
   const momentum = momentumAnswer(snapshot, tokens, 1);
   const newest = newestAnswer(snapshot, tokens, 1);
-  const graduated = tokens.filter((token) => ["graduated", "migrated"].includes(cleanText(token.status, 24).toLowerCase())).length;
+  const migrated = tokens.filter((token) => ["migration-observed", "graduated", "migrated"].includes(cleanText(token.status, 32).toLowerCase())).length;
   const callouts = Array.isArray(snapshot.callouts) ? snapshot.callouts.filter(isRecord).length : 0;
   return {
-    answer: `${feed.answer} ${momentum.answer} ${newest.answer} The supplied rows mark ${graduated} graduation${graduated === 1 ? "" : "s"} and include ${callouts} callout${callouts === 1 ? "" : "s"}.`,
+    answer: `${feed.answer} ${momentum.answer} ${newest.answer} The supplied rows contain ${migrated} migration/graduation observation${migrated === 1 ? "" : "s"} and ${callouts} callout${callouts === 1 ? "" : "s"}.`,
     evidence: [
       ...feed.evidence,
       ...momentum.evidence,
       ...newest.evidence,
-      citation("snapshot.tokens.status", `Eligible graduated rows: ${graduated}`),
+      citation("snapshot.tokens.status", `Eligible migration/graduation rows: ${migrated}`),
       citation("snapshot.callouts", `Supplied callout rows: ${callouts}`)
     ]
   };
@@ -363,12 +359,12 @@ export function analyzeSnapshot(question, snapshot, options = {}) {
 
   if (hasTradeActionRequest(normalizedQuestion)) {
     result = {
-      answer: "Caesar Intel is observation-only: it cannot recommend, execute, or simulate a trade. Ask for feed status, observed momentum, newest mints, narratives, risk confidence, graduations, or callouts.",
+      answer: "Caesar Intel is observation-only: it cannot recommend, execute, or simulate a trade. Ask for feed status, observed momentum, newest mints, narratives, risk evidence, migration observations, or callouts.",
       evidence: [citation("snapshot.tokens", `${tokens.length} eligible token rows are available for read-only analysis`)]
     };
   } else if (hasExternalDataRequest(normalizedQuestion)) {
     result = {
-      answer: "Caesar Intel does not call external services. It can answer only from the supplied snapshot's feed, token, narrative, graduation, risk-confidence, and callout sections.",
+      answer: "Caesar Intel does not call external services. It can answer only from the supplied snapshot's feed, token, narrative, lifecycle, risk-evidence, and callout sections.",
       evidence: [citation("snapshot", "Analysis scope is limited to the supplied snapshot")]
     };
   } else {
@@ -409,7 +405,7 @@ export function analyzeSnapshot(question, snapshot, options = {}) {
       };
     } else {
       result = {
-        answer: "I can summarize feed status, observed momentum and new mints, narratives, risk confidence, graduations, or callouts from this snapshot. Ask about one or more of those topics.",
+        answer: "I can summarize feed status, observed momentum and new mints, narratives, risk evidence, migration observations, or callouts from this snapshot. Ask about one or more of those topics.",
         evidence: [citation("snapshot.tokens", `${tokens.length} eligible token rows are available`)]
       };
     }

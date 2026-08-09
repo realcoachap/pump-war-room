@@ -8,7 +8,7 @@ const mint = (index) => `${String(index + 1).padStart(4, "1")}${"A".repeat(28)}`
 const token = (mint, overrides = {}) => ({
   mint, name: mint, symbol: mint.toUpperCase(), source: "pumpportal",
   createdAt: "2026-08-08T11:59:00.000Z", momentum: 50, bondingProgress: 25,
-  uniqueBuyers: 8, riskConfidence: "unverified", risk: null, ...overrides
+  uniqueBuyers: 8, riskConfidence: "unavailable", risk: null, ...overrides
 });
 
 test("builds a deterministic observed-feed Top 100", () => {
@@ -19,7 +19,7 @@ test("builds a deterministic observed-feed Top 100", () => {
   assert.deepEqual(rows.map((row) => row.token.name), ["high", "low"]);
   assert.deepEqual(rows.map((row) => row.rank), [1, 2]);
   assert.equal(rows[0].freshness.state, "fresh");
-  assert.equal(rows[0].riskConfidence, "unverified");
+  assert.equal(rows[0].riskConfidence, "unavailable");
 });
 
 test("caps rankings at 100 rows", () => {
@@ -103,6 +103,18 @@ test("rejects invalid live identities and contains invalid metrics", () => {
   assert.equal(row.token.volume5m, null);
   assert.equal(row.token.uniqueBuyers, null);
   assert.equal(row.token.risk, null);
+  assert.equal(row.score, null);
+  assert.equal(row.orderingBasis, "observation-recency-no-substantive-inputs");
+});
+
+test("withholds a numeric evidence score and orders by recency when substantive inputs are absent", () => {
+  const rows = createTop100([
+    token(mint(1), { momentum: null, uniqueBuyers: null, bondingProgress: 99, createdAt: "2026-08-08T11:58:00.000Z" }),
+    token(mint(2), { momentum: null, uniqueBuyers: null, bondingProgress: null, createdAt: "2026-08-08T11:59:00.000Z" })
+  ], { now, mode: "live" });
+  assert.deepEqual(rows.map((row) => row.token.mint), [mint(2), mint(1)]);
+  assert.ok(rows.every((row) => row.score === null));
+  assert.ok(rows.every((row) => row.reasons.some((reason) => /score withheld/i.test(reason))));
 });
 
 test("uses deterministic ties and records graduation only from token status", () => {
@@ -113,4 +125,18 @@ test("uses deterministic ties and records graduation only from token status", ()
   assert.equal(rows[0].token.mint, mint(1));
   assert.equal(rows[1].outcome.graduation.status, "observed");
   assert.equal(rows[0].outcome.graduation.status, "pending");
+});
+
+test("uncalibrated risk evidence never changes ranking score or order", () => {
+  const baseline = token(mint(1), { momentum: 60, risk: null, riskConfidence: "unavailable" });
+  const enriched = token(mint(2), {
+    momentum: 60,
+    risk: 100,
+    riskConfidence: "provider-observed",
+    riskIdentity: { overallEvidence: "provider-observed", concentration: { top10Percentage: 99 } }
+  });
+  const rows = createTop100([enriched, baseline], { now, mode: "live" });
+  assert.equal(rows[0].score, rows[1].score);
+  assert.equal(rows[0].token.mint, mint(1), "deterministic mint tie-break remains authoritative");
+  assert.match(rows[1].reasons.at(-1), /excluded from rank/);
 });

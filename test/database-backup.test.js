@@ -23,6 +23,7 @@ import {
   verifyRestorableBackup
 } from "../src/database-backup.js";
 import { Store } from "../src/store.js";
+import { parseGeckoTerminalTokenInfo } from "../src/risk-identity.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
 
@@ -51,6 +52,19 @@ function seededStore(directory) {
     missingReason: "missing-24h", errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
     nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
   });
+  store.upsertRiskIdentityState({
+    mint: "11111111111111111111111111111111", provider: "geckoterminal",
+    evidence: parseGeckoTerminalTokenInfo({ data: {
+      id: "solana_11111111111111111111111111111111",
+      type: "token",
+      attributes: {
+        address: "11111111111111111111111111111111", name: null, symbol: null, holders: null,
+        developer_address: null, developer_holding_percentage: null, twitter_handle: null, telegram_handle: null, websites: []
+      }
+    } }, { mint: "11111111111111111111111111111111", fetchedAt: createdAt }),
+    status: "available", missingReason: null, errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
+    nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
+  });
   return { store, databasePath };
 }
 
@@ -73,10 +87,10 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   assert.equal(report.disposableRestore.verified, true);
   assert.deepEqual(report.disposableRestore.applicationWriteProbe, { verified: true, rolledBack: true });
   assert.deepEqual(report.backup.rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
   assert.deepEqual(report.backup.invalidJsonPayloads, {
-    tokens: 0, events: 0, callouts: 0, outcome_enrichment: 0
+    tokens: 0, events: 0, callouts: 0, outcome_enrichment: 0, risk_identity_enrichment: 0
   });
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(digest(databasePath), sourceBefore);
@@ -116,6 +130,7 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   assert.deepEqual(JSON.parse(restored.prepare("SELECT evidence FROM outcome_enrichment WHERE mint=?").get("LiveMintPump").evidence), {
     outcome: { baseline: { nonempty: true, observedAt: createdAt }, windows: { "5m": { maximumDrawdownPct: 2, returnPct: 10 } } }
   });
+  assert.equal(JSON.parse(restored.prepare("SELECT evidence FROM risk_identity_enrichment").get().evidence).provider, "geckoterminal");
   assert.equal(restored.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name='price_observations'").get().count, 0);
   assert.equal(store.token("LiveMintPump").symbol, "LIVE");
 });
@@ -137,7 +152,7 @@ test("standalone restore verification is read-only and removes its disposable co
   assert.equal(statSync(destination).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
   assert.deepEqual(inspectDatabaseFile(destination).rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
 });
 
@@ -162,11 +177,42 @@ test("verifies an exact v0.5.1 artifact by migrating only the disposable restore
 
   assert.equal(report.artifact.userVersion, 501);
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 501);
-  assert.equal(report.disposableRestore.userVersion, 600);
+  assert.equal(report.disposableRestore.userVersion, 700);
   assert.equal(report.disposableRestore.rowCounts.tokens, 1);
   assert.equal(report.disposableRestore.rowCounts.outcome_enrichment, 0);
+  assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
   assert.equal(digest(legacyPath), before.hash);
   assert.equal(statSync(legacyPath).mtime.toISOString(), before.modifiedAt);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
+test("verifies an exact v0.6.0 artifact by migrating only the disposable restore copy", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const outcomePath = path.join(directory, "v0.6.0-backup.db");
+  const outcomeStore = new Store(outcomePath);
+  outcomeStore.upsertToken({ mint: "outcome-mint", source: "pumpportal", createdAt });
+  outcomeStore.db.exec(`
+    DROP INDEX risk_identity_provider_due;
+    DROP INDEX risk_identity_provider_status_updated;
+    DROP TABLE risk_identity_enrichment;
+    PRAGMA user_version = 600;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA journal_mode = DELETE;
+  `);
+  outcomeStore.db.close();
+  const before = { hash: digest(outcomePath), modifiedAt: statSync(outcomePath).mtime.toISOString() };
+
+  const report = verifyRestorableBackup(outcomePath, { scratchRoot: scratchDirectory });
+
+  assert.equal(report.artifact.userVersion, 600);
+  assert.equal(report.artifact.rowCounts.outcome_enrichment, 0);
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, 600);
+  assert.equal(report.disposableRestore.userVersion, 700);
+  assert.equal(report.disposableRestore.rowCounts.tokens, 1);
+  assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
+  assert.equal(digest(outcomePath), before.hash);
+  assert.equal(statSync(outcomePath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 

@@ -102,6 +102,22 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       && health.outcomes.lastSuccessIsStale === false, "health", "outcome provider success evidence is stale or missing");
     requireValue(Number(health.outcomes?.counters?.consecutiveFailures) <= 3, "health", "outcome provider has repeated consecutive failures");
   }
+  requireValue(health.riskIntelligence?.source === "geckoterminal", "health", "risk identity provider identity was missing");
+  const allowedRiskStates = expectedMode === "live"
+    ? ["idle", "enriching", "queued", "available", "unavailable", "rate-limited", "degraded", "invalid-response"]
+    : ["simulation-disabled"];
+  requireValue(allowedRiskStates.includes(health.riskIntelligence?.status), "health", `risk identity engine state ${health.riskIntelligence?.status ?? "missing"} was not explicit`);
+  requireValue(Number.isFinite(health.riskIntelligence?.queueDepth) && health.riskIntelligence.queueDepth >= 0, "health", "risk identity queue telemetry was missing");
+  if (expectedMode === "live") {
+    const attempted = Number.isFinite(health.riskIntelligence?.counters?.attempts) && health.riskIntelligence.counters.attempts >= 1;
+    const persisted = Number.isFinite(health.riskIntelligence?.persistence?.successfulStateCount) && health.riskIntelligence.persistence.successfulStateCount >= 1;
+    const succeeded = Number.isFinite(health.riskIntelligence?.counters?.successes) && health.riskIntelligence.counters.successes >= 1;
+    requireValue(attempted || persisted, "health", "risk identity provider was never attempted in runtime or persisted state");
+    requireValue(succeeded || persisted, "health", "risk identity provider has no successful runtime or persisted refresh");
+    requireValue(typeof health.riskIntelligence?.lastSuccessAt === "string", "health", "risk identity provider has no successful acquisition timestamp");
+    requireValue(health.riskIntelligence?.ongoingFreshnessRequired === false
+      && health.riskIntelligence?.evidenceAcquisition === "bounded-one-time-15m-with-one-missing-or-stale-retry", "health", "risk identity bounded acquisition policy was missing");
+  }
 
   requireValue(snapshot.version === expectedVersion, "snapshot", `version ${snapshot.version ?? "missing"} did not match ${expectedVersion}`);
   requireValue(snapshot.mode === expectedMode, "snapshot", `mode ${snapshot.mode ?? "missing"} did not match ${expectedMode}`);
@@ -112,6 +128,9 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   if (expectedMode === "live") requireValue(snapshot.storage?.mountPointVerified === true, "snapshot", "database mount point was not verified");
   requireValue(Number.isFinite(snapshot.service?.uptimeSeconds), "snapshot", "service uptime was missing");
   requireValue(snapshot.outcomes?.schemaVersion === 1, "snapshot", "outcome engine schema was missing");
+  requireValue(snapshot.leaderboard?.schemaVersion === 2
+    && snapshot.leaderboard?.ranking?.metric === "evidence_score_or_recency_v2"
+    && snapshot.leaderboard?.ranking?.scorePolicy === "withheld-without-substantive-input", "snapshot", "truthful v2 leaderboard contract was missing");
   requireValue(snapshot.outcomes?.revisionPolicy === "first-observed-derived-value-per-window-provider-revision", "snapshot", "per-window provider revision policy was missing");
   requireValue(snapshot.outcomes?.source?.id === "geckoterminal" && snapshot.outcomes.source.apiVersion === "20230203", "snapshot", "pinned GeckoTerminal source evidence was missing");
   requireValue(snapshot.outcomes?.source?.rawResponsesPersisted === false && snapshot.outcomes?.source?.rawCandlesPersisted === false
@@ -133,6 +152,18 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     }
   }
   requireValue(Array.isArray(snapshot.outcomes?.cohorts?.narrative?.cohorts) && Array.isArray(snapshot.outcomes?.cohorts?.lifecycle?.cohorts), "snapshot", "outcome cohort contracts were missing");
+  requireValue(snapshot.riskIntelligence?.schemaVersion === 1, "snapshot", "risk identity schema was missing");
+  requireValue(snapshot.riskIntelligence?.source?.id === "geckoterminal" && snapshot.riskIntelligence.source.apiVersion === "20230203", "snapshot", "pinned risk identity source evidence was missing");
+  requireValue(snapshot.riskIntelligence?.source?.rawResponsesPersisted === false && snapshot.riskIntelligence?.source?.rawProfilesPersisted === false, "snapshot", "risk identity retention boundary was missing");
+  requireValue(snapshot.riskIntelligence?.rankingImpact === "none-uncalibrated", "snapshot", "risk identity ranking boundary was missing");
+  requireValue(snapshot.riskIntelligence?.cohort?.policy === "risk-specific-prospective-fixed-admission-v1"
+    && snapshot.riskIntelligence?.cohort?.limit === 120
+    && typeof snapshot.riskIntelligence?.cohort?.universe === "string"
+    && (expectedMode !== "live" || snapshot.riskIntelligence.cohort.universe.includes("independent from the v0.6 outcome cohort"))
+    && Array.isArray(snapshot.riskIntelligence?.cohort?.observations), "snapshot", "independent inspectable risk cohort contract was missing");
+  requireValue(JSON.stringify(snapshot.riskIntelligence?.evidenceClasses) === JSON.stringify(["on-chain-finalized", "provider-observed", "feed-observed-processed", "locally-derived", "unavailable"]), "snapshot", "risk identity evidence classes were missing");
+  requireValue(Number.isFinite(snapshot.riskIntelligence?.coverage?.stateCount) && Number.isFinite(snapshot.riskIntelligence?.coverage?.successCount), "snapshot", "risk identity coverage was missing");
+  requireValue(!/"(?:fingerprint|normalizedName|normalizedSymbol|normalizedHandle|normalizedDomain|normalizedWebsite)"\s*:/i.test(JSON.stringify({ riskIntelligence: snapshot.riskIntelligence, tokens: snapshot.tokens, leaderboard: snapshot.leaderboard })), "snapshot", "private normalized identity values leaked into the public contract");
   for (const entry of snapshot.leaderboard?.top100 || []) {
     for (const window of ["5m", "15m", "1h", "6h", "24h"]) {
       const outcome = entry?.outcome?.windows?.[window];
@@ -146,11 +177,17 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(htmlResult.body.includes(`<meta name="application-version" content="${expectedVersion}">`), "html", "release version marker was missing");
   requireValue(htmlResult.body.includes("NO WALLET · NO EXECUTION"), "html", "read-only safety marker was missing");
   requireValue(htmlResult.body.includes('data-release-marker="provider-observed-outcome-engine"') && htmlResult.body.includes("On-chain data provided by GeckoTerminal") && htmlResult.body.includes("Powered by CoinGecko"), "html", "outcome engine attribution marker was missing");
+  requireValue(htmlResult.body.includes('data-release-marker="risk-identity-evidence-v1"') && htmlResult.body.includes("NO COMPOSITE SCORE"), "html", "risk identity release marker was missing");
   requireValue(scriptResult.body.includes("renderFeedObservability"), "app.js", "feed observability UI marker was missing");
   requireValue(scriptResult.body.includes("renderOutcomes") && scriptResult.body.includes("raw candle retention off"), "app.js", "outcome engine UI marker was missing");
+  requireValue(scriptResult.body.includes("renderRiskIntelligence")
+    && scriptResult.body.includes("identifier reuse only—not duplicate content")
+    && scriptResult.body.includes("SYNTHETIC DEMO"), "app.js", "risk identity UI truthfulness markers were missing");
   requireValue(stylesResult.body.includes(".outcome-source,footer{font-size:10px}"), "styles.css", "minimum-size provider attribution style was missing");
-  requireValue(termsResult.body.includes("CoinGecko API Terms") && termsResult.body.includes("not verified prices"), "terms", "provider ownership or data-risk terms were missing");
-  requireValue(privacyResult.body.includes("Minimal data by design") && privacyResult.body.includes("does not persist or expose bulk GeckoTerminal responses"), "privacy", "privacy and retention notice was missing");
+  requireValue(stylesResult.body.includes(".risk-intelligence-source"), "styles.css", "risk identity responsive style was missing");
+  requireValue(termsResult.body.includes("CoinGecko API Terms") && termsResult.body.includes("not verified prices")
+    && termsResult.body.includes("does not prove duplicate content") && termsResult.body.includes("common control"), "terms", "provider ownership or risk-evidence terms were missing");
+  requireValue(privacyResult.body.includes("Minimal data by design") && privacyResult.body.includes("does not persist or expose bulk GeckoTerminal responses") && privacyResult.body.includes("domain-separated hashes"), "privacy", "privacy and retention notice was missing");
 
   return {
     ok: true,
@@ -163,10 +200,11 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       uptimeSeconds: health.service.uptimeSeconds,
       errorsTotal: health.telemetry.errorsTotal,
       responses5xx: health.telemetry.responses5xx,
-      outcomeState: health.outcomes.status
+      outcomeState: health.outcomes.status,
+      riskIdentityState: health.riskIntelligence.status
     },
     http: { health: 200, snapshot: 200, html: 200, appJs: 200, styles: 200, terms: 200, privacy: 200 },
-    markers: { version: true, readOnly: true, observability: true, outcomeEngine: true, legalNotices: true }
+    markers: { version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true, legalNotices: true }
   };
 }
 

@@ -7,15 +7,16 @@ test("momentum rewards velocity and buyer breadth", () => {
   const hot = momentumScore({ volume5m: 15_000, uniqueBuyers: 35, buyRatio: .75, bondingProgress: 88 });
   assert.ok(hot > quiet); assert.ok(hot >= 75);
 });
-test("risk rises with concentration and creator flags", () => {
-  const low = riskScore({ devHoldingPct: 2, top10Pct: 20, buyRatio: .7, creatorRisk: false });
-  const high = riskScore({ devHoldingPct: 22, top10Pct: 74, buyRatio: .3, creatorRisk: true });
-  assert.ok(high > low); assert.ok(high >= 70);
+test("live risk remains withheld until outcome calibration exists", () => {
+  assert.equal(riskScore({ source: "pumpportal", devHoldingPct: 22, top10Pct: 74, buyRatio: .3, creatorRisk: true }), null);
+  assert.equal(riskScore({ source: "demo", risk: 73 }), null);
+  assert.equal(momentumScore({ volume5m: null, uniqueBuyers: null, buyRatio: null, bondingProgress: null }), null);
 });
 test("risk confidence separates synthetic and unenriched live data", () => {
   assert.equal(riskConfidence({ source: "demo" }), "synthetic");
-  assert.equal(riskConfidence({ source: "pumpportal", devHoldingPct: null, top10Pct: null, buyRatio: null, creatorRisk: null }), "unverified");
-  assert.equal(riskConfidence({ source: "pumpportal", devHoldingPct: 4, top10Pct: 31, buyRatio: .61, creatorRisk: false }), "verified");
+  assert.equal(riskConfidence({ source: "pumpportal", devHoldingPct: null, top10Pct: null, buyRatio: null, creatorRisk: null }), "unavailable");
+  assert.equal(riskConfidence({ source: "pumpportal", riskIdentity: { overallEvidence: "provider-observed" } }), "provider-observed");
+  assert.equal(riskConfidence({ source: "pumpportal", riskIdentity: { overallEvidence: "locally-derived" } }), "locally-derived");
 });
 test("narratives are deterministic", () => {
   assert.equal(classifyNarrative("Neural AI agent coin"), "AI agents");

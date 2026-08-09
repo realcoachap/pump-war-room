@@ -2,8 +2,18 @@ import { classifyNarrative, momentumScore } from "./signals.js";
 
 const NEW_TOKEN_TYPES = new Set(["create", "creation", "new-token", "new_token", "newtoken"]);
 const MIGRATION_TYPES = new Set(["migrate", "migrated", "migration"]);
+const SOLANA_ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const eventType = (value) => typeof value === "string" ? value.trim().toLowerCase() : "";
+const publicKey = (value) => {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return SOLANA_ADDRESS_PATTERN.test(normalized) ? normalized : null;
+};
+const nonNegativeNumber = (value) => {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
 
 /**
  * Classify only event types that PumpPortal identifies or that contain legacy
@@ -44,7 +54,8 @@ export class PumpPortalIngestor {
     connectTimeoutMs = 15_000,
     now = () => Date.now()
   }) {
-    Object.assign(this, { url, watchTrades, onToken, onMigration, onStatus });
+    if (watchTrades) throw new RangeError("PumpPortal trade subscriptions are disabled: this service has no approved metered trade-data contract");
+    Object.assign(this, { url, watchTrades: false, onToken, onMigration, onStatus });
     this.WebSocketImpl = WebSocketImpl;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
@@ -57,7 +68,6 @@ export class PumpPortalIngestor {
     this.connectTimer = null;
     this.ws = null;
     this.closed = false;
-    this.tradeMints = new Set();
 
     this.statusName = "idle";
     this.connectionStatus = "idle";
@@ -121,7 +131,7 @@ export class PumpPortalIngestor {
 
   _handle(raw, observedAt) {
     const kind = classifyPumpPortalEvent(raw);
-    const mint = raw && typeof raw === "object" ? raw.mint || raw.tokenAddress : null;
+    const mint = raw && typeof raw === "object" ? publicKey(raw.mint || raw.tokenAddress) : null;
     if (!kind || !mint) {
       this.counters.ignoredMessages++;
       return;
@@ -135,28 +145,47 @@ export class PumpPortalIngestor {
       return result;
     }
 
-    const solUsd = Number(process.env.SOL_USD) || 160;
+    const solUsd = Number(process.env.SOL_USD);
+    const marketCapSol = nonNegativeNumber(raw.marketCapSol ?? raw.marketCap);
+    const curveSol = nonNegativeNumber(raw.vSolInBondingCurve);
+    const launchSolAmount = nonNegativeNumber(raw.solAmount);
     const token = {
+      ingestSchemaVersion: 2,
       mint,
       name: raw.name || "Unknown",
       symbol: raw.symbol || "???",
-      creator: raw.traderPublicKey || raw.creator || "unknown",
+      // Pump's declared creator and the transaction user/deployer are distinct
+      // identities.  The declared creator need not sign, so never substitute
+      // the traderPublicKey when creator is absent.
+      creator: publicKey(raw.creator),
+      deployer: publicKey(raw.user ?? raw.traderPublicKey),
       description: raw.description || "",
       createdAt: observedAt,
       status: "bonding",
       narrative: classifyNarrative(`${raw.name || ""} ${raw.symbol || ""} ${raw.description || ""}`),
-      marketCap: Number(raw.marketCapSol || raw.marketCap || 0) * solUsd,
-      volume5m: Number(raw.vSolInBondingCurve || raw.solAmount || 0) * solUsd,
-      priceChange5m: 0,
-      uniqueBuyers: 1,
+      marketCap: marketCapSol !== null && Number.isFinite(solUsd) && solUsd > 0
+        ? marketCapSol * solUsd
+        : null,
+      marketCapSol,
+      marketCapEvidence: Number.isFinite(solUsd) && solUsd > 0
+        ? { evidenceClass: "locally-derived", basis: "feed-market-cap-sol-times-operator-sol-usd", solUsd }
+        : { evidenceClass: "unavailable", basis: "operator-sol-usd-not-configured", solUsd: null },
+      // Create frames do not contain a five-minute traded-volume window.
+      // vSolInBondingCurve is curve inventory and solAmount is the creation
+      // transaction amount; neither is labelled as volume.
+      volume5m: null,
+      curveSol,
+      launchSolAmount,
+      priceChange5m: null,
+      uniqueBuyers: null,
       buyRatio: null,
-      bondingProgress: 0,
+      bondingProgress: null,
       devHoldingPct: null,
       top10Pct: null,
       creatorRisk: null,
-      smartWallets: 0,
+      smartWallets: null,
       source: "pumpportal",
-      riskConfidence: "unverified"
+      riskConfidence: "unavailable"
     };
     token.momentum = momentumScore(token);
     token.risk = null;
@@ -166,10 +195,6 @@ export class PumpPortalIngestor {
     this.onToken?.(token);
     this._recordActivity(observedAt, "new-token");
 
-    if (this.watchTrades && !this.tradeMints.has(mint)) {
-      this.tradeMints.add(mint);
-      this._send({ method: "subscribeTokenTrade", keys: [mint] });
-    }
   }
 
   getStatus() {
@@ -217,12 +242,6 @@ export class PumpPortalIngestor {
     this._send({ method: "subscribeNewToken" }, socket);
     this._send({ method: "subscribeMigration" }, socket);
 
-    if (this.watchTrades && this.tradeMints.size) {
-      const mints = [...this.tradeMints];
-      for (let index = 0; index < mints.length; index += 5_000) {
-        this._send({ method: "subscribeTokenTrade", keys: mints.slice(index, index + 5_000) }, socket);
-      }
-    }
   }
 
   _onMessage(socket, event) {

@@ -1,4 +1,5 @@
 data/*.db
 data/*.db-*
 screenshots/
+node_modules/
 .env
