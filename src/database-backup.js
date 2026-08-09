@@ -29,6 +29,7 @@ const RISK_SCHEMA_VERSION = 700;
 const ACTION_SCHEMA_VERSION = 800;
 const HARDENED_ACTION_SCHEMA_VERSION = 801;
 const ACTOR_SCHEMA_VERSION = 900;
+const DEPLOYED_V091_ACTOR_PARSER_REVISION = "official-pump-account-bound-v3";
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
@@ -667,7 +668,9 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     if (!actorInstallationSecretValid) fail("Database actor installation secret is missing or malformed");
     if (!actorOnly) {
       actorMethodRevision = installation[0].methodRevision;
-      if (actorMethodRevision !== SOLANA_ACTOR_PARSER_REVISION) {
+      const knownPreviousRevision = allowLegacy && userVersion === STORE_SCHEMA_VERSION
+        && actorMethodRevision === DEPLOYED_V091_ACTOR_PARSER_REVISION;
+      if (actorMethodRevision !== SOLANA_ACTOR_PARSER_REVISION && !knownPreviousRevision) {
         fail(`Database actor method revision ${actorMethodRevision || "missing"} does not match ${SOLANA_ACTOR_PARSER_REVISION}`);
       }
     }
@@ -977,10 +980,23 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
       ACTION_SCHEMA_VERSION, HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION].includes(restored.userVersion)
       ? restored.userVersion
       : null;
-    if (migratedFromSchemaVersion !== null) {
-      const migratedStore = new Store(restoredPath);
-      migratedStore.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
-      migratedStore.db.close();
+    const migratedFromActorMethodRevision = restored.userVersion === STORE_SCHEMA_VERSION
+      && restored.actorMethodRevision !== SOLANA_ACTOR_PARSER_REVISION
+      ? restored.actorMethodRevision
+      : null;
+    if (migratedFromSchemaVersion !== null || migratedFromActorMethodRevision !== null) {
+      let migratedStore;
+      try {
+        migratedStore = new Store(restoredPath);
+        const preparation = migratedStore.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
+        if (migratedFromActorMethodRevision !== null && (!preparation.changed
+          || preparation.previousRevision !== migratedFromActorMethodRevision
+          || preparation.currentRevision !== SOLANA_ACTOR_PARSER_REVISION)) {
+          fail("Disposable restore did not prepare the supported actor method revision migration");
+        }
+      } finally {
+        try { migratedStore?.db.close(); } catch {}
+      }
       restored = inspectDatabaseFile(restoredPath);
     }
     const applicationWriteProbe = verifyApplicationWrites(restoredPath);
@@ -1009,6 +1025,7 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
         integrityCheck: restored.integrityCheck,
         userVersion: restored.userVersion,
         migratedFromSchemaVersion,
+        migratedFromActorMethodRevision,
         applicationWriteProbe,
         sha256: restored.sha256,
         bytes: restored.bytes,

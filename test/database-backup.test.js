@@ -29,6 +29,7 @@ import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
 const actorMint = "So11111111111111111111111111111111111111112";
+const V091_ACTOR_PARSER_REVISION = "official-pump-account-bound-v3";
 
 function actorObservation(overrides = {}) {
   return {
@@ -610,6 +611,75 @@ test("migrates schema 900 by preserving the installation secret and clearing pre
   assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 
+test("verifies a deployed v0.9.1 schema-901 artifact and prepares v4 only on the disposable restore", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const { store, databasePath } = seededStore(directory);
+  const actorSecretBefore = store.actorPrivacySecret().toString("hex");
+  store.db.prepare("UPDATE actor_installation SET method_revision=? WHERE id=1")
+    .run(V091_ACTOR_PARSER_REVISION);
+  store.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+  store.db.close();
+  const before = { hash: digest(databasePath), modifiedAt: statSync(databasePath).mtime.toISOString() };
+
+  assert.throws(
+    () => inspectDatabaseFile(databasePath),
+    (error) => error instanceof DatabaseVerificationError && /actor method revision/.test(error.message)
+  );
+  const artifact = inspectDatabaseFile(databasePath, { allowLegacy: true });
+  assert.equal(artifact.userVersion, STORE_SCHEMA_VERSION);
+  assert.equal(artifact.actorMethodRevision, V091_ACTOR_PARSER_REVISION);
+  assert.equal(artifact.rowCounts.actor_cohort, 1);
+  assert.equal(artifact.rowCounts.actor_observations, 1);
+  assert.equal(artifact.rowCounts.actor_summaries, 1);
+
+  const report = verifyRestorableBackup(databasePath, { scratchRoot: scratchDirectory });
+  assert.equal(report.artifact.sha256, before.hash);
+  assert.equal(report.artifact.actorMethodRevision, V091_ACTOR_PARSER_REVISION);
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, null);
+  assert.equal(report.disposableRestore.migratedFromActorMethodRevision, V091_ACTOR_PARSER_REVISION);
+  assert.equal(report.disposableRestore.actorMethodRevision, SOLANA_ACTOR_PARSER_REVISION);
+  assert.equal(report.disposableRestore.rowCounts.actor_cohort, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_observations, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_summaries, 0);
+  assert.equal(report.disposableRestore.applicationWriteProbe.actor.installationSecretStable, true);
+
+  assert.equal(digest(databasePath), before.hash);
+  assert.equal(statSync(databasePath).mtime.toISOString(), before.modifiedAt);
+  const original = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const installation = original.prepare("SELECT secret,method_revision AS methodRevision FROM actor_installation WHERE id=1").get();
+    assert.equal(Buffer.from(installation.secret).toString("hex"), actorSecretBefore);
+    assert.equal(installation.methodRevision, V091_ACTOR_PARSER_REVISION);
+    assert.equal(original.prepare("SELECT count(*) AS count FROM actor_cohort").get().count, 1);
+    assert.equal(original.prepare("SELECT count(*) AS count FROM actor_observations").get().count, 1);
+    assert.equal(original.prepare("SELECT count(*) AS count FROM actor_summaries").get().count, 1);
+  } finally {
+    original.close();
+  }
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
+test("rejects an unknown schema-901 actor method revision without changing the artifact", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const { store, databasePath } = seededStore(directory);
+  store.db.prepare("UPDATE actor_installation SET method_revision=? WHERE id=1")
+    .run("official-pump-unknown-v99");
+  store.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+  store.db.close();
+  const before = { hash: digest(databasePath), modifiedAt: statSync(databasePath).mtime.toISOString() };
+
+  assert.throws(
+    () => verifyRestorableBackup(databasePath, { scratchRoot: scratchDirectory }),
+    (error) => error instanceof DatabaseVerificationError
+      && /actor method revision official-pump-unknown-v99 does not match/.test(error.message)
+  );
+  assert.equal(digest(databasePath), before.hash);
+  assert.equal(statSync(databasePath).mtime.toISOString(), before.modifiedAt);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
 test("rejects an active WAL database whose main file is not a standalone restore", (t) => {
   const directory = temporaryWorkspace(t);
   const scratchDirectory = path.join(directory, "scratch");
@@ -704,6 +774,8 @@ test("requires actor retention schema and rejects persisted raw actor identities
   const { store: leakedStore, databasePath: leakedPath } = seededStore(leakedDirectory);
   leakedStore.db.prepare("UPDATE actor_observations SET event=? WHERE event_key='seeded-actor-observation'")
     .run(JSON.stringify({ ...actorObservation(), actorAddress: "So11111111111111111111111111111111111111112" }));
+  leakedStore.db.prepare("UPDATE actor_installation SET method_revision=? WHERE id=1")
+    .run(V091_ACTOR_PARSER_REVISION);
   leakedStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
   leakedStore.db.close();
   assert.throws(

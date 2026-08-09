@@ -516,7 +516,7 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   });
 });
 
-test("accepts an explicitly disabled live actor worker while reconciling persisted cohort telemetry", async (t) => {
+test("fails release smoke when the live actor worker is explicitly disabled", async (t) => {
   const baseUrl = await fixture(t, {
     "/api/health": jsonOverride((health) => {
       health.earlyActors.status = "disabled";
@@ -528,9 +528,11 @@ test("accepts an explicitly disabled live actor worker while reconciling persist
     })
   });
 
-  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
-  assert.equal(result.ok, true);
-  assert.equal(result.health.earlyActorState, "disabled");
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /current early-actor parser was not exercised/.test(error.message)
+  );
 });
 
 test("fails when early-actor sampling loses its bounded raw-data retention contract", async (t) => {
@@ -608,14 +610,17 @@ test("fails when early-actor rejection-reason telemetry does not reconcile", asy
   );
 });
 
-test("allows fresh prospective actor acquisition with no evidence yet", async (t) => {
+test("fails release smoke before the current actor parser accepts evidence", async (t) => {
   const prospective = () => [actorObservation()];
   const baseUrl = await fixture(t, {
     "/api/health": jsonOverride((health) => configureActorHealth(health, prospective(), "observing")),
     "/api/snapshot": jsonOverride((snapshot) => configureActorSnapshot(snapshot, prospective(), "observing"))
   });
-  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
-  assert.equal(result.ok, true);
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /no accepted evidence from the current early-actor parser/.test(error.message)
+  );
 });
 
 test("fails when one failed attempted mint is hidden by one untouched prospective admission", async (t) => {
@@ -668,8 +673,9 @@ test("accepts actor acquisition at the 25% attempted-mint failure boundary", asy
       errorCode: "invalid-transaction-response"
     }),
     ...[1, 2, 3].map((mintIndex) => actorObservation({
-      mintIndex, status: "unavailable", attemptCount: 1,
-      lastAttemptAt: "2026-08-08T12:00:00.000Z", lastSuccessAt: "2026-08-08T12:00:00.000Z"
+      mintIndex, status: mintIndex === 1 ? "observing" : "unavailable", attemptCount: 1,
+      lastAttemptAt: "2026-08-08T12:00:00.000Z", lastSuccessAt: "2026-08-08T12:00:00.000Z",
+      summary: mintIndex === 1 ? actorSummary(cohortMint(mintIndex)) : null
     }))
   ];
   const baseUrl = await fixture(t, {

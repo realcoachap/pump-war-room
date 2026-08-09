@@ -248,6 +248,7 @@ function validateActorEngine(engine, path, check, expectedMode) {
     && engine.cohort.evidenceMintCount <= engine.cohort.admittedCount
     && Number.isSafeInteger(engine.cohort?.attemptedMintCount) && engine.cohort.attemptedMintCount >= 0
     && engine.cohort.attemptedMintCount <= engine.cohort.admittedCount
+    && engine.cohort.evidenceMintCount <= engine.cohort.attemptedMintCount
     && Number.isSafeInteger(engine.cohort?.failureStateCount) && engine.cohort.failureStateCount >= 0
     && engine.cohort.failureStateCount <= engine.cohort.attemptedMintCount
     && (engine.cohort.attemptedMintCount === 0
@@ -289,6 +290,10 @@ function validateActorEngine(engine, path, check, expectedMode) {
       && engine.cohort.pendingAttemptCount === 0),
     check, `${path} exhausted every admitted mint with zero actor evidence`);
   }
+  requireValue(engine.status !== "disabled", check,
+    `${path} was disabled, so the current early-actor parser was not exercised`);
+  requireValue(engine.cohort.evidenceMintCount >= 1, check,
+    `${path} had no accepted evidence from the current early-actor parser`);
 }
 
 function validatePublicRiskIdentity(identity, path) {
