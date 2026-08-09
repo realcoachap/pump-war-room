@@ -1,3 +1,5 @@
+import { unavailableProviderOutcome, validateProviderObservedOutcome } from "./outcomes.js";
+
 const WINDOWS = ["5m", "15m", "1h", "6h", "24h"];
 
 const finite = (value) => value !== null && value !== undefined && value !== "" && typeof value !== "boolean" && Number.isFinite(Number(value)) ? Number(value) : null;
@@ -18,22 +20,24 @@ function freshness(createdAt, now) {
   return { state, observedAt: new Date(observedAt).toISOString(), ageSeconds };
 }
 
-function outcome(token) {
-  const supplied = token.outcomes && typeof token.outcomes === "object" ? token.outcomes : {};
-  const windows = Object.fromEntries(WINDOWS.map((window) => {
-    const value = finite(supplied[window]?.returnPct ?? supplied[window]);
-    return [window, value === null
-      ? { status: "unavailable", returnPct: null, reason: "No verified follow-up price observation" }
-      : { status: "observed", returnPct: value, reason: null }];
-  }));
-  const observed = Object.values(windows).filter((window) => window.status === "observed").length;
+function trustedOutcome(value) {
+  try { return validateProviderObservedOutcome(value, { requireProspectiveSelection: true }); }
+  catch { return null; }
+}
+
+function outcome(token, outcomesByMint, now) {
+  const supplied = outcomesByMint instanceof Map ? outcomesByMint.get(token.mint) : outcomesByMint?.[token.mint];
+  const providerState = supplied?.evidence && typeof supplied.evidence === "object" ? supplied : null;
+  const verified = trustedOutcome(providerState?.evidence?.outcome ?? supplied);
+  const asOf = new Date(now).toISOString();
+  const launchAt = timestamp(token.createdAt) === null ? asOf : new Date(timestamp(token.createdAt)).toISOString();
+  const fallback = unavailableProviderOutcome({ launchAt, asOf, state: providerState });
+  const matchingVerified = verified && timestamp(verified.launchAt) === timestamp(token.createdAt) ? verified : null;
   return {
-    status: observed === WINDOWS.length ? "complete" : observed ? "partial" : "awaiting-enrichment",
-    basis: observed ? "verified-price-observations" : null,
+    ...(matchingVerified || fallback),
     graduation: token.status === "graduated"
       ? { status: "observed", observedAt: token.graduatedAt || null }
-      : { status: "pending", observedAt: null },
-    windows
+      : { status: "pending", observedAt: null }
   };
 }
 
@@ -51,7 +55,7 @@ function publicToken(token) {
   return result;
 }
 
-function scoreToken(token, now) {
+function scoreToken(token, now, outcomesByMint) {
   const momentum = clamp(Math.max(0, finite(token.momentum) ?? 0));
   const curve = clamp(Math.max(0, finite(token.bondingProgress) ?? 0));
   const buyers = Math.max(0, finite(token.uniqueBuyers) ?? 0);
@@ -68,16 +72,16 @@ function scoreToken(token, now) {
     curve >= 75 ? "Near graduation" : curve > 0 ? `Curve ${Math.round(curve)}%` : "Curve unverified",
     confidence === "verified" ? `Verified risk ${Math.round(risk ?? 0)}/100` : "Risk unverified"
   ];
-  return { token: publicToken(token), score: Math.round(score * 10) / 10, reasons, freshness: fresh, riskConfidence: confidence, outcome: outcome(token) };
+  return { token: publicToken(token), score: Math.round(score * 10) / 10, reasons, freshness: fresh, riskConfidence: confidence, outcome: outcome(token, outcomesByMint, now) };
 }
 
-export function createTop100(tokens, { now = Date.now(), mode = "live" } = {}) {
+export function createTop100(tokens, { now = Date.now(), mode = "live", outcomesByMint = null } = {}) {
   if (!Array.isArray(tokens)) return [];
   return tokens
     .filter((token) => token && typeof token === "object" && token.mint)
     .filter((token) => mode !== "live" || token.source === "pumpportal")
     .filter((token) => mode !== "live" || validLiveMint(token.mint))
-    .map((token) => scoreToken(token, now))
+    .map((token) => scoreToken(token, now, outcomesByMint))
     .sort((a, b) => b.score - a.score || (timestamp(b.token.createdAt) ?? 0) - (timestamp(a.token.createdAt) ?? 0) || String(a.token.mint).localeCompare(String(b.token.mint)))
     .slice(0, 100)
     .map((entry, index) => ({ rank: index + 1, mode, chain: "solana", ...entry }));

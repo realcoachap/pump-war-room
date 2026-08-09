@@ -1,4 +1,4 @@
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let refreshInFlight = false;
@@ -207,9 +207,13 @@ function renderTokens() {
 
 function outcomeCell(entry, window) {
   const outcome = entry?.outcome?.windows?.[window];
-  if (!outcome || outcome.status !== "observed" || !hasNumber(outcome.returnPct)) return '<span class="outcome-unavailable" title="No verified follow-up price observation">—</span>';
+  if (!outcome || outcome.status !== "observed" || !hasNumber(outcome.returnPct)) {
+    const reason = outcome?.reason ? String(outcome.reason).replaceAll("-", " ") : "No provider-observed follow-up candle";
+    return `<span class="outcome-unavailable" title="${esc(reason)}">—</span>`;
+  }
   const value = number(outcome.returnPct);
-  return `<span class="outcome-value ${value < 0 ? "negative" : "positive"}">${value >= 0 ? "+" : ""}${Math.round(value * 10) / 10}%</span>`;
+  const evidence = `Expected ${outcome.expectedAt || "—"}; completed close ${outcome.observedAt || "—"}; staleness ${number(outcome.stalenessSeconds)}s; source ${outcome.source || "unverified"}`;
+  return `<span class="outcome-value ${value < 0 ? "negative" : "positive"}" title="${esc(evidence)}">${value >= 0 ? "+" : ""}${Math.round(value * 10) / 10}%</span>`;
 }
 
 function leaderboardEntries() {
@@ -253,6 +257,51 @@ function renderLeaderboard() {
     </button>`;
   }).join("");
   document.querySelectorAll(".leaderboard-row").forEach((row) => row.addEventListener("click", () => openToken(row.dataset.mint)));
+}
+
+function signedPct(value) {
+  if (!hasNumber(value)) return "—";
+  const rounded = Math.round(number(value) * 10) / 10;
+  return `${rounded > 0 ? "+" : ""}${rounded}%`;
+}
+
+function renderOutcomes() {
+  const outcomeState = state.outcomes && typeof state.outcomes === "object" ? state.outcomes : {};
+  const engine = outcomeState.engine && typeof outcomeState.engine === "object" ? outcomeState.engine : {};
+  const status = String(engine.status || (state.mode === "live" ? "acquiring" : "disabled")).toUpperCase();
+  $("#outcome-engine-state").textContent = status;
+  const windows = outcomeState.summary?.windows && typeof outcomeState.summary.windows === "object" ? outcomeState.summary.windows : {};
+  const keys = ["5m", "15m", "1h", "6h", "24h"];
+  $("#outcome-summary").innerHTML = keys.map((key) => {
+    const metric = windows[key] || {};
+    const sufficient = metric.status === "sufficient-evidence";
+    const sample = number(metric.evidenceCount);
+    const minimum = number(metric.minimumEvidence, 3);
+    const coverage = Math.round(number(metric.coverageRatio) * 100);
+    const minimumCoverage = Math.round(number(metric.minimumCoverageRatio, 0.5) * 100);
+    return `<article class="outcome-card ${sufficient ? "measured" : "waiting"}"><span>${key.toUpperCase()} RETURN</span><strong>${sufficient ? signedPct(metric.medianReturnPct) : "—"}</strong><dl><div><dt>HIT RATE</dt><dd>${sufficient ? signedPct(metric.hitRatePct) : "—"}</dd></div><div><dt>WORST DRAWDOWN</dt><dd>${sufficient ? signedPct(-number(metric.maximumDrawdownPct)) : "—"}</dd></div></dl><small>${sample}/${minimum} evidence · ${coverage}%/${minimumCoverage}% coverage</small></article>`;
+  }).join("");
+  const cohorts = Array.isArray(outcomeState.cohorts?.narrative?.cohorts) ? outcomeState.cohorts.narrative.cohorts : [];
+  $("#outcome-cohorts").innerHTML = cohorts.length ? cohorts.slice(0, 8).map((cohort) => {
+    const metric = cohort.windows?.["1h"] || {};
+    const sufficient = metric.status === "sufficient-evidence";
+    return `<div class="outcome-cohort"><span><b>${esc(cohort.cohort)}</b><small>${number(cohort.outcomeCount)} tracked</small></span><span><b>${sufficient ? signedPct(metric.medianReturnPct) : "—"}</b><small>${sufficient ? `${signedPct(metric.hitRatePct)} hit rate` : `${number(metric.evidenceCount)}/${number(metric.minimumEvidence, 3)} evidence`}</small></span></div>`;
+  }).join("") : '<div class="outcome-empty">No narrative cohort has provider-observed follow-up evidence yet.</div>';
+  const coverage = outcomeState.coverage && typeof outcomeState.coverage === "object" ? outcomeState.coverage : {};
+  const cohortLimit = number(outcomeState.sampling?.cohortLimit, 120);
+  $("#outcome-coverage").textContent = `${nf.format(number(coverage.total ?? outcomeState.summary?.outcomeCount))}/${nf.format(cohortLimit)} prospective cohort · ${nf.format(number(coverage.withObservedWindows))} with measured windows · raw candle retention off`;
+}
+
+function outcomeDetail(entry) {
+  const outcome = entry?.outcome;
+  if (!outcome?.windows) return '<div class="outcome-detail"><span class="kicker">PROVIDER-OBSERVED OUTCOMES</span><p>No provider-grounded outcome record is available for this observation.</p></div>';
+  const rows = ["5m", "15m", "1h", "6h", "24h"].map((key) => {
+    const window = outcome.windows[key] || {};
+    if (window.status !== "observed") return `<div><b>${key}</b><strong>—</strong><small>${esc(String(window.reason || "target observation missing").replaceAll("-", " "))}</small></div>`;
+    return `<div><b>${key}</b><strong class="${number(window.returnPct) < 0 ? "negative" : "positive"}">${signedPct(window.returnPct)}</strong><small>close ${esc(window.observedAt || "—")} · calculated ${esc(window.calculatedAt || "—")} · staleness ${number(window.stalenessSeconds)}s · drawdown ${signedPct(-number(window.maximumDrawdownPct))}</small></div>`;
+  }).join("");
+  const baseline = outcome.baseline?.status === "observed" ? `Initial baseline reference completed ${outcome.baseline.observedAt}; ${outcome.baseline.source} pool ${shortMint(outcome.baseline.pool)}` : `Baseline ${String(outcome.baseline?.reason || "missing").replaceAll("-", " ")}`;
+  return `<div class="outcome-detail"><span class="kicker">PROVIDER-OBSERVED OUTCOMES // SOURCE EVIDENCE</span><p>${esc(baseline)}. Each horizon freezes its first derived value from a baseline and target returned together in that provider refresh; calculated timestamps disclose independently observed provider revisions. Returns never interpolate gaps.</p><div class="outcome-detail-grid">${rows}</div></div>`;
 }
 
 function narrativeRows() {
@@ -470,6 +519,7 @@ function render() {
   renderFeedObservability();
   renderStats();
   renderLeaderboard();
+  renderOutcomes();
   renderTokens();
   renderCallouts();
   renderNarratives();
@@ -491,7 +541,8 @@ async function refresh() {
       callouts: Array.isArray(snapshot.callouts) ? snapshot.callouts : [],
       narratives: Array.isArray(snapshot.narratives) ? snapshot.narratives : [],
       stats: snapshot.stats && typeof snapshot.stats === "object" ? snapshot.stats : {},
-      leaderboard: snapshot.leaderboard && typeof snapshot.leaderboard === "object" ? snapshot.leaderboard : { top100: [] }
+      leaderboard: snapshot.leaderboard && typeof snapshot.leaderboard === "object" ? snapshot.leaderboard : { top100: [] },
+      outcomes: snapshot.outcomes && typeof snapshot.outcomes === "object" ? snapshot.outcomes : {}
     };
     snapshotFailed = false;
     render();
@@ -507,6 +558,7 @@ async function refresh() {
 function openToken(mint) {
   const token = rankedTokens().find((candidate) => candidate.mint === mint);
   if (!token) return;
+  const leaderboardEntry = Array.isArray(state.leaderboard?.top100) ? state.leaderboard.top100.find((entry) => entry.token?.mint === mint) : null;
   const confidence = riskConfidence(token);
   const momentum = [];
   const risks = [];
@@ -520,7 +572,7 @@ function openToken(mint) {
   if (token.creatorRisk) risks.push("creator history flag");
   $("#token-detail").innerHTML = `<div class="detail"><span class="kicker">${esc(token.narrative || "Unclassified")} // ${esc(token.status || "observed")}</span><h2>${esc(token.name || "Unnamed mint")} <span class="risk-low">${esc(token.symbol || "??")}</span></h2><div class="mint">${esc(token.mint)}</div>
     <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? number(token.momentum) : "—"}/100</strong></div><div class="detail-card"><label>RISK · ${esc(confidence.toUpperCase())}</label><strong class="${riskClass(token.risk)}">${riskLabel(token)}${hasNumber(token.risk) ? "/100" : ""}</strong></div><div class="detail-card"><label>MARKET CAP</label><strong>${money(token.marketCap)}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${nf.format(number(token.uniqueBuyers))}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>SMART WALLETS</label><strong>${nf.format(number(token.smartWallets))}</strong></div></div>
-    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk read</strong><br>${esc((confidence === "unverified" ? ["awaiting holder, creator, and trade enrichment"] : risks.length ? risks : ["no major heuristic flags"]).join(" · "))}</div></div>
+    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk read</strong><br>${esc((confidence === "unverified" ? ["awaiting holder, creator, and trade enrichment"] : risks.length ? risks : ["no major heuristic flags"]).join(" · "))}</div></div>${outcomeDetail(leaderboardEntry)}
     <div class="detail-actions"><button class="primary" id="export-coin">EXPORT TO OBSIDIAN</button><a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
   $("#token-dialog").showModal();
   $("#export-coin").onclick = async () => {

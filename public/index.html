@@ -149,10 +149,26 @@
         <label><span>FRESHNESS</span><select id="leaderboard-freshness"><option value="all">All observations</option><option value="fresh">Fresh</option><option value="aging">Aging</option><option value="stale">Stale</option></select></label>
         <label><span>RISK CONFIDENCE</span><select id="leaderboard-risk"><option value="all">All confidence</option><option value="verified">Verified</option><option value="unverified">Unverified</option></select></label>
       </form>
-      <div class="leaderboard-scope" role="note"><b>Scope:</b> strict observed-feed inventory. Outcome windows show <strong>—</strong> until verified follow-up prices exist; missing data is never interpreted as performance.</div>
+      <div class="leaderboard-scope" role="note"><b>Scope:</b> strict observed-feed inventory. Outcome windows show <strong>—</strong> until provider-observed follow-up candles exist; missing data is never interpreted as performance.</div>
       <div class="leaderboard-table" role="region" aria-label="Top 100 observed coins" tabindex="0">
         <div class="leaderboard-columns" aria-hidden="true"><span>#</span><span>Asset / rank reason</span><span>Radar</span><span>Freshness</span><span>Risk</span><span>5m</span><span>1h</span><span>24h</span></div>
         <div id="leaderboard-rows"><div class="loading">Building observed-feed ranking…</div></div>
+      </div>
+    </section>
+
+    <section class="outcomes panel" aria-labelledby="outcomes-title" data-release-marker="provider-observed-outcome-engine">
+      <header class="outcomes-header">
+        <div>
+          <span class="kicker">PROVIDER-OBSERVED OUTCOME ENGINE // COMPLETED CANDLES ONLY</span>
+          <h2 id="outcomes-title">What happened after observation?</h2>
+          <p>Auditable returns, hit rate, median return, and observed-close drawdown. Missing evidence stays missing.</p>
+        </div>
+        <div class="outcome-source"><span id="outcome-engine-state">ACQUIRING</span><a href="https://www.geckoterminal.com/" target="_blank" rel="noreferrer">On-chain data provided by GeckoTerminal ↗</a><a href="https://www.coingecko.com/" target="_blank" rel="noreferrer">Powered by CoinGecko ↗</a></div>
+      </header>
+      <div id="outcome-summary" class="outcome-summary"><div class="loading">Acquiring provider-observed outcome evidence…</div></div>
+      <div class="outcome-cohort-grid">
+        <div><span class="kicker">NARRATIVE COHORTS // 1H</span><div id="outcome-cohorts" class="outcome-cohorts"><div class="loading">Waiting for cohort evidence…</div></div></div>
+        <div class="outcome-method" role="note"><span class="kicker">AUDIT CONTRACT</span><p id="outcome-method-copy">A fixed prospective cohort admits up to 120 launches; the earliest-created eligible pool returned on the provider-ranked first page is fixed within 2 minutes, with page and rank disclosed. Selection calls are prioritized before candle work. Each horizon freezes its first derived value from a baseline and target returned together in that refresh, with an independent provider-revision timestamp. Provider prices, volumes, bulk candles, and raw responses are not retained.</p><small id="outcome-coverage">0 outcome records</small></div>
       </div>
     </section>
 
@@ -182,7 +198,7 @@
       </aside>
     </section>
 
-    <footer><span>NO WALLET · NO EXECUTION · NO PRICE PROMISES · <b id="app-version">v—</b></span><span>Signals are transparent heuristics, not financial advice.</span></footer>
+    <footer><span>NO WALLET · NO EXECUTION · NO PRICE PROMISES · <b id="app-version">v—</b></span><span>Signals are transparent heuristics, not financial advice. <a href="https://www.geckoterminal.com/" target="_blank" rel="noreferrer">On-chain data: GeckoTerminal</a> · <a href="https://www.coingecko.com/" target="_blank" rel="noreferrer">Powered by CoinGecko</a> · <a href="/terms.html">Terms</a> · <a href="/privacy.html">Privacy</a>.</span></footer>
   </main>
 
   <dialog id="token-dialog">

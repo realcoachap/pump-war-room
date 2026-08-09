@@ -19,34 +19,47 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { STORE_SCHEMA_VERSION } from "./store.js";
+import { Store, STORE_SCHEMA_VERSION } from "./store.js";
+
+const LEGACY_SCHEMA_VERSION = 501;
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
   events: Object.freeze(["id", "kind", "mint", "payload", "created_at"]),
   alerts: Object.freeze(["id", "level", "title", "message", "mint", "created_at"]),
-  callouts: Object.freeze(["external_id", "mint", "payload", "created_at"])
+  callouts: Object.freeze(["external_id", "mint", "payload", "created_at"]),
+  outcome_enrichment: Object.freeze([
+    "mint", "provider", "pool", "token_side", "dex", "source_url", "evidence", "status", "missing_reason", "error_code",
+    "attempt_count", "last_attempt_at", "next_attempt_at", "last_success_at", "updated_at"
+  ])
 });
 
 const REQUIRED_COLUMN_TYPES = Object.freeze({
   tokens: Object.freeze({ mint: "TEXT", payload: "TEXT", created_at: "TEXT", updated_at: "TEXT" }),
   events: Object.freeze({ id: "INTEGER", kind: "TEXT", mint: "TEXT", payload: "TEXT", created_at: "TEXT" }),
   alerts: Object.freeze({ id: "INTEGER", level: "TEXT", title: "TEXT", message: "TEXT", mint: "TEXT", created_at: "TEXT" }),
-  callouts: Object.freeze({ external_id: "TEXT", mint: "TEXT", payload: "TEXT", created_at: "TEXT" })
+  callouts: Object.freeze({ external_id: "TEXT", mint: "TEXT", payload: "TEXT", created_at: "TEXT" }),
+  outcome_enrichment: Object.freeze({
+    mint: "TEXT", provider: "TEXT", pool: "TEXT", token_side: "TEXT", dex: "TEXT", source_url: "TEXT",
+    evidence: "TEXT", status: "TEXT", missing_reason: "TEXT", error_code: "TEXT", attempt_count: "INTEGER",
+    last_attempt_at: "TEXT", next_attempt_at: "TEXT", last_success_at: "TEXT", updated_at: "TEXT"
+  })
 });
 
 const REQUIRED_PRIMARY_KEYS = Object.freeze({
   tokens: Object.freeze(["mint"]),
   events: Object.freeze(["id"]),
   alerts: Object.freeze(["id"]),
-  callouts: Object.freeze(["external_id"])
+  callouts: Object.freeze(["external_id"]),
+  outcome_enrichment: Object.freeze(["mint"])
 });
 
 const REQUIRED_NOT_NULL = Object.freeze({
   tokens: Object.freeze(["payload", "created_at", "updated_at"]),
   events: Object.freeze(["kind", "payload", "created_at"]),
   alerts: Object.freeze(["level", "title", "message", "created_at"]),
-  callouts: Object.freeze(["mint", "payload", "created_at"])
+  callouts: Object.freeze(["mint", "payload", "created_at"]),
+  outcome_enrichment: Object.freeze(["mint", "evidence", "status", "attempt_count", "updated_at"])
 });
 
 const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
@@ -55,6 +68,18 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     name: "callouts_mint_created",
     tableName: "callouts",
     sql: "CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "outcome_enrichment_provider_due",
+    tableName: "outcome_enrichment",
+    sql: "CREATE INDEX outcome_enrichment_provider_due ON outcome_enrichment(provider, next_attempt_at, mint)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "outcome_enrichment_provider_status_updated",
+    tableName: "outcome_enrichment",
+    sql: "CREATE INDEX outcome_enrichment_provider_status_updated ON outcome_enrichment(provider, status, updated_at DESC, mint)"
   }),
   Object.freeze({
     type: "table",
@@ -76,11 +101,29 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
   }),
   Object.freeze({
     type: "table",
+    name: "outcome_enrichment",
+    tableName: "outcome_enrichment",
+    sql: `CREATE TABLE outcome_enrichment (
+      mint TEXT PRIMARY KEY NOT NULL, provider TEXT, pool TEXT, token_side TEXT, dex TEXT, source_url TEXT,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence) = 'object'),
+      status TEXT NOT NULL, missing_reason TEXT, error_code TEXT,
+      attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0), last_attempt_at TEXT,
+      next_attempt_at TEXT, last_success_at TEXT, updated_at TEXT NOT NULL,
+      CHECK(token_side IS NULL OR token_side IN ('base','quote'))
+    )`
+  }),
+  Object.freeze({
+    type: "table",
     name: "tokens",
     tableName: "tokens",
     sql: "CREATE TABLE tokens (mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
   })
 ]);
+
+const LEGACY_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
+  Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => table !== "outcome_enrichment")
+));
+const LEGACY_SCHEMA_OBJECTS = Object.freeze(EXPECTED_SCHEMA_OBJECTS.filter(({ tableName }) => tableName !== "outcome_enrichment"));
 
 export class DatabaseVerificationError extends Error {
   constructor(message, options) {
@@ -154,7 +197,7 @@ function normalizeSchemaSql(value) {
     .trim();
 }
 
-function inspectOpenDatabase(database) {
+function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const integrity = pragmaValues(database, "PRAGMA integrity_check");
   if (integrity.length !== 1 || integrity[0] !== "ok") {
     fail(`SQLite integrity check failed: ${integrity.join("; ") || "no result"}`);
@@ -165,9 +208,13 @@ function inspectOpenDatabase(database) {
     fail(`SQLite foreign-key check found ${foreignKeyViolations.length} violation(s)`);
   }
 
+  const userVersion = Number(database.prepare("PRAGMA user_version").get().user_version);
+  const legacy = allowLegacy && userVersion === LEGACY_SCHEMA_VERSION;
+  const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA : REQUIRED_DATABASE_SCHEMA;
+  const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS : EXPECTED_SCHEMA_OBJECTS;
   const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(({ name }) => name);
   const rowCounts = {};
-  for (const [table, requiredColumns] of Object.entries(REQUIRED_DATABASE_SCHEMA)) {
+  for (const [table, requiredColumns] of Object.entries(requiredSchema)) {
     if (!tables.includes(table)) fail(`Database is not a Pump War Room backup: missing table ${table}`);
     const tableInfo = database.prepare(`SELECT name,type,"notnull",pk
       FROM pragma_table_info(?) ORDER BY cid`).all(table);
@@ -205,17 +252,20 @@ function inspectOpenDatabase(database) {
     fail(`Database contains unsupported trigger(s): ${unsupportedTriggers.map(({ name }) => name).join(", ")}`);
   }
   const normalizedSchema = schema.map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }));
-  const normalizedExpectedSchema = EXPECTED_SCHEMA_OBJECTS.map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }));
+  const normalizedExpectedSchema = expectedSchemaObjects.map((row) => ({ ...row, sql: normalizeSchemaSql(row.sql) }));
   if (JSON.stringify(normalizedSchema) !== JSON.stringify(normalizedExpectedSchema)) {
     fail("Database schema objects do not exactly match the supported Pump War Room schema");
   }
-  const userVersion = Number(database.prepare("PRAGMA user_version").get().user_version);
-  if (userVersion !== STORE_SCHEMA_VERSION) {
+  if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy && userVersion === LEGACY_SCHEMA_VERSION)) {
     fail(`Database schema version ${userVersion} does not match required version ${STORE_SCHEMA_VERSION}`);
   }
-  const invalidJsonPayloads = Object.fromEntries(["tokens", "events", "callouts"].map((table) => [
+  const jsonColumns = {
+    tokens: "payload", events: "payload", callouts: "payload",
+    ...(legacy ? {} : { outcome_enrichment: "evidence" })
+  };
+  const invalidJsonPayloads = Object.fromEntries(Object.entries(jsonColumns).map(([table, column]) => [
     table,
-    Number(database.prepare(`SELECT count(*) AS count FROM ${table} WHERE NOT json_valid(payload)`).get().count)
+    Number(database.prepare(`SELECT count(*) AS count FROM ${table} WHERE NOT json_valid(${column})`).get().count)
   ]));
   return {
     integrityCheck: "ok",
@@ -276,6 +326,11 @@ function verifyApplicationWrites(databasePath) {
     database.prepare(`INSERT INTO callouts (external_id,mint,payload,created_at)
       VALUES (?,?,?,?) ON CONFLICT(external_id) DO UPDATE SET payload=excluded.payload`)
       .run(externalId, mint, payload, createdAt);
+    database.prepare(`INSERT INTO outcome_enrichment
+      (mint,provider,pool,token_side,dex,source_url,evidence,status,missing_reason,error_code,attempt_count,last_attempt_at,next_attempt_at,last_success_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(mint, "restore-probe", `restore-pool-${suffix}`, "base", "probe-dex", null,
+        JSON.stringify({ source: "restore-verification" }), "complete", null, null, 1, createdAt, null, createdAt, createdAt);
     const inserted = Number(database.prepare("SELECT count(*) AS count FROM tokens WHERE mint=?").get(mint).count);
     if (inserted !== 1) fail("Database application write probe could not read its disposable token row");
     database.exec("ROLLBACK");
@@ -292,12 +347,12 @@ function verifyApplicationWrites(databasePath) {
   }
 }
 
-export function inspectDatabaseFile(databasePath) {
+export function inspectDatabaseFile(databasePath, { allowLegacy = false } = {}) {
   const candidate = regularFile(databasePath, "Database file");
   let database;
   try {
     database = new DatabaseSync(candidate.realPath, { readOnly: true });
-    const sqlite = inspectOpenDatabase(database);
+    const sqlite = inspectOpenDatabase(database, { allowLegacy });
     database.close();
     database = undefined;
     const metadata = statSync(candidate.realPath);
@@ -337,11 +392,17 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
   let operationError = null;
 
   try {
-    const artifact = inspectDatabaseFile(backup.realPath);
+    const artifact = inspectDatabaseFile(backup.realPath, { allowLegacy: true });
     copyFileSync(backup.realPath, restoredPath, constants.COPYFILE_EXCL);
     chmodSync(restoredPath, 0o600);
-    const restored = inspectDatabaseFile(restoredPath);
+    let restored = inspectDatabaseFile(restoredPath, { allowLegacy: true });
     assertSameRestore(artifact, restored);
+    const migratedFromSchemaVersion = restored.userVersion === LEGACY_SCHEMA_VERSION ? LEGACY_SCHEMA_VERSION : null;
+    if (migratedFromSchemaVersion !== null) {
+      const migratedStore = new Store(restoredPath);
+      migratedStore.db.close();
+      restored = inspectDatabaseFile(restoredPath);
+    }
     const applicationWriteProbe = verifyApplicationWrites(restoredPath);
     const afterProbe = inspectDatabaseFile(restoredPath);
     if (afterProbe.schemaSha256 !== restored.schemaSha256 ||
@@ -363,6 +424,8 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
       disposableRestore: {
         verified: true,
         integrityCheck: restored.integrityCheck,
+        userVersion: restored.userVersion,
+        migratedFromSchemaVersion,
         applicationWriteProbe,
         sha256: restored.sha256,
         bytes: restored.bytes,

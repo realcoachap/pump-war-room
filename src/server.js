@@ -13,6 +13,9 @@ import { analyzeSnapshot } from "./analyst.js";
 import { createRateLimiter, HttpError, readJsonBody } from "./http.js";
 import { createTop100 } from "./ranking.js";
 import { createRuntimeTelemetry, FEED_STALE_AFTER_MS, observeFeed, observeStorage } from "./observability.js";
+import { GECKOTERMINAL_PROVIDER, GeckoTerminalClient } from "./geckoterminal.js";
+import { VerifiedOutcomeIngestor } from "./outcome-ingest.js";
+import { aggregateOutcomeCohorts, OUTCOME_REVISION_POLICY, summarizeVerifiedOutcomes, unavailableProviderOutcome, validateProviderObservedOutcome } from "./outcomes.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
@@ -46,6 +49,7 @@ let reconnects = 0;
 let feedMessages = 0;
 let feedParseErrors = 0;
 let pumpPortalIngestor = null;
+let outcomeIngestor = null;
 
 function feedObservation() {
   const telemetry = pumpPortalIngestor?.getStatus?.() || null;
@@ -120,6 +124,7 @@ async function maybeSendTelegram(alert) {
 function upsert(token) {
   const previous = store.token(token.mint);
   store.upsertToken(token); store.addEvent(previous ? "update" : "mint", token);
+  outcomeIngestor?.enqueue(token);
   alertFor(token, previous); send(previous ? "token-update" : "new-token", token);
 }
 
@@ -130,6 +135,7 @@ function addCallout(callout) {
 }
 
 function snapshot() {
+  const generatedAt = new Date().toISOString();
   const callouts = store.callouts(200);
   const calloutCounts = callouts.reduce((counts, callout) => counts.set(callout.mint, (counts.get(callout.mint) || 0) + 1), new Map());
   const tokens = store.tokens(120)
@@ -144,8 +150,33 @@ function snapshot() {
     row.coins++; row.volume += token.volume5m || 0; row.momentum += token.momentum || 0;
     return acc;
   }, {})).map((row) => ({ ...row, momentum: Math.round(row.momentum / row.coins) })).sort((a, b) => b.volume - a.volume);
-  const top100 = createTop100(tokens, { mode });
-  const generatedAt = new Date().toISOString();
+  const enrichmentStates = store.enrichmentStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+  const enrichmentByMint = new Map(enrichmentStates
+    .map((state) => [state.mint, state]));
+  const outcomesByMint = new Map(tokens.flatMap((token) => {
+    const enrichment = enrichmentByMint.get(token.mint);
+    return enrichment ? [[token.mint, enrichment]] : [];
+  }));
+  const top100 = createTop100(tokens, { mode, outcomesByMint });
+  const cohortEntries = enrichmentStates.flatMap((enrichment) => {
+    const token = store.token(enrichment.mint);
+    if (!token || token.source !== "pumpportal") return [];
+    const launchAt = Number.isFinite(Date.parse(token.createdAt)) ? new Date(Date.parse(token.createdAt)).toISOString() : generatedAt;
+    let outcome;
+    try { outcome = validateProviderObservedOutcome(enrichment.evidence?.outcome, { requireProspectiveSelection: true }); }
+    catch { outcome = unavailableProviderOutcome({ launchAt, asOf: generatedAt, state: enrichment }); }
+    return [{
+      outcome,
+      narrative: token.narrative || "Unclassified",
+      lifecycle: token.status === "graduated" ? "Graduated" : "Bonding / observed"
+    }];
+  });
+  const cohortOutcomes = cohortEntries.map(({ outcome }) => outcome);
+  const outcomeSummary = summarizeVerifiedOutcomes(cohortOutcomes);
+  const narrativeCohorts = aggregateOutcomeCohorts(cohortEntries.map(({ narrative, outcome }) => ({ cohort: narrative, outcome })));
+  const lifecycleCohorts = aggregateOutcomeCohorts(cohortEntries.map(({ lifecycle, outcome }) => ({ cohort: lifecycle, outcome })));
+  const observedOutcomeCount = cohortOutcomes.filter((outcome) => Object.values(outcome.windows || {}).some((window) => window.status === "observed")).length;
+  const persistedOutcomeCoverage = store.outcomeCoverage({ provider: GECKOTERMINAL_PROVIDER.id });
   const feed = feedObservation();
   const source = mode === "live" ? "pumpportal" : null;
   const countSince = (iso) => source ? store.countSinceBySource(iso, source) : store.countSince(iso);
@@ -175,11 +206,74 @@ function snapshot() {
       scope: mode === "live" ? "observed-by-this-war-room" : "simulated-feed",
       rankingBasis: "momentum, curve progress, buyer breadth, freshness, and verified-risk adjustment",
       ranking: { metric: "radar_score_v1", eligibilityVersion: "observed_feed_v1", eligibleCount: top100.length, limit: 100 },
-      outcomeTracking: "Returns remain unavailable until trusted follow-up price observations exist.",
+      outcomeTracking: "Returns use GeckoTerminal-observed completed pool candles; missing targets remain unavailable.",
       top100
+    },
+    outcomes: {
+      schemaVersion: 1,
+      generatedAt,
+      revisionPolicy: OUTCOME_REVISION_POLICY,
+      source: {
+        id: GECKOTERMINAL_PROVIDER.id,
+        label: "GeckoTerminal-observed pool OHLCV",
+        apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
+        intervalSeconds: GECKOTERMINAL_PROVIDER.intervalSeconds,
+        attributionUrl: GECKOTERMINAL_PROVIDER.attributionUrl,
+        poweredByUrl: "https://www.coingecko.com/",
+        publicBeta: true,
+        rawResponsesPersisted: false,
+        rawCandlesPersisted: false,
+        providerOhlcvValuesPersisted: false,
+        retention: "derived metrics and minimal provenance only"
+      },
+      engine: outcomeIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
+      coverage: {
+        ...persistedOutcomeCoverage,
+        total: cohortOutcomes.length,
+        withObservedWindows: observedOutcomeCount
+      },
+      sampling: {
+        policy: "prospective-fixed-admission-v1",
+        cohortLimit: 120,
+        selectionDeadlineSeconds: 120,
+        poolDiscoveryScope: "GeckoTerminal contemporaneously ranked page=1 only; earliest-created eligible returned pool",
+        selectionPriority: "unselected launches before candle retrieval",
+        universe: "PumpPortal launches observed after the outcome engine was active; admitted in observation order until the fixed cohort is full",
+        exclusionsRemainMissing: true
+      },
+      summary: outcomeSummary,
+      cohorts: { narrative: narrativeCohorts, lifecycle: lifecycleCohorts },
+      disclaimer: "Provider-observed on-chain pool data can be delayed, incomplete, revised, or manipulated; outcomes are descriptive research, not price guarantees or financial advice."
     },
     narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
   };
+}
+
+if (mode === "live" && process.env.OUTCOME_ENRICHMENT !== "false") {
+  const outcomeClient = new GeckoTerminalClient({
+    userAgent: `PumpWarRoom/${appVersion} (+https://pump-war-room-production.up.railway.app)`
+  });
+  outcomeIngestor = new VerifiedOutcomeIngestor({
+    store,
+    client: outcomeClient,
+    onStatus: (status, telemetry = {}) => {
+      const details = { status, mint: telemetry.mint, errorCode: telemetry.errorCode, nextAttemptAt: telemetry.nextAttemptAt };
+      if (["degraded", "rate-limited"].includes(status)) runtimeTelemetry.warn("outcomes.status", details);
+      else if (["pool-selected", "observing", "complete"].includes(status)) runtimeTelemetry.info("outcomes.status", { ...details, observations: telemetry.observations, rejected: telemetry.rejected });
+    }
+  });
+  outcomeIngestor.start(store.dueEnrichmentTokens({
+    provider: GECKOTERMINAL_PROVIDER.id,
+    now: new Date().toISOString(),
+    limit: 120
+  }));
+  setInterval(() => {
+    for (const token of store.dueEnrichmentTokens({
+      provider: GECKOTERMINAL_PROVIDER.id,
+      now: new Date().toISOString(),
+      limit: 120
+    })) outcomeIngestor.enqueue(token);
+  }, 60_000).unref();
 }
 
 if (process.env.BARK_API_KEY) {
@@ -265,7 +359,9 @@ const server = http.createServer(async (req, res) => {
       liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
       demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
       reconnects: feed.counters.reconnects, feedMessages: feed.counters.messages, feedParseErrors: feed.counters.malformedMessages,
-      analyst: { status: "ready", engine: "local-grounded-v1" }
+      analyst: { status: "ready", engine: "local-grounded-v1" },
+      outcomes: outcomeIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
+      outcomeCoverage: store.outcomeCoverage({ provider: GECKOTERMINAL_PROVIDER.id })
     });
     }
     if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
@@ -343,7 +439,13 @@ server.listen(port, "0.0.0.0", () => {
       mountPointVerified: storage.mountPointVerified,
       filesystemType: storage.filesystemType
     },
-    feedStaleAfterSeconds: FEED_STALE_AFTER_MS / 1_000
+    feedStaleAfterSeconds: FEED_STALE_AFTER_MS / 1_000,
+    outcomes: {
+      source: GECKOTERMINAL_PROVIDER.id,
+      enabled: Boolean(outcomeIngestor),
+      apiVersion: GECKOTERMINAL_PROVIDER.apiVersion,
+      rawCandlesPersisted: false
+    }
   });
   if (cleanup.tokens) runtimeTelemetry.info("database.demo_cleanup", cleanup);
 });

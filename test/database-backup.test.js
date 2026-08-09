@@ -43,6 +43,14 @@ function seededStore(directory) {
   store.addEvent("mint", { mint: "LiveMintPump", source: "pumpportal" });
   store.addAlert({ level: "signal", title: "Observed", message: "Live row", mint: "LiveMintPump", createdAt });
   store.upsertCallout({ externalId: "callout-1", mint: "LiveMintPump", source: "bark", createdAt });
+  store.upsertEnrichmentState({
+    mint: "LiveMintPump", provider: "dexscreener", pool: "Pool111", tokenSide: "base", dex: "raydium",
+    sourceUrl: "https://dex.example/pools/Pool111", evidence: {
+      outcome: { baseline: { observedAt: createdAt, nonempty: true }, windows: { "5m": { returnPct: 10, maximumDrawdownPct: 2 } } }
+    }, status: "partial",
+    missingReason: "missing-24h", errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
+    nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
+  });
   return { store, databasePath };
 }
 
@@ -64,8 +72,12 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   assert.equal(report.backup.integrityCheck, "ok");
   assert.equal(report.disposableRestore.verified, true);
   assert.deepEqual(report.disposableRestore.applicationWriteProbe, { verified: true, rolledBack: true });
-  assert.deepEqual(report.backup.rowCounts, { tokens: 1, events: 1, alerts: 1, callouts: 1 });
-  assert.deepEqual(report.backup.invalidJsonPayloads, { tokens: 0, events: 0, callouts: 0 });
+  assert.deepEqual(report.backup.rowCounts, {
+    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1
+  });
+  assert.deepEqual(report.backup.invalidJsonPayloads, {
+    tokens: 0, events: 0, callouts: 0, outcome_enrichment: 0
+  });
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(digest(databasePath), sourceBefore);
   assert.equal(digest(`${databasePath}-wal`), walBefore);
@@ -79,7 +91,16 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
     CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL);
     CREATE TABLE callouts (external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC);
-    PRAGMA user_version = 501;
+    CREATE TABLE outcome_enrichment (
+      mint TEXT PRIMARY KEY NOT NULL, provider TEXT, pool TEXT, token_side TEXT, dex TEXT, source_url TEXT,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence) = 'object'),
+      status TEXT NOT NULL, missing_reason TEXT, error_code TEXT,
+      attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0), last_attempt_at TEXT,
+      next_attempt_at TEXT, last_success_at TEXT, updated_at TEXT NOT NULL,
+      CHECK(token_side IS NULL OR token_side IN ('base','quote'))
+    );
+    CREATE INDEX outcome_enrichment_provider_status_updated ON outcome_enrichment(provider, status, updated_at DESC, mint);
+    PRAGMA user_version = 600;
   `);
   constrained.close();
   assert.throws(
@@ -92,6 +113,10 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   const restored = new DatabaseSync(destination, { readOnly: true });
   t.after(() => restored.close());
   assert.equal(JSON.parse(restored.prepare("SELECT payload FROM tokens WHERE mint=?").get("LiveMintPump").payload).symbol, "LIVE");
+  assert.deepEqual(JSON.parse(restored.prepare("SELECT evidence FROM outcome_enrichment WHERE mint=?").get("LiveMintPump").evidence), {
+    outcome: { baseline: { nonempty: true, observedAt: createdAt }, windows: { "5m": { maximumDrawdownPct: 2, returnPct: 10 } } }
+  });
+  assert.equal(restored.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name='price_observations'").get().count, 0);
   assert.equal(store.token("LiveMintPump").symbol, "LIVE");
 });
 
@@ -111,7 +136,38 @@ test("standalone restore verification is read-only and removes its disposable co
   assert.equal(digest(destination), before.hash);
   assert.equal(statSync(destination).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
-  assert.deepEqual(inspectDatabaseFile(destination).rowCounts, { tokens: 1, events: 1, alerts: 1, callouts: 1 });
+  assert.deepEqual(inspectDatabaseFile(destination).rowCounts, {
+    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1
+  });
+});
+
+test("verifies an exact v0.5.1 artifact by migrating only the disposable restore copy", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const legacyPath = path.join(directory, "v0.5.1-backup.db");
+  const legacy = new DatabaseSync(legacyPath);
+  legacy.exec(`
+    CREATE TABLE tokens (mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE callouts (external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC);
+    INSERT INTO tokens VALUES ('legacy-mint','{"mint":"legacy-mint","source":"pumpportal"}','${createdAt}','${createdAt}');
+    PRAGMA user_version = 501;
+  `);
+  legacy.close();
+  const before = { hash: digest(legacyPath), modifiedAt: statSync(legacyPath).mtime.toISOString() };
+
+  const report = verifyRestorableBackup(legacyPath, { scratchRoot: scratchDirectory });
+
+  assert.equal(report.artifact.userVersion, 501);
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, 501);
+  assert.equal(report.disposableRestore.userVersion, 600);
+  assert.equal(report.disposableRestore.rowCounts.tokens, 1);
+  assert.equal(report.disposableRestore.rowCounts.outcome_enrichment, 0);
+  assert.equal(digest(legacyPath), before.hash);
+  assert.equal(statSync(legacyPath).mtime.toISOString(), before.modifiedAt);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 
 test("rejects an active WAL database whose main file is not a standalone restore", (t) => {
@@ -171,6 +227,21 @@ test("keeps backup staging private in a pre-existing shared directory", (t) => {
   assert.equal(report.backup.mode, "0600");
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(readdirSync(destinationDirectory).some((name) => name.includes(".partial")), false);
+});
+
+test("requires the outcome-enrichment lookup index before creating a backup", (t) => {
+  const directory = temporaryWorkspace(t);
+  const { store, databasePath } = seededStore(directory);
+  t.after(() => store.db.close());
+  store.db.exec("DROP INDEX outcome_enrichment_provider_status_updated");
+
+  assert.throws(
+    () => createVerifiedBackup(databasePath, path.join(directory, "must-not-publish.db"), {
+      scratchRoot: path.join(directory, "scratch")
+    }),
+    (error) => error instanceof DatabaseVerificationError && /schema objects do not exactly match/.test(error.message)
+  );
+  assert.equal(readdirSync(directory).includes("must-not-publish.db"), false);
 });
 
 test("rejects corrupt, truncated, and wrong-schema artifacts and cleans scratch space", (t) => {
