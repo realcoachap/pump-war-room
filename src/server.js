@@ -26,7 +26,7 @@ import { attachRiskIdentityEvidence } from "./risk-public.js";
 import { normalizePersistedLiveToken } from "./live-token.js";
 import { projectPublicCallout, projectPublicToken } from "./privacy.js";
 import { ACTOR_COHORT_LIMIT, ACTOR_EARLY_WINDOW_MS, ACTOR_RAW_RETENTION_MS, ACTOR_SIGNATURE_LIMIT, ACTOR_TRANSACTION_LIMIT, EarlyActorIngestor } from "./actor-ingest.js";
-import { SOLANA_MAINNET_RPC, SolanaRpcClient } from "./solana-rpc.js";
+import { SOLANA_ACTOR_PARSER_REVISION, SOLANA_MAINNET_RPC, SolanaRpcClient } from "./solana-rpc.js";
 import {
   buildCoinComparison,
   buildCoinTimeline,
@@ -51,11 +51,40 @@ const publicBaseUrl = typeof configuredPublicBaseUrl === "string" && /^https:\/\
   ? configuredPublicBaseUrl
   : "https://pump-war-room-production.up.railway.app";
 const publicMintPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const rawSolanaIdentityText = /(?:^|[^1-9A-HJ-NP-Za-km-z])(?:[1-9A-HJ-NP-Za-km-z]{64,88}|[1-9A-HJ-NP-Za-km-z]{32,44})(?=$|[^1-9A-HJ-NP-Za-km-z])/;
+const rawSocialProfileText = /(?:^|[\s(])(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)]+)/i;
 const MATERIAL_BASELINE_EVENT_KEY = "material-baseline-v1";
 process.on("uncaughtExceptionMonitor", (error, origin) => runtimeTelemetry.error("process.uncaught_exception", error, { origin }));
 const store = new Store(dbPath);
+const actorRevisionPreparation = store.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
+if (actorRevisionPreparation.changed) {
+  runtimeTelemetry.info("early_actors.method_revision_prepared", actorRevisionPreparation);
+}
+const enforceActorRetention = () => {
+  try { return store.pruneActorObservations({ now: new Date().toISOString(), maximum: 4096 }); }
+  catch (error) {
+    runtimeTelemetry.error("early_actors.retention_failed", error);
+    return null;
+  }
+};
+enforceActorRetention();
+setInterval(enforceActorRetention, 60_000).unref();
 const actorPrivacySecret = store.actorPrivacySecret();
-const publicToken = (token) => projectPublicToken(token, { installationSecret: actorPrivacySecret });
+const publicDisplayText = (value) => {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized && !rawSolanaIdentityText.test(normalized) && !rawSocialProfileText.test(normalized)
+    ? normalized : null;
+};
+const publicToken = (token) => {
+  const projected = projectPublicToken(token, { installationSecret: actorPrivacySecret });
+  if (!projected) return projected;
+  for (const key of ["name", "symbol", "narrative"]) {
+    const sanitized = publicDisplayText(projected[key]);
+    if (sanitized === null) delete projected[key];
+    else projected[key] = sanitized;
+  }
+  return projected;
+};
 const publicCallout = (callout) => projectPublicCallout(callout, { installationSecret: actorPrivacySecret });
 const identityCleanup = store.sanitizeLegacyCalloutProfiles(publicCallout);
 const storage = observeStorage({
@@ -413,8 +442,9 @@ function snapshot() {
     generatedAt
   });
   const narratives = Object.values(latestEnrichedTokens.reduce((acc, token) => {
-    const row = acc[token.narrative] ||= {
-      name: token.narrative, coins: 0, volume: null, volumeEvidenceCount: 0,
+    const narrative = publicDisplayText(token.narrative) || "Unclassified";
+    const row = acc[narrative] ||= {
+      name: narrative, coins: 0, volume: null, volumeEvidenceCount: 0,
       momentum: null, momentumEvidenceCount: 0
     };
     row.coins++;
@@ -534,9 +564,14 @@ function snapshot() {
   const actorStatus = actorIngestor?.getStatus() || {
     schemaVersion: 1,
     source: SOLANA_MAINNET_RPC.id,
+    parserRevision: SOLANA_ACTOR_PARSER_REVISION,
     status: mode === "live" ? "disabled" : "simulation-disabled",
     queueDepth: 0,
-    cohort: { limit: ACTOR_COHORT_LIMIT, admittedCount: 0, evidenceMintCount: 0, eligibleMintCount: 0, statusCounts: {} },
+    cohort: {
+      limit: ACTOR_COHORT_LIMIT, admittedCount: 0, evidenceMintCount: 0, eligibleMintCount: 0,
+      attemptedMintCount: 0, failureStateCount: 0, failureRatio: null,
+      pendingAttemptCount: 0, terminalCount: 0, terminalFailureCount: 0, statusCounts: {}
+    },
     correlationGate: {
       status: "withheld", minimumEligibleMints: 20, minimumAcquisitionCoverage: 0.6,
       eligibleMintCount: 0, acquisitionCoverage: null, labeledHoldoutCalibrationPassed: false,
@@ -548,6 +583,7 @@ function snapshot() {
     generatedAt,
     source: {
       id: SOLANA_MAINNET_RPC.id,
+      parserRevision: SOLANA_ACTOR_PARSER_REVISION,
       evidenceClass: "on-chain-finalized",
       endpointClass: "documented-rate-limited-public-rpc",
       attributionUrl: SOLANA_MAINNET_RPC.attributionUrl,
@@ -574,7 +610,7 @@ function snapshot() {
       admittedCount: actorStates.length,
       limit: ACTOR_COHORT_LIMIT,
       observations: actorStates.map((actorState) => {
-        const token = store.token(actorState.mint);
+        const token = publicToken(store.token(actorState.mint));
         return {
           mint: actorState.mint,
           name: token?.name || "Unnamed mint",
@@ -712,13 +748,16 @@ function snapshot() {
         admittedCount: mode === "demo" ? riskCohortTokens.length : riskIdentityStates.length,
         universe: mode === "demo" ? "Synthetic demonstration cohort"
           : "PumpPortal launches admitted by the v0.7 risk worker while active; independent from the v0.6 outcome cohort",
-        observations: riskCohortView.tokens.map((token) => ({
-          mint: token.mint,
-          name: token.name,
-          symbol: token.symbol,
-          createdAt: token.createdAt,
-          riskIdentity: token.riskIdentity
-        }))
+        observations: riskCohortView.tokens.map((token) => {
+          const projected = publicToken(token);
+          return {
+            mint: projected.mint,
+            name: projected.name || "Unnamed mint",
+            symbol: projected.symbol || "???",
+            createdAt: projected.createdAt,
+            riskIdentity: projected.riskIdentity
+          };
+        })
       },
       summary: riskCohortView.summary,
       disclaimer: "Provider and feed observations can be incomplete, delayed, or wrong. Exact declared-identifier or registrable-domain reuse does not establish duplicate content, common control, maliciousness, safety, or a probability of harm."
@@ -861,7 +900,7 @@ if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
 }
 
 if (mode === "live" && process.env.EARLY_ACTOR_ENRICHMENT !== "false") {
-  solanaRpcClient = new SolanaRpcClient({ endpoint: process.env.SOLANA_RPC_URL || SOLANA_MAINNET_RPC.endpoint });
+  solanaRpcClient = new SolanaRpcClient({ endpoint: SOLANA_MAINNET_RPC.endpoint });
   actorIngestor = new EarlyActorIngestor({
     store,
     client: solanaRpcClient,
@@ -993,7 +1032,18 @@ const server = http.createServer(async (req, res) => {
         materialPersistence: "atomic-with-durable-baseline",
         telegram: telegramHealth()
       },
-      earlyActors: actorIngestor?.getStatus() || { schemaVersion: 1, source: SOLANA_MAINNET_RPC.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 }
+      earlyActors: actorIngestor?.getStatus() || {
+        schemaVersion: 1,
+        source: SOLANA_MAINNET_RPC.id,
+        parserRevision: SOLANA_ACTOR_PARSER_REVISION,
+        status: mode === "live" ? "disabled" : "simulation-disabled",
+        queueDepth: 0,
+        cohort: {
+          limit: ACTOR_COHORT_LIMIT, admittedCount: 0, evidenceMintCount: 0, eligibleMintCount: 0,
+          attemptedMintCount: 0, failureStateCount: 0, failureRatio: null,
+          pendingAttemptCount: 0, terminalCount: 0, terminalFailureCount: 0, statusCounts: {}
+        }
+      }
     });
     }
     if (url.pathname === "/api/snapshot") {
@@ -1180,6 +1230,7 @@ server.listen(port, "0.0.0.0", () => {
     },
     earlyActors: {
       source: SOLANA_MAINNET_RPC.id,
+      parserRevision: SOLANA_ACTOR_PARSER_REVISION,
       enabled: Boolean(actorIngestor),
       cohortLimit: ACTOR_COHORT_LIMIT,
       rawWalletsPersisted: false,

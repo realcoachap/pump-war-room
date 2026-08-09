@@ -650,7 +650,7 @@ function earlyActorDetail(summary, acquisition = null) {
   if (!metrics) {
     const gate = coverage.gate || {};
     const gateEvidence = summary
-      ? `${number(coverage.eventCount)}/${number(gate.minimumEventCount, 5)} events · ${number(coverage.uniqueActorCount)}/${number(gate.minimumActorCount, 3)} actors · source time ${Math.round(number(coverage.sourceTimestamps?.ratio) * 100)}%`
+      ? `${number(coverage.eventCount)}/${number(gate.minimumEventCount, 5)} summarized observations · ${number(coverage.uniqueActorCount)}/${number(gate.minimumActorCount, 3)} actors · source time ${Math.round(number(coverage.sourceTimestamps?.ratio) * 100)}%`
       : "No minimized actor observation summary is retained for this mint.";
     const reason = acquisition?.missingReason || "The minimum event, actor, and source-time gate has not been met.";
     return `<div class="early-actor-detail"><span class="kicker">ANONYMOUS EARLY-ACTOR EVIDENCE // ${esc(stateLabel.toUpperCase())}</span><p>${esc(gateEvidence)}. ${esc(reason)} Missing evidence is unknown; no behavior or outcome inference is published.</p></div>`;
@@ -661,7 +661,7 @@ function earlyActorDetail(summary, acquisition = null) {
   const amount = metrics.amountConcentration || {};
   const burst = metrics.activityBurst || {};
   const rows = [
-    ["Unique actors", nf.format(number(metrics.uniqueActors?.count)), `${number(coverage.eventCount)} retained events · source-time coverage ${Math.round(number(coverage.sourceTimestamps?.ratio) * 100)}%`],
+    ["Unique actors", nf.format(number(metrics.uniqueActors?.count)), `${number(coverage.eventCount)} summarized observations · source-time coverage ${Math.round(number(coverage.sourceTimestamps?.ratio) * 100)}%`],
     ["Launch-relative timing", timing.state === "available" ? offsetMsLabel(timing.actorFirstObservationOffsetMs?.median) : "—", `${timing.actorsObservedWithinWindow ?? "—"} actors observed inside the ${durationMsLabel(timing.earlyWindowMs)} bounded window; source time minus launch receipt`],
     ["Repeat activity", `${number(repeats.actorsWithMultipleBuys)} buy / ${number(repeats.actorsWithMultipleSells)} sell`, `${number(repeats.actorsObservedOnBothSides)} actors observed on both validated sides`],
     ["Observed duration", holding.state === "available" ? durationMsLabel(holding.medianMs) : "—", `${number(holding.pairedObservationCount)} observed buy-to-later-sell pairings; not a complete holding period`],
@@ -688,10 +688,10 @@ function renderEarlyActors() {
     ["ADMITTED MINTS", `${nf.format(admitted)}/${nf.format(limit)}`, "fixed prospective cohort; no historical backfill"],
     ["EVIDENCE MINTS", nf.format(evidenceMints), `${admitted ? acquisition : 0}% sampled acquisition; completeness unmeasured`],
     ["ELIGIBLE MINTS", nf.format(eligibleMints), "per-coin event, actor, and source-time gates met"],
-    ["RAW IDENTITY RETENTION", "OFF", "wallets, signatures, payloads, and lookup mappings excluded"]
+    ["RAW ADDRESSES / SIGNATURES", "EXCLUDED", "not stored in actor evidence tables or exposed publicly"]
   ].map(([label, value, note]) => `<article><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
-  $("#early-actor-cohort-scope").textContent = `${nf.format(admitted)}/${nf.format(limit)} admitted · ${nf.format(evidenceMints)} with evidence · partial acquisition expected`;
-  $("#early-actor-cohort").innerHTML = observations.length ? observations.slice(0, 12).map((observation) => {
+  $("#early-actor-cohort-scope").textContent = `${nf.format(admitted)}/${nf.format(limit)} admitted · showing all ${nf.format(observations.length)} · ${nf.format(evidenceMints)} with evidence`;
+  $("#early-actor-cohort").innerHTML = observations.length ? observations.map((observation) => {
     const coverage = observation.summary?.coverage || {};
     const status = String(coverage.state || observation.acquisition?.status || "unavailable").replaceAll("-", " ");
     const detail = observation.summary

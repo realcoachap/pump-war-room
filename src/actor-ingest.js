@@ -4,12 +4,18 @@ import {
   normalizeEarlyActorTrade,
   summarizeEarlyActorEvents
 } from "./early-actors.js";
-import { extractFinalizedActorInputs, SOLANA_MAINNET_RPC, SolanaRpcError } from "./solana-rpc.js";
+import {
+  extractFinalizedActorInputs,
+  SOLANA_ACTOR_PARSER_REVISION,
+  SOLANA_MAINNET_RPC,
+  SolanaRpcError
+} from "./solana-rpc.js";
+import { ACTOR_OBSERVATION_MAX_RETENTION_MS } from "./store.js";
 
 export const ACTOR_COHORT_LIMIT = 32;
 export const ACTOR_SIGNATURE_LIMIT = 16;
 export const ACTOR_TRANSACTION_LIMIT = 8;
-export const ACTOR_RAW_RETENTION_MS = 72 * 60 * 60 * 1_000;
+export const ACTOR_RAW_RETENTION_MS = ACTOR_OBSERVATION_MAX_RETENTION_MS;
 export const ACTOR_EARLY_WINDOW_MS = 30 * 60 * 1_000;
 const ATTEMPT_OFFSETS_MS = Object.freeze([2 * 60_000, 10 * 60_000, 30 * 60_000]);
 const REPLAY_MAX_AGE_MS = 2 * 60_000;
@@ -45,7 +51,9 @@ function publicErrorCode(error) {
 
 export class EarlyActorIngestor {
   constructor({ store, client, now = () => Date.now(), onStatus, extract = extractFinalizedActorInputs } = {}) {
-    if (!store || typeof store.actorPrivacySecret !== "function") throw new TypeError("store must provide actor persistence");
+    if (!store || typeof store.actorPrivacySecret !== "function" || typeof store.prepareActorMethodRevision !== "function") {
+      throw new TypeError("store must provide revision-aware actor persistence");
+    }
     if (!client || typeof client.signaturesForAddress !== "function" || typeof client.transaction !== "function") {
       throw new TypeError("client must provide bounded Solana RPC reads");
     }
@@ -55,6 +63,7 @@ export class EarlyActorIngestor {
     this.now = now;
     this.onStatus = onStatus;
     this.extract = extract;
+    this.revisionPreparation = store.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
     this.secret = store.actorPrivacySecret();
     this.running = false;
     this.started = false;
@@ -79,6 +88,7 @@ export class EarlyActorIngestor {
   }
 
   start() {
+    this.store.pruneActorObservations({ now: new Date(this.now()).toISOString(), maximum: 4096 });
     this.started = true;
     this.#emit("idle");
   }
@@ -107,6 +117,7 @@ export class EarlyActorIngestor {
 
   async drainDue() {
     if (!this.started || this.running) return false;
+    this.store.pruneActorObservations({ now: new Date(this.now()).toISOString(), maximum: 4096 });
     const [state] = this.store.dueActorStates({ now: new Date(this.now()).toISOString(), limit: 1 });
     if (!state) return false;
     this.running = true;
@@ -125,6 +136,14 @@ export class EarlyActorIngestor {
     const evidenceMintCount = summaries.filter((summary) => summary.coverage?.eventCount > 0).length;
     const eligibleMintCount = summaries.filter((summary) => summary.coverage?.state === "available").length;
     const admittedCount = states.length;
+    const attemptedMintCount = states.filter((state) => state.attemptCount > 0).length;
+    const failureStateCount = states.filter((state) => state.attemptCount > 0
+      && ["rate-limited", "degraded", "invalid-response"].includes(state.status)).length;
+    const failureRatio = attemptedMintCount ? failureStateCount / attemptedMintCount : null;
+    const pendingAttemptCount = states.filter((state) => state.nextAttemptAt !== null).length;
+    const terminalCount = admittedCount - pendingAttemptCount;
+    const terminalFailureCount = states.filter((state) => state.nextAttemptAt === null
+      && ["rate-limited", "degraded", "invalid-response"].includes(state.status)).length;
     const acquisitionCoverage = admittedCount ? evidenceMintCount / admittedCount : null;
     const correlationGate = {
       status: eligibleMintCount >= 20 && acquisitionCoverage !== null && acquisitionCoverage >= 0.6 ? "review-required" : "withheld",
@@ -141,14 +160,23 @@ export class EarlyActorIngestor {
     return {
       schemaVersion: 1,
       source: SOLANA_MAINNET_RPC.id,
-      status: this.running ? "acquiring" : admittedCount ? "observing" : "awaiting-prospective-admission",
+      parserRevision: SOLANA_ACTOR_PARSER_REVISION,
+      status: this.running ? "acquiring"
+        : !admittedCount ? "awaiting-prospective-admission"
+          : pendingAttemptCount > 0 ? (this.lastErrorCode && evidenceMintCount === 0 ? "degraded" : "observing")
+            : evidenceMintCount > 0 ? "complete-partial"
+              : terminalFailureCount > 0 ? "failed" : "complete-with-missing",
       started: this.started,
       queueDepth: this.store.dueActorStates({ now: new Date(this.now()).toISOString(), limit: ACTOR_COHORT_LIMIT }).length,
       lastAttemptAt: this.lastAttemptAt,
       lastSuccessAt: this.lastSuccessAt,
       lastErrorAt: this.lastErrorAt,
       lastErrorCode: this.lastErrorCode,
-      cohort: { limit: ACTOR_COHORT_LIMIT, admittedCount, evidenceMintCount, eligibleMintCount, statusCounts },
+      cohort: {
+        limit: ACTOR_COHORT_LIMIT, admittedCount, evidenceMintCount, eligibleMintCount,
+        attemptedMintCount, failureStateCount, failureRatio,
+        pendingAttemptCount, terminalCount, terminalFailureCount, statusCounts
+      },
       correlationGate,
       counters: { ...this.counters }
     };
@@ -162,16 +190,18 @@ export class EarlyActorIngestor {
     this.lastAttemptAt = attemptedAt;
     this.counters.attempts++;
     this.#emit("acquiring", { mint: state.mint });
+    let candidates = [];
+    let observed = 0;
+    let rejected = 0;
+    let acquisitionError = null;
     try {
       const signatures = await this.client.signaturesForAddress(state.mint, { limit: ACTOR_SIGNATURE_LIMIT });
       this.counters.signaturesReturned += signatures.length;
       const launchSourceFloorMs = Math.floor(launchAtMs / 1_000) * 1_000;
-      const candidates = signatures
+      candidates = signatures
         .filter((entry) => entry.blockTime * 1_000 >= launchSourceFloorMs && entry.blockTime * 1_000 <= launchAtMs + ACTOR_EARLY_WINDOW_MS)
         .sort((left, right) => left.blockTime - right.blockTime || left.signature.localeCompare(right.signature))
         .slice(0, ACTOR_TRANSACTION_LIMIT);
-      let observed = 0;
-      let rejected = 0;
       for (const signature of candidates) {
         this.counters.transactionsRequested++;
         const transaction = await this.client.transaction(signature.signature);
@@ -212,8 +242,15 @@ export class EarlyActorIngestor {
           }
         }
       }
-      const events = this.store.actorObservationEvents(state.mint, 512);
-      const summary = summarizeEarlyActorEvents(state.mint, events, {
+    } catch (error) {
+      acquisitionError = error;
+    }
+
+    let events = [];
+    let summary = null;
+    try {
+      events = this.store.actorObservationEvents(state.mint, 512);
+      summary = summarizeEarlyActorEvents(state.mint, events, {
         mintCreatedAt: state.launchObservedAt,
         minimumEventCount: 5,
         minimumActorCount: 3,
@@ -221,29 +258,17 @@ export class EarlyActorIngestor {
         earlyWindowMs: ACTOR_EARLY_WINDOW_MS
       });
       this.store.saveActorSummary(state.mint, summary);
-      this.store.pruneActorObservations({ now: attemptedAt, maximum: 4096 });
-      const terminal = scheduledNext === null;
-      const status = terminal ? "complete" : summary.coverage.eventCount > 0 ? "observing" : "unavailable";
-      const missingReason = summary.coverage.eventCount > 0
-        ? summary.coverage.state === "available" ? null : "Minimum per-coin event/actor/source-time gate not yet met"
-        : candidates.length === 0
-          ? "No finalized address-referencing signatures were returned inside the bounded early window"
-          : "Bounded transactions did not contain unambiguous official Pump buy/sell evidence";
-      this.store.recordActorState({
-        mint: state.mint,
-        status,
-        attemptedAt,
-        nextAttemptAt: scheduledNext,
-        successAt: attemptedAt,
-        missingReason,
-        errorCode: null
-      });
-      this.lastSuccessAt = attemptedAt;
-      this.lastErrorCode = null;
-      this.#emit(status, { mint: state.mint, observed, rejected, coverageState: summary.coverage.state });
     } catch (error) {
-      const errorCode = publicErrorCode(error);
-      const terminal = scheduledNext === null;
+      acquisitionError ||= error;
+    }
+    try {
+      this.store.pruneActorObservations({ now: attemptedAt, maximum: 4096 });
+    } catch (error) {
+      acquisitionError ||= error;
+    }
+
+    if (acquisitionError) {
+      const errorCode = publicErrorCode(acquisitionError);
       const status = errorCode === "rate-limited" ? "rate-limited"
         : errorCode.startsWith("invalid-") ? "invalid-response"
           : "degraded";
@@ -251,16 +276,39 @@ export class EarlyActorIngestor {
         mint: state.mint,
         status,
         attemptedAt,
-        nextAttemptAt: terminal ? null : scheduledNext,
+        nextAttemptAt: scheduledNext,
         successAt: null,
-        missingReason: "Bounded finalized transaction acquisition failed; evidence remains unavailable",
+        missingReason: events.length > 0
+          ? "Partial bounded evidence retained; acquisition failed and coverage remains explicit"
+          : "Bounded finalized transaction acquisition failed; evidence remains unavailable",
         errorCode
       });
       this.lastErrorAt = attemptedAt;
       this.lastErrorCode = errorCode;
       this.counters.failures++;
-      this.#emit(status, { mint: state.mint, errorCode, error });
+      this.#emit(status, { mint: state.mint, errorCode, error: acquisitionError, coverageState: summary?.coverage?.state });
+      return;
     }
+
+    const terminal = scheduledNext === null;
+    const status = terminal ? "complete" : summary.coverage.eventCount > 0 ? "observing" : "unavailable";
+    const missingReason = summary.coverage.eventCount > 0
+      ? summary.coverage.state === "available" ? null : "Minimum per-coin event/actor/source-time gate not yet met"
+      : candidates.length === 0
+        ? "No finalized address-referencing signatures were returned inside the bounded early window"
+        : "Bounded transactions did not contain unambiguous official Pump buy/sell evidence";
+    this.store.recordActorState({
+      mint: state.mint,
+      status,
+      attemptedAt,
+      nextAttemptAt: scheduledNext,
+      successAt: attemptedAt,
+      missingReason,
+      errorCode: null
+    });
+    this.lastSuccessAt = attemptedAt;
+    this.lastErrorCode = null;
+    this.#emit(status, { mint: state.mint, observed, rejected, coverageState: summary.coverage.state });
   }
 
   #emit(status, details = {}) {

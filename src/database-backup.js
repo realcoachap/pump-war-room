@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { SOLANA_ACTOR_PARSER_REVISION } from "./solana-rpc.js";
 import { Store, STORE_SCHEMA_VERSION } from "./store.js";
 
 const LEGACY_SCHEMA_VERSION = 501;
@@ -26,6 +27,7 @@ const OUTCOME_SCHEMA_VERSION = 600;
 const RISK_SCHEMA_VERSION = 700;
 const ACTION_SCHEMA_VERSION = 800;
 const HARDENED_ACTION_SCHEMA_VERSION = 801;
+const ACTOR_SCHEMA_VERSION = 900;
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
@@ -48,7 +50,7 @@ export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
     "mint", "provider", "evidence", "status", "missing_reason", "error_code", "attempt_count",
     "last_attempt_at", "next_attempt_at", "last_success_at", "updated_at"
   ]),
-  actor_installation: Object.freeze(["id", "secret", "created_at"]),
+  actor_installation: Object.freeze(["id", "secret", "created_at", "method_revision"]),
   actor_cohort: Object.freeze([
     "mint", "launch_observed_at", "admitted_at", "status", "attempt_count", "last_attempt_at",
     "next_attempt_at", "last_success_at", "missing_reason", "error_code", "updated_at"
@@ -85,7 +87,7 @@ const REQUIRED_COLUMN_TYPES = Object.freeze({
     mint: "TEXT", provider: "TEXT", evidence: "TEXT", status: "TEXT", missing_reason: "TEXT", error_code: "TEXT",
     attempt_count: "INTEGER", last_attempt_at: "TEXT", next_attempt_at: "TEXT", last_success_at: "TEXT", updated_at: "TEXT"
   }),
-  actor_installation: Object.freeze({ id: "INTEGER", secret: "BLOB", created_at: "TEXT" }),
+  actor_installation: Object.freeze({ id: "INTEGER", secret: "BLOB", created_at: "TEXT", method_revision: "TEXT" }),
   actor_cohort: Object.freeze({
     mint: "TEXT", launch_observed_at: "TEXT", admitted_at: "TEXT", status: "TEXT", attempt_count: "INTEGER",
     last_attempt_at: "TEXT", next_attempt_at: "TEXT", last_success_at: "TEXT", missing_reason: "TEXT",
@@ -123,7 +125,7 @@ const REQUIRED_NOT_NULL = Object.freeze({
   ]),
   outcome_enrichment: Object.freeze(["mint", "evidence", "status", "attempt_count", "updated_at"]),
   risk_identity_enrichment: Object.freeze(["mint", "provider", "evidence", "status", "attempt_count", "updated_at"]),
-  actor_installation: Object.freeze(["id", "secret", "created_at"]),
+  actor_installation: Object.freeze(["id", "secret", "created_at", "method_revision"]),
   actor_cohort: Object.freeze(["mint", "launch_observed_at", "admitted_at", "status", "attempt_count", "updated_at"]),
   actor_observations: Object.freeze(["event_key", "mint", "event", "observed_at", "retained_until", "created_at"]),
   actor_summaries: Object.freeze(["mint", "summary", "updated_at"])
@@ -265,7 +267,8 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     sql: `CREATE TABLE actor_installation (
       id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
       secret BLOB NOT NULL CHECK(length(secret)=32),
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      method_revision TEXT NOT NULL DEFAULT 'uninitialized'
     )`
   }),
   Object.freeze({
@@ -365,6 +368,23 @@ const ACTION_SCHEMA_ALERT_OBJECT = Object.freeze({
 const ACTOR_TABLES = Object.freeze(new Set([
   "actor_installation", "actor_cohort", "actor_observations", "actor_summaries"
 ]));
+const LEGACY_ACTOR_INSTALLATION_OBJECT = Object.freeze({
+  type: "table",
+  name: "actor_installation",
+  tableName: "actor_installation",
+  sql: `CREATE TABLE actor_installation (
+    id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+    secret BLOB NOT NULL CHECK(length(secret)=32),
+    created_at TEXT NOT NULL
+  )`
+});
+const ACTOR_DATABASE_SCHEMA = Object.freeze({
+  ...REQUIRED_DATABASE_SCHEMA,
+  actor_installation: Object.freeze(["id", "secret", "created_at"])
+});
+const ACTOR_SCHEMA_OBJECTS = Object.freeze(EXPECTED_SCHEMA_OBJECTS.map((entry) => (
+  entry.type === "table" && entry.name === "actor_installation" ? LEGACY_ACTOR_INSTALLATION_OBJECT : entry
+)));
 const HARDENED_ACTION_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
   Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => !ACTOR_TABLES.has(table))
 ));
@@ -530,17 +550,20 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const riskOnly = allowLegacy && userVersion === RISK_SCHEMA_VERSION;
   const actionOnly = allowLegacy && userVersion === ACTION_SCHEMA_VERSION;
   const hardenedActionOnly = allowLegacy && userVersion === HARDENED_ACTION_SCHEMA_VERSION;
+  const actorOnly = allowLegacy && userVersion === ACTOR_SCHEMA_VERSION;
   const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA
     : outcomeOnly ? OUTCOME_DATABASE_SCHEMA
       : riskOnly ? RISK_DATABASE_SCHEMA
         : actionOnly || hardenedActionOnly ? HARDENED_ACTION_DATABASE_SCHEMA
-          : REQUIRED_DATABASE_SCHEMA;
+          : actorOnly ? ACTOR_DATABASE_SCHEMA
+            : REQUIRED_DATABASE_SCHEMA;
   const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS
     : outcomeOnly ? OUTCOME_SCHEMA_OBJECTS
       : riskOnly ? RISK_SCHEMA_OBJECTS
         : actionOnly ? ACTION_SCHEMA_OBJECTS
           : hardenedActionOnly ? HARDENED_ACTION_SCHEMA_OBJECTS
-            : EXPECTED_SCHEMA_OBJECTS;
+            : actorOnly ? ACTOR_SCHEMA_OBJECTS
+              : EXPECTED_SCHEMA_OBJECTS;
   const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(({ name }) => name);
   const rowCounts = {};
   for (const [table, requiredColumns] of Object.entries(requiredSchema)) {
@@ -595,10 +618,10 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   }
   if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy
     && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION,
-      HARDENED_ACTION_SCHEMA_VERSION].includes(userVersion))) {
+      HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION].includes(userVersion))) {
     fail(`Database schema version ${userVersion} does not match required version ${STORE_SCHEMA_VERSION}`);
   }
-  const actorSchema = userVersion === STORE_SCHEMA_VERSION;
+  const actorSchema = [ACTOR_SCHEMA_VERSION, STORE_SCHEMA_VERSION].includes(userVersion);
   const jsonColumns = {
     tokens: "payload", events: "payload", callouts: "payload",
     ...(legacy ? {} : { outcome_enrichment: "evidence" }),
@@ -612,12 +635,21 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   ]));
   let actorPrivacyViolations = null;
   let actorInstallationSecretValid = null;
+  let actorMethodRevision = null;
   if (actorSchema) {
-    const installation = database.prepare("SELECT id,secret FROM actor_installation").all();
+    const installation = database.prepare(actorOnly
+      ? "SELECT id,secret FROM actor_installation"
+      : "SELECT id,secret,method_revision AS methodRevision FROM actor_installation").all();
     actorInstallationSecretValid = installation.length === 1 && installation[0].id === 1
       && (Buffer.isBuffer(installation[0].secret) || installation[0].secret instanceof Uint8Array)
       && installation[0].secret.length === 32;
     if (!actorInstallationSecretValid) fail("Database actor installation secret is missing or malformed");
+    if (!actorOnly) {
+      actorMethodRevision = installation[0].methodRevision;
+      if (actorMethodRevision !== SOLANA_ACTOR_PARSER_REVISION) {
+        fail(`Database actor method revision ${actorMethodRevision || "missing"} does not match ${SOLANA_ACTOR_PARSER_REVISION}`);
+      }
+    }
     actorPrivacyViolations = verifyActorPrivacyRows(database);
   }
   return {
@@ -630,6 +662,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     rowCounts,
     invalidJsonPayloads,
     actorInstallationSecretValid,
+    actorMethodRevision,
     actorPrivacyViolations
   };
 }
@@ -670,6 +703,8 @@ function verifyApplicationWrites(databasePath) {
     const actorSecretBeforeRestart = Buffer.from(beforeRestartRow.secret);
     store = new Store(databasePath);
     database = store.db;
+    const revisionPreparation = store.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
+    if (revisionPreparation.changed) fail("Database application write probe found an unprepared actor method revision");
     const actorSecretBefore = store.actorPrivacySecret();
     const actorSecretRestartStable = actorSecretBeforeRestart.equals(actorSecretBefore);
     actorSecretBeforeRestart.fill(0);
@@ -763,7 +798,7 @@ function verifyApplicationWrites(databasePath) {
       mint: actorMint,
       event: actorEvent,
       observedAt: createdAt,
-      retainedUntil: "2100-01-01T00:00:00.000Z"
+      retainedUntil: "2000-01-03T00:00:00.000Z"
     });
     if (!observation.written) fail("Database application write probe could not persist its actor observation");
     const duplicate = store.saveActorObservation({
@@ -771,7 +806,7 @@ function verifyApplicationWrites(databasePath) {
       mint: actorMint,
       event: actorEvent,
       observedAt: createdAt,
-      retainedUntil: "2100-01-01T00:00:00.000Z"
+      retainedUntil: "2000-01-03T00:00:00.000Z"
     });
     if (duplicate.written) fail("Database application write probe did not deduplicate its actor observation");
     let actorConflictRejected = false;
@@ -781,7 +816,7 @@ function verifyApplicationWrites(databasePath) {
         mint: actorMint,
         event: { ...actorEvent, side: "sell" },
         observedAt: createdAt,
-        retainedUntil: "2100-01-01T00:00:00.000Z"
+        retainedUntil: "2000-01-03T00:00:00.000Z"
       });
     } catch (error) {
       if (!/dedupe key conflicts/.test(error?.message || "")) throw error;
@@ -795,7 +830,7 @@ function verifyApplicationWrites(databasePath) {
         mint: actorMint,
         event: { ...actorEvent, actorAddress: "So11111111111111111111111111111111111111112" },
         observedAt: createdAt,
-        retainedUntil: "2100-01-01T00:00:00.000Z"
+        retainedUntil: "2000-01-03T00:00:00.000Z"
       });
     } catch (error) {
       if (!/raw identity/.test(error?.message || "")) throw error;
@@ -896,6 +931,7 @@ function assertSameRestore(original, restored) {
       JSON.stringify(original.rowCounts) !== JSON.stringify(restored.rowCounts) ||
       JSON.stringify(original.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads) ||
       original.actorInstallationSecretValid !== restored.actorInstallationSecretValid ||
+      original.actorMethodRevision !== restored.actorMethodRevision ||
       original.actorPrivacyViolations !== restored.actorPrivacyViolations) {
     fail("Disposable restore does not match the backup schema and row counts");
   }
@@ -917,11 +953,12 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
     let restored = inspectDatabaseFile(restoredPath, { allowLegacy: true });
     assertSameRestore(artifact, restored);
     const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION,
-      ACTION_SCHEMA_VERSION, HARDENED_ACTION_SCHEMA_VERSION].includes(restored.userVersion)
+      ACTION_SCHEMA_VERSION, HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION].includes(restored.userVersion)
       ? restored.userVersion
       : null;
     if (migratedFromSchemaVersion !== null) {
       const migratedStore = new Store(restoredPath);
+      migratedStore.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
       migratedStore.db.close();
       restored = inspectDatabaseFile(restoredPath);
     }
@@ -931,6 +968,7 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
         JSON.stringify(afterProbe.rowCounts) !== JSON.stringify(restored.rowCounts) ||
         JSON.stringify(afterProbe.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads) ||
         afterProbe.actorInstallationSecretValid !== restored.actorInstallationSecretValid ||
+        afterProbe.actorMethodRevision !== restored.actorMethodRevision ||
         afterProbe.actorPrivacyViolations !== restored.actorPrivacyViolations) {
       fail("Disposable application write probe did not roll back cleanly");
     }
@@ -957,6 +995,7 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
         rowCounts: restored.rowCounts,
         invalidJsonPayloads: restored.invalidJsonPayloads,
         actorInstallationSecretValid: restored.actorInstallationSecretValid,
+        actorMethodRevision: restored.actorMethodRevision,
         actorPrivacyViolations: restored.actorPrivacyViolations
       }
     };

@@ -159,7 +159,6 @@ export class PumpPortalIngestor {
       // the traderPublicKey when creator is absent.
       creator: publicKey(raw.creator),
       deployer: publicKey(raw.user ?? raw.traderPublicKey),
-      description: raw.description || "",
       createdAt: observedAt,
       status: "bonding",
       narrative: classifyNarrative(`${raw.name || ""} ${raw.symbol || ""} ${raw.description || ""}`),

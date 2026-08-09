@@ -1,28 +1,107 @@
-const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const SOLANA_SIGNATURE = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
+import { createHash } from "node:crypto";
+
 const MAX_RESPONSE_BYTES = 2 * 1_024 * 1_024;
 const MAX_TOKEN_AMOUNT = 1_000_000_000_000_000;
 const MAX_ACTORS_PER_TRANSACTION = 16;
 const PUMP_BONDING_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const PUMP_SWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+const SYSTEM_PROGRAM = "11111111111111111111111111111111";
+const ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const PUMP_FEE_PROGRAM = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_PROGRAMS = new Set([TOKEN_PROGRAM, TOKEN_2022_PROGRAM]);
+const RESERVED_FEE_RECIPIENTS = Object.freeze([
+  "GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS",
+  "4budycTjhs9fD6xw62VBducVTNgMgJJ5BgtKq7mAZwn6",
+  "8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR",
+  "4UQeTP1T39KZ9Sfxzo3WR5skgsaP6NZa87BAkuazLEKH",
+  "8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6",
+  "Fh9HmeLNUMVCvejxCtCL2DbYaRyBFVJ5xrWkLnMH6fdk",
+  "463MEnMeGyJekNZFQSTUABBEbLnvMTALbT6ZmsxAbAdq",
+  "6AUH3WEHucYZyC61hqpqYUWVto5qA5hjHuNQ32GNnNxA"
+]);
+const SHARED_NORMAL_FEE_RECIPIENTS = Object.freeze([
+  "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+  "7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ",
+  "7hTckgnGnLQR6sdH7YkqFTAA7VwTfYFaZ6EhEsU3saCX",
+  "9rPYyANsfQZw3DnDmKE3YCQF5E8oD89UXoHn9JFEhJUz",
+  "AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY",
+  "FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz",
+  "G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP"
+]);
+const PUMP_LEGACY_FEE_RECIPIENTS = new Set([
+  ...SHARED_NORMAL_FEE_RECIPIENTS,
+  "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
+  ...RESERVED_FEE_RECIPIENTS
+]);
+const PUMP_SWAP_LEGACY_FEE_RECIPIENTS = new Set([
+  ...SHARED_NORMAL_FEE_RECIPIENTS,
+  "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU",
+  ...RESERVED_FEE_RECIPIENTS
+]);
+const PUMP_FEE_CONFIG_SEED = Buffer.from([1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170, 81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176]);
+const PUMP_SWAP_FEE_CONFIG_SEED = Buffer.from([12, 20, 222, 252, 130, 94, 198, 118, 148, 37, 8, 24, 187, 101, 64, 101, 244, 41, 141, 49, 86, 213, 113, 180, 212, 248, 9, 12, 24, 233, 168, 99]);
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_VALUES = new Map([...BASE58_ALPHABET].map((character, index) => [character, index]));
+export const SOLANA_ACTOR_PARSER_REVISION = "official-pump-account-bound-v3";
 const instructionKey = (value) => Buffer.from(value).toString("hex");
+const pumpBondingContract = (side, name, accountCount, accepted = true) => Object.freeze({
+  side,
+  name,
+  accepted,
+  accountCount,
+  dataLength: side === "sell" ? 24 : 25,
+  trackVolume: side !== "sell",
+  tokenAmountOffset: accepted ? 8 : null,
+  mintIndex: 2,
+  actorIndex: 6,
+  userTokenIndex: 5,
+  writableIndices: Object.freeze(side === "sell" ? [1, 3, 4, 5, 6, 8] : [1, 3, 4, 5, 6, 9, 13]),
+  fixedAccounts: Object.freeze(accountCount === 16
+    ? [[7, SYSTEM_PROGRAM], [11, PUMP_BONDING_PROGRAM], [15, PUMP_FEE_PROGRAM]]
+    : [[7, SYSTEM_PROGRAM], [11, PUMP_BONDING_PROGRAM], [13, PUMP_FEE_PROGRAM]])
+});
+const pumpSwapContract = (side, name, accountCount, accepted = true) => Object.freeze({
+  side,
+  name,
+  accepted,
+  accountCount,
+  dataLength: side === "sell" ? 24 : 25,
+  trackVolume: side !== "sell",
+  tokenAmountOffset: accepted ? 8 : null,
+  mintIndex: 3,
+  actorIndex: 1,
+  userTokenIndex: 5,
+  writableIndices: Object.freeze(side === "sell" ? [0, 1, 5, 6, 7, 8, 10, 17] : [0, 1, 5, 6, 7, 8, 10, 17, 20]),
+  fixedAccounts: Object.freeze(accountCount === 23
+    ? [[13, SYSTEM_PROGRAM], [14, ASSOCIATED_TOKEN_PROGRAM], [16, PUMP_SWAP_PROGRAM], [22, PUMP_FEE_PROGRAM]]
+    : [[13, SYSTEM_PROGRAM], [14, ASSOCIATED_TOKEN_PROGRAM], [16, PUMP_SWAP_PROGRAM], [20, PUMP_FEE_PROGRAM]])
+});
 const PUMP_INSTRUCTIONS = Object.freeze({
   [PUMP_BONDING_PROGRAM]: Object.freeze({
-    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: Object.freeze({ side: "buy", mintIndex: 2, actorIndex: 6, name: "buy" }),
-    [instructionKey([56, 252, 116, 8, 158, 223, 205, 95])]: Object.freeze({ side: "buy", mintIndex: 2, actorIndex: 6, name: "buy_exact_sol_in" }),
-    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: Object.freeze({ side: "sell", mintIndex: 2, actorIndex: 6, name: "sell" })
+    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: pumpBondingContract("buy", "buy", 16),
+    [instructionKey([56, 252, 116, 8, 158, 223, 205, 95])]: pumpBondingContract("buy", "buy_exact_sol_in", 16, false),
+    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: pumpBondingContract("sell", "sell", 14)
   }),
   [PUMP_SWAP_PROGRAM]: Object.freeze({
-    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: Object.freeze({ side: "buy", mintIndex: 3, actorIndex: 1, name: "buy" }),
-    [instructionKey([198, 46, 21, 82, 180, 217, 232, 112])]: Object.freeze({ side: "buy", mintIndex: 3, actorIndex: 1, name: "buy_exact_quote_in" }),
-    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: Object.freeze({ side: "sell", mintIndex: 3, actorIndex: 1, name: "sell" })
+    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: pumpSwapContract("buy", "buy", 23),
+    [instructionKey([198, 46, 21, 82, 180, 217, 232, 112])]: pumpSwapContract("buy", "buy_exact_quote_in", 23, false),
+    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: pumpSwapContract("sell", "sell", 21)
   })
+});
+const UNSUPPORTED_TRADE_INSTRUCTIONS = Object.freeze({
+  [PUMP_BONDING_PROGRAM]: new Set([
+    instructionKey([184, 23, 238, 97, 103, 197, 211, 61]),
+    instructionKey([93, 246, 130, 60, 231, 233, 64, 178]),
+    instructionKey([194, 171, 28, 70, 104, 77, 91, 47])
+  ]),
+  [PUMP_SWAP_PROGRAM]: new Set()
 });
 
 export const SOLANA_MAINNET_RPC = Object.freeze({
   id: "solana-mainnet-rpc",
+  parserRevision: SOLANA_ACTOR_PARSER_REVISION,
   endpoint: "https://api.mainnet.solana.com",
   commitment: "finalized",
   attributionUrl: "https://solana.com/docs/references/clusters",
@@ -38,16 +117,34 @@ export class SolanaRpcError extends Error {
   }
 }
 
+function encodeBase58(value) {
+  const bytes = Buffer.from(value);
+  let number = bytes.length ? BigInt(`0x${bytes.toString("hex")}`) : 0n;
+  let encoded = "";
+  while (number > 0n) {
+    encoded = BASE58_ALPHABET[Number(number % 58n)] + encoded;
+    number /= 58n;
+  }
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1;
+  return "1".repeat(zeros) + encoded;
+}
+
+function canonicalBase58(value, byteLength, label) {
+  if (typeof value !== "string" || value !== value.trim()) throw new TypeError(`${label} must be canonical base58 data`);
+  const decoded = decodeBase58(value);
+  if (!decoded || decoded.length !== byteLength || encodeBase58(decoded) !== value) {
+    throw new TypeError(`${label} must be canonical ${byteLength}-byte Solana base58 data`);
+  }
+  return value;
+}
+
 function address(value, label = "address") {
-  const normalized = typeof value === "string" ? value.trim() : "";
-  if (!SOLANA_ADDRESS.test(normalized)) throw new TypeError(`${label} must be a Solana base58 address`);
-  return normalized;
+  return canonicalBase58(value, 32, label);
 }
 
 function signature(value) {
-  const normalized = typeof value === "string" ? value.trim() : "";
-  if (!SOLANA_SIGNATURE.test(normalized)) throw new TypeError("signature must be bounded Solana base58 data");
-  return normalized;
+  return canonicalBase58(value, 64, "signature");
 }
 
 function timestamp(value, label) {
@@ -64,11 +161,17 @@ function retryAfterMs(value) {
 }
 
 function publicEndpoint(value) {
-  const parsed = new URL(value);
+  let parsed;
+  try { parsed = new URL(value); }
+  catch { throw new TypeError("Solana RPC endpoint must be the documented public mainnet endpoint"); }
   if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new TypeError("Solana RPC endpoint must be credential-free HTTPS without query or fragment data");
   }
-  return parsed.toString().replace(/\/$/, "");
+  const documented = new URL(SOLANA_MAINNET_RPC.endpoint);
+  if (parsed.origin !== documented.origin || (parsed.pathname !== "/" && parsed.pathname !== "")) {
+    throw new TypeError("Solana RPC endpoint must be the documented public Solana mainnet origin and root path");
+  }
+  return SOLANA_MAINNET_RPC.endpoint;
 }
 
 function safeRpcId(value) {
@@ -113,8 +216,8 @@ export class SolanaRpcClient {
         try {
           const normalized = {
             signature: signature(row?.signature),
-            slot: Number(row?.slot),
-            blockTime: Number(row?.blockTime),
+            slot: row?.slot,
+            blockTime: row?.blockTime,
             confirmationStatus: row?.confirmationStatus,
             err: row?.err
           };
@@ -189,29 +292,41 @@ export class SolanaRpcClient {
 }
 
 function accountKeys(message) {
-  const keys = Array.isArray(message?.accountKeys) ? message.accountKeys : [];
-  const required = Number(message?.header?.numRequiredSignatures);
-  return keys.flatMap((entry, index) => {
-    const raw = typeof entry === "string" ? entry : entry?.pubkey;
-    try {
-      return [{ address: address(raw), signer: typeof entry === "object" ? entry.signer === true : Number.isSafeInteger(required) && index < required }];
-    } catch { return []; }
-  });
-}
-
-function transactionAccountKeys(transaction) {
-  const entries = accountKeys(transaction?.transaction?.message);
-  const known = new Set(entries.map((entry) => entry.address));
-  for (const raw of [
-    ...(Array.isArray(transaction?.meta?.loadedAddresses?.writable) ? transaction.meta.loadedAddresses.writable : []),
-    ...(Array.isArray(transaction?.meta?.loadedAddresses?.readonly) ? transaction.meta.loadedAddresses.readonly : [])
-  ]) {
-    try {
-      const normalized = address(raw);
-      if (!known.has(normalized)) entries.push({ address: normalized, signer: false });
-    } catch {}
+  const rawKeys = message?.accountKeys;
+  const header = message?.header;
+  if (!Array.isArray(rawKeys) || rawKeys.length < 1 || rawKeys.length > 256
+    || !header || typeof header !== "object" || Array.isArray(header)) return null;
+  const firstLookupIndex = rawKeys.findIndex((entry) => entry?.source === "lookupTable");
+  const staticCount = firstLookupIndex === -1 ? rawKeys.length : firstLookupIndex;
+  if (rawKeys.some((entry, index) => entry?.source !== undefined
+    && entry.source !== (index < staticCount ? "transaction" : "lookupTable"))) return null;
+  const requiredSignatures = header.numRequiredSignatures;
+  const readonlySigned = header.numReadonlySignedAccounts;
+  const readonlyUnsigned = header.numReadonlyUnsignedAccounts;
+  if (!Number.isSafeInteger(requiredSignatures) || requiredSignatures < 1 || requiredSignatures > staticCount
+    || !Number.isSafeInteger(readonlySigned) || readonlySigned < 0 || readonlySigned > requiredSignatures
+    || !Number.isSafeInteger(readonlyUnsigned) || readonlyUnsigned < 0 || readonlyUnsigned > staticCount - requiredSignatures) return null;
+  const entries = [];
+  const known = new Set();
+  for (const [index, entry] of rawKeys.entries()) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || typeof entry.signer !== "boolean" || typeof entry.writable !== "boolean") return null;
+    const raw = entry.pubkey;
+    let normalized;
+    try { normalized = address(raw); }
+    catch { return null; }
+    if (known.has(normalized)) return null;
+    known.add(normalized);
+    const signer = index < requiredSignatures;
+    const writable = index < requiredSignatures
+      ? index < requiredSignatures - readonlySigned
+      : index < staticCount
+        ? index < staticCount - readonlyUnsigned
+        : entry.writable;
+    if (entry.signer !== signer || entry.writable !== writable) return null;
+    entries.push({ address: normalized, signer, writable: entry.writable, index });
   }
-  return entries;
+  return { entries, requiredSignatures };
 }
 
 function decodeBase58(value) {
@@ -230,63 +345,281 @@ function decodeBase58(value) {
   return Buffer.concat([Buffer.alloc(zeros), body]);
 }
 
-function instructionAddress(value, keys) {
-  if (typeof value === "string") {
-    try { return address(value); } catch { return null; }
-  }
-  return Number.isSafeInteger(value) && value >= 0 && value < keys.length ? keys[value]?.address || null : null;
+const ED25519_FIELD = (1n << 255n) - 19n;
+const ED25519_D = mod(-121665n * modPow(121666n, ED25519_FIELD - 2n));
+const ED25519_SQRT_M1 = modPow(2n, (ED25519_FIELD - 1n) / 4n);
+
+function mod(value) {
+  const remainder = value % ED25519_FIELD;
+  return remainder >= 0n ? remainder : remainder + ED25519_FIELD;
 }
 
-function pumpInstructionSides(transaction, mint, actor) {
-  const keys = transactionAccountKeys(transaction);
+function modPow(value, exponent) {
+  let base = mod(value);
+  let power = exponent;
+  let result = 1n;
+  while (power > 0n) {
+    if (power & 1n) result = mod(result * base);
+    base = mod(base * base);
+    power >>= 1n;
+  }
+  return result;
+}
+
+function littleEndianInteger(bytes) {
+  let value = 0n;
+  for (let index = bytes.length - 1; index >= 0; index -= 1) value = (value << 8n) + BigInt(bytes[index]);
+  return value;
+}
+
+function isEd25519CurvePoint(value) {
+  if (!Buffer.isBuffer(value) || value.length !== 32) return false;
+  const bytes = Buffer.from(value);
+  const sign = bytes[31] >> 7;
+  bytes[31] &= 0x7f;
+  const y = littleEndianInteger(bytes);
+  if (y >= ED25519_FIELD) return false;
+  const ySquared = mod(y * y);
+  const numerator = mod(ySquared - 1n);
+  const denominator = mod(ED25519_D * ySquared + 1n);
+  if (denominator === 0n) return false;
+  const xSquared = mod(numerator * modPow(denominator, ED25519_FIELD - 2n));
+  let x = modPow(xSquared, (ED25519_FIELD + 3n) / 8n);
+  if (mod(x * x - xSquared) !== 0n) x = mod(x * ED25519_SQRT_M1);
+  if (mod(x * x - xSquared) !== 0n || (x === 0n && sign === 1)) return false;
+  return true;
+}
+
+function findProgramAddress(seeds, programId) {
+  const normalizedSeeds = seeds.map((seed) => Buffer.from(seed));
+  if (normalizedSeeds.length > 15 || normalizedSeeds.some((seed) => seed.length > 32)) return null;
+  const program = decodeBase58(programId);
+  if (!program || program.length !== 32) return null;
+  for (let bump = 255; bump >= 0; bump -= 1) {
+    const digest = createHash("sha256")
+      .update(Buffer.concat([...normalizedSeeds, Buffer.from([bump]), program, Buffer.from("ProgramDerivedAddress")]))
+      .digest();
+    if (!isEd25519CurvePoint(digest)) return encodeBase58(digest);
+  }
+  return null;
+}
+
+function addressSeed(value) {
+  const decoded = decodeBase58(value);
+  return decoded?.length === 32 ? decoded : null;
+}
+
+function associatedTokenAddress(owner, tokenProgram, mint) {
+  const seeds = [addressSeed(owner), addressSeed(tokenProgram), addressSeed(mint)];
+  return seeds.some((seed) => !seed) ? null : findProgramAddress(seeds, ASSOCIATED_TOKEN_PROGRAM);
+}
+
+function instructionAccount(value, keys) {
+  if (Number.isSafeInteger(value) && value >= 0 && value < keys.length) return keys[value];
+  if (typeof value !== "string") return null;
+  let normalized;
+  try { normalized = address(value); }
+  catch { return null; }
+  return keys.find((entry) => entry.address === normalized) || null;
+}
+
+function hasExactAccountRoles(accounts, contract) {
+  const writable = new Set(contract.writableIndices);
+  return accounts.every((account, index) => account.signer === (index === contract.actorIndex)
+    && account.writable === writable.has(index));
+}
+
+function hasOnlyAllowedDuplicateAccounts(accounts, programId) {
+  const occurrences = new Map();
+  accounts.forEach((account, index) => {
+    const indices = occurrences.get(account.address) || [];
+    indices.push(index);
+    occurrences.set(account.address, indices);
+  });
+  return [...occurrences.values()].every((indices) => indices.length === 1
+    || (programId === PUMP_SWAP_PROGRAM && indices.length === 2 && indices[0] === 11 && indices[1] === 12));
+}
+
+function matchesAddress(account, expected) {
+  return Boolean(expected) && account?.address === expected;
+}
+
+function validatePumpBondingAccounts(accounts, contract) {
+  const mint = accounts[contract.mintIndex].address;
+  const actor = accounts[contract.actorIndex].address;
+  const tokenProgramIndex = contract.side === "sell" ? 9 : 8;
+  const tokenProgram = accounts[tokenProgramIndex].address;
+  if (!TOKEN_PROGRAMS.has(tokenProgram) || !PUMP_LEGACY_FEE_RECIPIENTS.has(accounts[1].address)) return false;
+  const bondingCurve = findProgramAddress([Buffer.from("bonding-curve"), addressSeed(mint)], PUMP_BONDING_PROGRAM);
+  const expected = [
+    [0, findProgramAddress([Buffer.from("global")], PUMP_BONDING_PROGRAM)],
+    [3, bondingCurve],
+    [4, associatedTokenAddress(bondingCurve, tokenProgram, mint)],
+    [5, associatedTokenAddress(actor, tokenProgram, mint)],
+    [10, findProgramAddress([Buffer.from("__event_authority")], PUMP_BONDING_PROGRAM)],
+    [contract.accountCount - 2, findProgramAddress([Buffer.from("fee_config"), PUMP_FEE_CONFIG_SEED], PUMP_FEE_PROGRAM)]
+  ];
+  if (contract.side !== "sell") {
+    expected.push(
+      [12, findProgramAddress([Buffer.from("global_volume_accumulator")], PUMP_BONDING_PROGRAM)],
+      [13, findProgramAddress([Buffer.from("user_volume_accumulator"), addressSeed(actor)], PUMP_BONDING_PROGRAM)]
+    );
+  }
+  // creator_vault depends on bonding_curve.creator account data, which getTransaction does not include.
+  // Its exact role and distinctness are still enforced above; only directly reproducible PDAs are compared here.
+  return expected.every(([index, value]) => matchesAddress(accounts[index], value));
+}
+
+function validatePumpSwapAccounts(accounts, contract) {
+  const actor = accounts[contract.actorIndex].address;
+  const pool = accounts[0].address;
+  const baseMint = accounts[3].address;
+  const quoteMint = accounts[4].address;
+  const baseTokenProgram = accounts[11].address;
+  const quoteTokenProgram = accounts[12].address;
+  if (!TOKEN_PROGRAMS.has(baseTokenProgram) || !TOKEN_PROGRAMS.has(quoteTokenProgram)
+    || !PUMP_SWAP_LEGACY_FEE_RECIPIENTS.has(accounts[9].address)) return false;
+  const expected = [
+    [2, findProgramAddress([Buffer.from("global_config")], PUMP_SWAP_PROGRAM)],
+    [5, associatedTokenAddress(actor, baseTokenProgram, baseMint)],
+    [6, associatedTokenAddress(actor, quoteTokenProgram, quoteMint)],
+    [7, associatedTokenAddress(pool, baseTokenProgram, baseMint)],
+    [8, associatedTokenAddress(pool, quoteTokenProgram, quoteMint)],
+    [10, associatedTokenAddress(accounts[9].address, quoteTokenProgram, quoteMint)],
+    [15, findProgramAddress([Buffer.from("__event_authority")], PUMP_SWAP_PROGRAM)],
+    [17, associatedTokenAddress(accounts[18].address, quoteTokenProgram, quoteMint)],
+    [contract.accountCount - 2, findProgramAddress([Buffer.from("fee_config"), PUMP_SWAP_FEE_CONFIG_SEED], PUMP_FEE_PROGRAM)]
+  ];
+  if (contract.side !== "sell") {
+    expected.push(
+      [19, findProgramAddress([Buffer.from("global_volume_accumulator")], PUMP_SWAP_PROGRAM)],
+      [20, findProgramAddress([Buffer.from("user_volume_accumulator"), addressSeed(actor)], PUMP_SWAP_PROGRAM)]
+    );
+  }
+  // pool relations and coin_creator_vault_authority depend on Pool account fields absent from getTransaction.
+  // Their derived token accounts, exact roles, and distinctness remain verifiable and are enforced here.
+  return expected.every(([index, value]) => matchesAddress(accounts[index], value));
+}
+
+function validateInstructionAccountContract(accounts, contract, programId) {
+  if (!hasExactAccountRoles(accounts, contract) || !hasOnlyAllowedDuplicateAccounts(accounts, programId)) return false;
+  return programId === PUMP_BONDING_PROGRAM
+    ? validatePumpBondingAccounts(accounts, contract)
+    : validatePumpSwapAccounts(accounts, contract);
+}
+
+function instructionTokenAmount(data, contract) {
+  if (!contract.accepted || !Number.isSafeInteger(contract.tokenAmountOffset)
+    || data.length < contract.tokenAmountOffset + 8) return null;
+  const amount = data.readBigUInt64LE(contract.tokenAmountOffset);
+  return amount > 0n ? amount : null;
+}
+
+function pumpInstructionEvidence(transaction, mint, keys, signers) {
   const instructions = [
     ...(Array.isArray(transaction?.transaction?.message?.instructions) ? transaction.transaction.message.instructions : []),
     ...(Array.isArray(transaction?.meta?.innerInstructions)
       ? transaction.meta.innerInstructions.flatMap((entry) => Array.isArray(entry?.instructions) ? entry.instructions : [])
       : [])
-  ].slice(0, 256);
+  ];
+  if (instructions.length > 256) return { valid: false, matches: [] };
   const matches = [];
+  let unsupportedTrade = false;
   for (const instruction of instructions) {
-    const programId = typeof instruction?.programId === "string"
-      ? instructionAddress(instruction.programId, keys)
-      : instructionAddress(instruction?.programIdIndex, keys);
+    const rawProgram = instruction?.programId ?? instruction?.programIdIndex;
+    const programAccount = instructionAccount(rawProgram, keys);
+    let recognizableProgram = null;
+    if (typeof rawProgram === "string") {
+      try { recognizableProgram = address(rawProgram); }
+      catch {}
+    }
+    if (!programAccount) {
+      if (recognizableProgram && PUMP_INSTRUCTIONS[recognizableProgram]) return { valid: false, matches: [] };
+      continue;
+    }
+    const programId = programAccount.address;
     const program = PUMP_INSTRUCTIONS[programId];
     if (!program) continue;
     const data = decodeBase58(instruction?.data);
-    if (!data || data.length < 8) continue;
-    const contract = program[data.subarray(0, 8).toString("hex")];
-    if (!contract || !Array.isArray(instruction.accounts)) continue;
-    const instructionMint = instructionAddress(instruction.accounts[contract.mintIndex], keys);
-    const instructionActor = instructionAddress(instruction.accounts[contract.actorIndex], keys);
-    if (instructionMint === mint && instructionActor === actor) {
-      matches.push({ side: contract.side, programId, instruction: contract.name });
+    if (!data || data.length < 8 || encodeBase58(data) !== instruction.data) return { valid: false, matches: [] };
+    const discriminator = data.subarray(0, 8).toString("hex");
+    const contract = program[discriminator];
+    if (!contract) {
+      if (UNSUPPORTED_TRADE_INSTRUCTIONS[programId]?.has(discriminator)) unsupportedTrade = true;
+      continue;
     }
+    if (data.length !== contract.dataLength || (contract.trackVolume && data.at(-1) > 1)) {
+      return { valid: false, matches: [] };
+    }
+    if (!Array.isArray(instruction.accounts) || instruction.accounts.length !== contract.accountCount) return { valid: false, matches: [] };
+    const accounts = instruction.accounts.map((entry) => instructionAccount(entry, keys));
+    if (accounts.some((entry) => !entry)) return { valid: false, matches: [] };
+    if (contract.fixedAccounts.some(([index, expected]) => accounts[index]?.address !== expected || accounts[index]?.writable)) {
+      return { valid: false, matches: [] };
+    }
+    if (!validateInstructionAccountContract(accounts, contract, programId)) return { valid: false, matches: [] };
+    const instructionMint = accounts[contract.mintIndex];
+    if (instructionMint.address !== mint) continue;
+    if (!contract.accepted) {
+      unsupportedTrade = true;
+      continue;
+    }
+    const instructionActor = accounts[contract.actorIndex];
+    const userTokenAccount = accounts[contract.userTokenIndex];
+    const expectedRawTokenAmount = instructionTokenAmount(data, contract);
+    if (!signers.has(instructionActor.address) || instructionActor.address === mint
+      || userTokenAccount.address === mint || userTokenAccount.address === instructionActor.address
+      || expectedRawTokenAmount === null) return { valid: false, matches: [] };
+    matches.push({
+      actor: instructionActor.address,
+      side: contract.side,
+      expectedRawTokenAmount,
+      userTokenAccount: userTokenAccount.address,
+      userTokenIndex: userTokenAccount.index,
+      programId,
+      instruction: contract.name
+    });
   }
-  const sides = new Set(matches.map(({ side }) => side));
-  return sides.size === 1 ? { side: [...sides][0], matches } : null;
+  return { valid: true, matches, unsupportedTrade };
 }
 
-function amountRecord(entry, mint) {
-  if (!entry || entry.mint !== mint) return null;
+function amountRecord(entry, mint, keys) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.mint !== mint) return null;
+  const accountIndex = entry.accountIndex;
+  if (!Number.isSafeInteger(accountIndex) || accountIndex < 0 || accountIndex >= keys.length) return null;
   let owner;
   try { owner = address(entry.owner, "token balance owner"); }
   catch { return null; }
   const amount = entry.uiTokenAmount?.amount;
-  const decimals = Number(entry.uiTokenAmount?.decimals);
+  const decimals = entry.uiTokenAmount?.decimals;
   if (typeof amount !== "string" || !/^\d{1,40}$/.test(amount) || !Number.isSafeInteger(decimals) || decimals < 0 || decimals > 18) return null;
-  return { owner, amount: BigInt(amount), decimals };
+  return { accountIndex, tokenAccount: keys[accountIndex].address, owner, amount: BigInt(amount), decimals };
 }
 
-function aggregateBalances(rows, mint) {
+function aggregateBalances(rows, mint, keys) {
+  if (!Array.isArray(rows) || rows.length > 256) return null;
   const balances = new Map();
-  for (const row of Array.isArray(rows) ? rows.slice(0, 256) : []) {
-    const parsed = amountRecord(row, mint);
-    if (!parsed) continue;
-    const current = balances.get(parsed.owner);
-    if (current && current.decimals !== parsed.decimals) return null;
-    balances.set(parsed.owner, { decimals: parsed.decimals, amount: (current?.amount || 0n) + parsed.amount });
+  for (const row of rows) {
+    if (row?.mint !== mint) continue;
+    const parsed = amountRecord(row, mint, keys);
+    if (!parsed || balances.has(parsed.accountIndex)) return null;
+    balances.set(parsed.accountIndex, parsed);
   }
   return balances;
+}
+
+function balanceDelta(pre, post, accountIndex) {
+  const before = pre.get(accountIndex);
+  const after = post.get(accountIndex);
+  if (!before && !after) return null;
+  if (before && after && (before.owner !== after.owner || before.decimals !== after.decimals || before.tokenAccount !== after.tokenAccount)) return null;
+  const evidence = before || after;
+  return {
+    owner: evidence.owner,
+    tokenAccount: evidence.tokenAccount,
+    decimals: evidence.decimals,
+    amount: (after?.amount || 0n) - (before?.amount || 0n)
+  };
 }
 
 function decimalAmount(amount, decimals) {
@@ -303,41 +636,97 @@ export function extractFinalizedActorInputs({ mint, signatureInfo, transaction, 
   const normalizedObservedAt = timestamp(observedAt, "observedAt");
   const normalizedSignature = signature(signatureInfo?.signature);
   if (signatureInfo?.err !== null || signatureInfo?.confirmationStatus !== "finalized") return { status: "rejected", reason: "signature-not-finalized-success", observations: [] };
-  const slot = Number(signatureInfo?.slot);
-  const blockTime = Number(signatureInfo?.blockTime ?? transaction?.blockTime);
+  const slot = signatureInfo?.slot;
+  const blockTime = signatureInfo?.blockTime;
   if (!Number.isSafeInteger(slot) || slot < 1 || !Number.isSafeInteger(blockTime) || blockTime < 1) {
     return { status: "rejected", reason: "missing-finalized-time-or-slot", observations: [] };
   }
-  if (!transaction || typeof transaction !== "object" || Array.isArray(transaction) || transaction.meta?.err != null) {
+  const meta = transaction?.meta;
+  if (!transaction || typeof transaction !== "object" || Array.isArray(transaction)
+    || !meta || typeof meta !== "object" || Array.isArray(meta)
+    || !Object.hasOwn(meta, "err") || meta.err !== null) {
     return { status: "rejected", reason: "transaction-missing-or-failed", observations: [] };
   }
-  const returnedSignature = transaction.transaction?.signatures?.[0];
-  if (returnedSignature !== normalizedSignature) return { status: "rejected", reason: "transaction-signature-mismatch", observations: [] };
-  if (Number(transaction.slot) !== slot || Number(transaction.blockTime) !== blockTime) {
+  if (transaction.slot !== slot || transaction.blockTime !== blockTime) {
     return { status: "rejected", reason: "transaction-provenance-mismatch", observations: [] };
   }
-  const signers = new Set(accountKeys(transaction.transaction?.message).filter((entry) => entry.signer).map((entry) => entry.address));
-  const pre = aggregateBalances(transaction.meta?.preTokenBalances, normalizedMint);
-  const post = aggregateBalances(transaction.meta?.postTokenBalances, normalizedMint);
+  const keyContext = accountKeys(transaction.transaction?.message);
+  if (!keyContext) return { status: "rejected", reason: "token-balance-evidence-invalid", observations: [] };
+  const returnedSignatures = transaction.transaction?.signatures;
+  if (!Array.isArray(returnedSignatures) || returnedSignatures.length !== keyContext.requiredSignatures) {
+    return { status: "rejected", reason: "transaction-signature-mismatch", observations: [] };
+  }
+  try {
+    if (returnedSignatures.map((entry) => signature(entry))[0] !== normalizedSignature) {
+      return { status: "rejected", reason: "transaction-signature-mismatch", observations: [] };
+    }
+  } catch {
+    return { status: "rejected", reason: "transaction-signature-mismatch", observations: [] };
+  }
+  const keys = keyContext.entries;
+  const signers = new Set(keys.filter((entry) => entry.signer).map((entry) => entry.address));
+  const pre = aggregateBalances(meta.preTokenBalances, normalizedMint, keys);
+  const post = aggregateBalances(meta.postTokenBalances, normalizedMint, keys);
   if (!pre || !post || !signers.size) return { status: "rejected", reason: "token-balance-evidence-invalid", observations: [] };
-  const owners = [...new Set([...pre.keys(), ...post.keys()])].sort();
+  const pumpEvidence = pumpInstructionEvidence(transaction, normalizedMint, keys, signers);
+  if (!pumpEvidence.valid) return { status: "rejected", reason: "official-pump-instruction-invalid", observations: [] };
+  if (pumpEvidence.unsupportedTrade) {
+    return { status: "unavailable", reason: "unsupported-official-pump-trade-variant", observations: [] };
+  }
+  if (!pumpEvidence.matches.length) {
+    return { status: "unavailable", reason: "no-unambiguous-official-pump-buy-or-sell-evidence", observations: [] };
+  }
+  const evidenceByActor = new Map();
+  const tokenAccountActors = new Map();
+  for (const evidence of pumpEvidence.matches) {
+    const existing = evidenceByActor.get(evidence.actor);
+    if (existing && (existing.side !== evidence.side || existing.userTokenIndex !== evidence.userTokenIndex)) {
+      return { status: "rejected", reason: "mixed-or-ambiguous-official-pump-activity", observations: [] };
+    }
+    const claimedActor = tokenAccountActors.get(evidence.userTokenIndex);
+    if (claimedActor && claimedActor !== evidence.actor) {
+      return { status: "rejected", reason: "mixed-or-ambiguous-official-pump-activity", observations: [] };
+    }
+    tokenAccountActors.set(evidence.userTokenIndex, evidence.actor);
+    if (existing) {
+      existing.expectedRawTokenAmount += evidence.expectedRawTokenAmount;
+      existing.matches.push(evidence);
+    }
+    else evidenceByActor.set(evidence.actor, { ...evidence, matches: [evidence] });
+  }
+
+  const designatedByActor = new Map([...evidenceByActor].map(([actor, evidence]) => [actor, evidence.userTokenIndex]));
+  const changedIndices = new Set([...pre.keys(), ...post.keys()]);
+  for (const accountIndex of changedIndices) {
+    const delta = balanceDelta(pre, post, accountIndex);
+    if (!delta) return { status: "rejected", reason: "token-balance-evidence-invalid", observations: [] };
+    if (delta.amount !== 0n && signers.has(delta.owner) && designatedByActor.get(delta.owner) !== accountIndex) {
+      return { status: "rejected", reason: "mixed-or-ambiguous-signer-token-activity", observations: [] };
+    }
+  }
+
+  for (const [actor, evidence] of evidenceByActor) {
+    const delta = balanceDelta(pre, post, evidence.userTokenIndex);
+    if (!delta || delta.owner !== actor || delta.tokenAccount !== evidence.userTokenAccount) {
+      return { status: "rejected", reason: "token-balance-evidence-invalid", observations: [] };
+    }
+    const expectedDelta = evidence.side === "buy" ? evidence.expectedRawTokenAmount : -evidence.expectedRawTokenAmount;
+    if (delta.amount !== expectedDelta) {
+      return { status: "rejected", reason: "instruction-token-amount-mismatch", observations: [] };
+    }
+  }
+
   const sourceTimestamp = new Date(blockTime * 1_000).toISOString();
-  const observations = owners.flatMap((owner) => {
-    if (!signers.has(owner)) return [];
-    const pumpEvidence = pumpInstructionSides(transaction, normalizedMint, owner);
-    if (!pumpEvidence) return [];
-    const before = pre.get(owner);
-    const after = post.get(owner);
-    const decimals = before?.decimals ?? after?.decimals;
-    if (!Number.isSafeInteger(decimals) || (before && after && before.decimals !== after.decimals)) return [];
-    const delta = (after?.amount || 0n) - (before?.amount || 0n);
-    const tokenAmount = decimalAmount(delta, decimals);
+  const observations = [...evidenceByActor.entries()].sort(([left], [right]) => left.localeCompare(right)).flatMap(([actor, evidence]) => {
+    const delta = balanceDelta(pre, post, evidence.userTokenIndex);
+    if (!delta || delta.owner !== actor || delta.tokenAccount !== evidence.userTokenAccount) return [];
+    const tokenAmount = decimalAmount(delta.amount, delta.decimals);
     if (tokenAmount === null) return [];
-    const side = pumpEvidence.side;
+    const side = evidence.side;
     if ((side === "buy" && tokenAmount < 0) || (side === "sell" && tokenAmount > 0)) return [];
     return [{
       mint: normalizedMint,
-      actorAddress: owner,
+      actorAddress: actor,
       side,
       tokenAmount: Math.abs(tokenAmount),
       nativeAmount: null,
@@ -347,8 +736,11 @@ export function extractFinalizedActorInputs({ mint, signatureInfo, transaction, 
       observedAt: normalizedObservedAt,
       transactionId: normalizedSignature,
       slot,
-      amountBasis: "net-finalized-token-balance-delta-matched-to-official-pump-instruction",
-      instructionBasis: pumpEvidence.matches.map(({ programId, instruction }) => ({ programId, instruction })),
+      amountBasis: "instruction-token-amount-reconciled-to-designated-user-token-account-delta",
+      instructionBasis: [...new Map(evidence.matches.map(({ programId, instruction }) => [
+        `${programId}:${instruction}`,
+        { programId, instruction }
+      ])).values()],
       nativeAmountStatus: "unavailable-transaction-balance-delta-is-not-trade-consideration"
     }];
   });

@@ -6,6 +6,7 @@ import {
   RISK_IDENTITY_METHOD_VERSION,
   RISK_IDENTITY_PARSER_REVISION
 } from "../src/risk-identity.js";
+import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RISK_COHORT_LIMIT = 120;
@@ -15,6 +16,12 @@ const RISK_MAXIMUM_INVALID_RESPONSE_RATIO = 0.25;
 const ACTOR_COHORT_LIMIT = 32;
 const ACTOR_MINIMUM_ELIGIBLE_MINTS = 20;
 const ACTOR_MINIMUM_ACQUISITION_COVERAGE = 0.6;
+const ACTOR_ACQUISITION_ATTEMPT_LIMIT = 3;
+const ACTOR_MAXIMUM_FAILURE_RATIO = 0.25;
+const ACTOR_ACQUISITION_STATES = new Set([
+  "queued", "observing", "available", "unavailable", "rate-limited", "degraded", "invalid-response", "complete"
+]);
+const ACTOR_FAILURE_STATES = new Set(["rate-limited", "degraded", "invalid-response"]);
 const MATERIAL_ALERT_KINDS = new Set([
   "score-rise", "score-drop", "risk-concentration", "risk-developer-holding",
   "risk-identity-reuse", "risk-creator-history", "migration-observed"
@@ -50,9 +57,21 @@ const PUBLIC_RISK_SUMMARY_KEYS = new Set([
   "totalTracked", "holderEvidenceCount", "developerEvidenceCount", "exactDuplicateTokenCount",
   "identityHistoryCount", "liquidityEvidenceCount", "curveEvidenceCount", "migrationObservationCount"
 ]);
-const RAW_PROFILE_VALUE = /^(?:@[A-Za-z0-9_]{1,32}|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s]+)$/i;
+const RAW_PROFILE_VALUE = /(?:^|[\s(])(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)]+)/i;
+const RAW_SOLANA_IDENTITY_VALUE = /(?:^|[^1-9A-HJ-NP-Za-km-z])(?:[1-9A-HJ-NP-Za-km-z]{64,88}|[1-9A-HJ-NP-Za-km-z]{32,44})(?=$|[^1-9A-HJ-NP-Za-km-z])/;
 const RAW_PUBLIC_IDENTITY_KEYS = new Set([
-  "creator", "deployer", "caller", "actoraddress", "traderpublickey", "signature", "transactionid"
+  "creator", "deployer", "caller", "trader", "traderaddress", "traderwallet", "traderpublickey",
+  "actoraddress", "signature", "transactionid", "txid",
+  "wallet", "walletaddress", "walletid", "walletpublickey", "publicwallet", "connectedwallet",
+  "owner", "owneraddress", "ownerwallet", "ownerpublickey",
+  "signer", "signeraddress", "signerwallet", "signerpublickey",
+  "user", "useraddress", "userwallet", "userpublickey",
+  "participant", "participantaddress", "participantwallet", "participantpublickey",
+  "authority", "authorityaddress", "authoritywallet", "authoritypublickey",
+  "payer", "payeraddress", "payerwallet", "feepayer", "sender", "recipient",
+  "address", "account", "accountaddress", "accountkey", "accountpublickey", "publickey",
+  "profile", "profileid", "profileurl", "profilehandle", "username", "handle",
+  "sourceprofile", "sourceprofileid", "sourceprofileurl", "sourceprofilehandle"
 ]);
 const HIDDEN_PUBLIC_MATERIAL_KEYS = new Set([
   "secret", "installationsecret", "actorsecret", "key", "privatekey", "hmackey", "keymaterial",
@@ -99,14 +118,32 @@ function normalizedPublicKey(value) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function rejectPublicIdentityLeaks(value, path, check) {
+function allowsPublicSolanaIdentifier(key, value) {
+  const normalized = normalizedPublicKey(key || "");
+  if (/^(?:name|symbol)$/.test(normalized)
+    || /(?:narrative|label|title|description|message|detail|reason|scope|limitation|note|text)$/.test(normalized)) return false;
+  if (normalized === "mint" || normalized === "mints" || normalized.endsWith("mint") || normalized.endsWith("mints")
+    || normalized === "pool" || normalized === "pools" || normalized.endsWith("pool") || normalized.endsWith("pools")) return true;
+  if (!/(?:url|uri|href|link|timeline|endpoint|docs?|page)$/.test(normalized)) return false;
+  if (value.startsWith("/")) return true;
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function rejectPublicIdentityLeaks(value, path, check, contextKey = "") {
   if (typeof value === "string") {
     requireValue(!RAW_PROFILE_VALUE.test(value), check, `${path} exposed a raw social profile value`);
+    requireValue(!RAW_SOLANA_IDENTITY_VALUE.test(value) || allowsPublicSolanaIdentifier(contextKey, value),
+      check, `${path} exposed a raw Solana identity value outside a mint, pool, or URL field`);
     return;
   }
   if (!value || typeof value !== "object") return;
   if (Array.isArray(value)) {
-    value.forEach((entry, index) => rejectPublicIdentityLeaks(entry, `${path}[${index}]`, check));
+    value.forEach((entry, index) => rejectPublicIdentityLeaks(entry, `${path}[${index}]`, check, contextKey));
     return;
   }
   for (const [key, entry] of Object.entries(value)) {
@@ -121,7 +158,7 @@ function rejectPublicIdentityLeaks(value, path, check) {
       || normalized === "hmac");
     requireValue(!rawIdentityKey, check, `${path}.${key} exposed a raw public identity key`);
     requireValue(!hiddenMaterial, check, `${path}.${key} exposed hidden mapping, key, digest, or provenance material`);
-    rejectPublicIdentityLeaks(entry, `${path}.${key}`, check);
+    rejectPublicIdentityLeaks(entry, `${path}.${key}`, check, key);
   }
 }
 
@@ -190,9 +227,13 @@ function validateActorSummary(summary, mint, path, check) {
 
 function validateActorEngine(engine, path, check, expectedMode) {
   const allowedStates = expectedMode === "live"
-    ? ["awaiting-prospective-admission", "queued", "acquiring", "observing", "complete", "unavailable", "rate-limited", "degraded", "invalid-response"]
+    ? [
+      "awaiting-prospective-admission", "queued", "acquiring", "observing", "complete", "complete-partial",
+      "complete-with-missing", "failed", "unavailable", "rate-limited", "degraded", "invalid-response"
+    ]
     : ["simulation-disabled"];
   requireValue(engine?.schemaVersion === 1 && engine.source === "solana-mainnet-rpc"
+    && engine.parserRevision === SOLANA_ACTOR_PARSER_REVISION
     && allowedStates.includes(engine.status) && Number.isSafeInteger(engine.queueDepth) && engine.queueDepth >= 0,
   check, `${path} early-actor engine contract was missing`);
   if (expectedMode !== "live") return;
@@ -203,9 +244,38 @@ function validateActorEngine(engine, path, check, expectedMode) {
     && Number.isSafeInteger(engine.cohort?.evidenceMintCount) && engine.cohort.evidenceMintCount >= 0
     && Number.isSafeInteger(engine.cohort?.eligibleMintCount) && engine.cohort.eligibleMintCount >= 0
     && engine.cohort.eligibleMintCount <= engine.cohort.evidenceMintCount
-    && engine.cohort.evidenceMintCount <= engine.cohort.admittedCount,
+    && engine.cohort.evidenceMintCount <= engine.cohort.admittedCount
+    && Number.isSafeInteger(engine.cohort?.attemptedMintCount) && engine.cohort.attemptedMintCount >= 0
+    && engine.cohort.attemptedMintCount <= engine.cohort.admittedCount
+    && Number.isSafeInteger(engine.cohort?.failureStateCount) && engine.cohort.failureStateCount >= 0
+    && engine.cohort.failureStateCount <= engine.cohort.attemptedMintCount
+    && (engine.cohort.attemptedMintCount === 0
+      ? engine.cohort.failureRatio === null
+      : Number.isFinite(engine.cohort.failureRatio) && engine.cohort.failureRatio >= 0
+        && engine.cohort.failureRatio <= 1
+        && engine.cohort.failureRatio === engine.cohort.failureStateCount / engine.cohort.attemptedMintCount)
+    && Number.isSafeInteger(engine.cohort?.pendingAttemptCount) && engine.cohort.pendingAttemptCount >= 0
+    && Number.isSafeInteger(engine.cohort?.terminalCount) && engine.cohort.terminalCount >= 0
+    && engine.cohort.pendingAttemptCount + engine.cohort.terminalCount === engine.cohort.admittedCount
+    && Number.isSafeInteger(engine.cohort?.terminalFailureCount) && engine.cohort.terminalFailureCount >= 0
+    && engine.cohort.terminalFailureCount <= engine.cohort.terminalCount
+    && engine.cohort.statusCounts && typeof engine.cohort.statusCounts === "object"
+    && !Array.isArray(engine.cohort.statusCounts)
+    && Object.values(engine.cohort.statusCounts).every((count) => Number.isSafeInteger(count) && count >= 0)
+    && Object.values(engine.cohort.statusCounts).reduce((total, count) => total + count, 0) === engine.cohort.admittedCount,
   check, `${path} cohort coverage was invalid`);
   validateActorDownstreamGate(engine.correlationGate, `${path}.correlationGate`, check);
+  const expectedCoverage = engine.cohort.admittedCount
+    ? engine.cohort.evidenceMintCount / engine.cohort.admittedCount : null;
+  requireValue(engine.correlationGate.eligibleMintCount === engine.cohort.eligibleMintCount
+    && engine.correlationGate.acquisitionCoverage === expectedCoverage,
+  check, `${path} acquisition coverage did not reconcile with the admitted cohort`);
+  requireValue(engine.cohort.failureRatio === null || engine.cohort.failureRatio <= ACTOR_MAXIMUM_FAILURE_RATIO,
+    check, `${path} failure-state ratio ${engine.cohort.failureStateCount}/${engine.cohort.attemptedMintCount} exceeded 25% of attempted mints`);
+  requireValue(!(engine.cohort.admittedCount > 0
+    && engine.cohort.evidenceMintCount === 0
+    && engine.cohort.pendingAttemptCount === 0),
+  check, `${path} exhausted every admitted mint with zero actor evidence`);
 }
 
 function validatePublicRiskIdentity(identity, path) {
@@ -672,6 +742,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   const actorIntelligence = snapshot.earlyActorIntelligence;
   requireValue(actorIntelligence?.schemaVersion === 1, "snapshot", "early-actor intelligence schema was missing");
   requireValue(actorIntelligence.source?.id === "solana-mainnet-rpc"
+    && actorIntelligence.source?.parserRevision === SOLANA_ACTOR_PARSER_REVISION
     && actorIntelligence.source?.evidenceClass === "on-chain-finalized"
     && actorIntelligence.source?.endpointClass === "documented-rate-limited-public-rpc"
     && actorIntelligence.source?.attributionUrl === "https://solana.com/docs/references/clusters"
@@ -712,22 +783,54 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && actorIntelligence.cohort.observations.length === actorIntelligence.cohort.admittedCount,
   "snapshot", "inspectable early-actor cohort contract was missing or inconsistent");
   const actorObservationMints = new Set();
+  let actorEvidenceMintCount = 0;
+  let actorAttemptedMintCount = 0;
+  let actorFailureStateCount = 0;
+  let actorPendingAttemptCount = 0;
+  let actorTerminalFailureCount = 0;
   for (const [index, observation] of actorIntelligence.cohort.observations.entries()) {
     const path = `snapshot.earlyActorIntelligence.cohort.observations[${index}]`;
     requireValue(observation && typeof observation.mint === "string" && !actorObservationMints.has(observation.mint)
       && typeof observation.name === "string" && typeof observation.symbol === "string"
       && Number.isFinite(Date.parse(observation.launchObservedAt))
-      && observation.acquisition && typeof observation.acquisition.status === "string"
-      && Number.isSafeInteger(observation.acquisition.attemptCount) && observation.acquisition.attemptCount >= 0,
+      && observation.acquisition && ACTOR_ACQUISITION_STATES.has(observation.acquisition.status)
+      && Number.isSafeInteger(observation.acquisition.attemptCount) && observation.acquisition.attemptCount >= 0
+      && observation.acquisition.attemptCount <= ACTOR_ACQUISITION_ATTEMPT_LIMIT
+      && (observation.acquisition.lastAttemptAt === null || Number.isFinite(Date.parse(observation.acquisition.lastAttemptAt)))
+      && (observation.acquisition.nextAttemptAt === null || Number.isFinite(Date.parse(observation.acquisition.nextAttemptAt)))
+      && (observation.acquisition.lastSuccessAt === null || Number.isFinite(Date.parse(observation.acquisition.lastSuccessAt))),
     "snapshot", `${path} acquisition evidence was invalid`);
+    requireValue(observation.acquisition.attemptCount > 0 || observation.acquisition.lastAttemptAt === null,
+      "snapshot", `${path} claimed an attempt timestamp before acquisition began`);
+    requireValue(observation.acquisition.nextAttemptAt !== null
+      || observation.acquisition.attemptCount === ACTOR_ACQUISITION_ATTEMPT_LIMIT,
+    "snapshot", `${path} became terminal before its bounded acquisition attempts were exhausted`);
     actorObservationMints.add(observation.mint);
-    if (observation.summary !== null) validateActorSummary(observation.summary, observation.mint, `${path}.summary`, "snapshot");
+    if (observation.acquisition.attemptCount > 0) {
+      actorAttemptedMintCount++;
+      if (ACTOR_FAILURE_STATES.has(observation.acquisition.status)) actorFailureStateCount++;
+    }
+    if (observation.acquisition.nextAttemptAt !== null) actorPendingAttemptCount++;
+    else if (ACTOR_FAILURE_STATES.has(observation.acquisition.status)) actorTerminalFailureCount++;
+    if (observation.summary !== null) {
+      validateActorSummary(observation.summary, observation.mint, `${path}.summary`, "snapshot");
+      if (observation.summary.coverage.eventCount > 0) actorEvidenceMintCount++;
+    }
   }
   if (expectedMode === "live") {
     requireValue(health.earlyActors.cohort.admittedCount === actorIntelligence.cohort.admittedCount
       && health.earlyActors.cohort.evidenceMintCount === actorIntelligence.engine.cohort.evidenceMintCount
-      && health.earlyActors.cohort.eligibleMintCount === actorIntelligence.engine.cohort.eligibleMintCount,
+      && health.earlyActors.cohort.eligibleMintCount === actorIntelligence.engine.cohort.eligibleMintCount
+      && health.earlyActors.cohort.attemptedMintCount === actorIntelligence.engine.cohort.attemptedMintCount
+      && health.earlyActors.cohort.failureStateCount === actorIntelligence.engine.cohort.failureStateCount,
     "snapshot", "early-actor health and snapshot coverage disagreed");
+    requireValue(actorEvidenceMintCount === actorIntelligence.engine.cohort.evidenceMintCount
+      && actorAttemptedMintCount === actorIntelligence.engine.cohort.attemptedMintCount
+      && actorFailureStateCount === actorIntelligence.engine.cohort.failureStateCount
+      && actorPendingAttemptCount === actorIntelligence.engine.cohort.pendingAttemptCount
+      && actorIntelligence.cohort.admittedCount - actorPendingAttemptCount === actorIntelligence.engine.cohort.terminalCount
+      && actorTerminalFailureCount === actorIntelligence.engine.cohort.terminalFailureCount,
+    "snapshot", "early-actor observations did not reconcile with engine acquisition telemetry");
   }
   for (const [check, value] of [
     ["health", health], ["snapshot", snapshot], ["dossier", dossier], ["timeline", timeline],

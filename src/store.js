@@ -3,7 +3,9 @@ import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
 
-export const STORE_SCHEMA_VERSION = 900;
+export const STORE_SCHEMA_VERSION = 901;
+const LEGACY_ACTOR_SCHEMA_VERSION = 900;
+export const ACTOR_OBSERVATION_MAX_RETENTION_MS = 72 * 60 * 60 * 1_000;
 
 const MAX_ENRICHMENT_QUERY = 200;
 const MAX_EVIDENCE_BYTES = 64 * 1_024;
@@ -36,6 +38,33 @@ const SELECTION_POLICY = "prospective-earliest-created-eligible-pool-on-provider
 const BASELINE_ROLE = "first-observed-baseline-reference-only; each window retains its own provider revision";
 const DRAWDOWN_BASIS = "observed-completed-candle-closes-only";
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const SOLANA_SIGNATURE_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
+const RAW_SOCIAL_PROFILE_PATTERN = /^(?:@[A-Za-z0-9_]{1,32}|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s]+)$/i;
+const ACTOR_SUMMARY_KEYS = Object.freeze({
+  root: new Set(["schemaVersion", "mint", "coverage", "metrics"]),
+  coverage: new Set(["state", "eventCount", "uniqueActorCount", "launchObservedAt", "sourceTimestamps", "gate"]),
+  launchObservedAt: new Set(["state", "value"]),
+  sourceTimestamps: new Set(["state", "availableCount", "missingCount", "ratio"]),
+  gate: new Set(["minimumEventCount", "minimumActorCount", "minimumSourceTimestampRatio", "eventCountMet", "actorCountMet", "sourceTimestampRatioMet"]),
+  metrics: new Set(["timing", "uniqueActors", "repeatActivity", "holdingDurationEvidence", "amountConcentration", "activityBurst"]),
+  timing: new Set(["state", "basis", "reason", "launchObservedAt", "earlyWindowMs", "firstActivityAt", "lastActivityAt", "actorsObservedWithinWindow", "actorFirstObservationOffsetMs"]),
+  actorFirstObservationOffsetMs: new Set(["minimum", "median", "maximum"]),
+  uniqueActors: new Set(["state", "count"]),
+  repeatActivity: new Set(["state", "actorsWithMultipleBuys", "actorsWithMultipleSells", "actorsObservedOnBothSides"]),
+  holdingDurationEvidence: new Set(["state", "basis", "timestampBasis", "pairedObservationCount", "minimumMs", "medianMs", "maximumMs"]),
+  amountConcentration: new Set(["state", "basis", "amountCoverage", "actorCountWithAmount", "largestActorShare", "largestThreeActorShare"]),
+  amountCoverage: new Set(["state", "availableCount", "missingCount"]),
+  activityBurst: new Set(["state", "timestampBasis", "windowMs", "maximumEventCount", "maximumUniqueActorCount", "startedAt", "endedAt"])
+});
+const ACTOR_OBSERVATION_KEYS = Object.freeze({
+  root: new Set(["schemaVersion", "mint", "actor", "side", "amounts", "source", "timestamps", "transactionProvenance"]),
+  amounts: new Set(["native", "token"]),
+  source: new Set(["name", "evidenceClass"]),
+  timestamps: new Set(["source", "observedAt"]),
+  sourceTimestamp: new Set(["state", "value"]),
+  transactionProvenance: new Set(["state", "evidenceClass", "slot"]),
+  slot: new Set(["state", "value"])
+});
 const OUTCOME_REASONS = new Set(["baseline-missing", "baseline-observation-stale", "window-not-mature", "target-observation-missing", "target-observation-stale", "return-calculation-out-of-range"]);
 const GECKOTERMINAL_STATUSES = new Set([
   "queued", "pool-selected", "awaiting-pool", "awaiting-price", "baseline-unavailable",
@@ -251,6 +280,97 @@ function boundedInteger(value, label, { min = 0, max = Number.MAX_SAFE_INTEGER }
     throw new RangeError(`${label} must be an integer between ${min} and ${max}`);
   }
   return value;
+}
+
+function actorSummaryObject(value, label, schema) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!ACTOR_SUMMARY_KEYS[schema].has(key)) throw new TypeError(`${label}.${key} was outside the public aggregate contract`);
+  }
+  return value;
+}
+
+function actorObservationObject(value, label, schema) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!ACTOR_OBSERVATION_KEYS[schema].has(key)) {
+      throw new TypeError(`${label}.${key} contained raw identity or data outside the minimized observation contract`);
+    }
+  }
+  return value;
+}
+
+function validateActorObservationContract(event) {
+  actorObservationObject(event, "actor event", "root");
+  actorObservationObject(event.amounts, "actor event.amounts", "amounts");
+  actorObservationObject(event.source, "actor event.source", "source");
+  actorObservationObject(event.timestamps, "actor event.timestamps", "timestamps");
+  actorObservationObject(event.timestamps.source, "actor event.timestamps.source", "sourceTimestamp");
+  actorObservationObject(event.transactionProvenance, "actor event.transactionProvenance", "transactionProvenance");
+  actorObservationObject(event.transactionProvenance.slot, "actor event.transactionProvenance.slot", "slot");
+  if (event.schemaVersion !== 1
+    || !Number.isFinite(event.amounts.token) || event.amounts.token <= 0 || event.amounts.token > 1_000_000_000_000_000
+    || (event.amounts.native !== null && (!Number.isFinite(event.amounts.native) || event.amounts.native < 0 || event.amounts.native > 1_000_000_000_000))
+    || !["solana-mainnet-rpc", "pumpportal"].includes(event.source.name)
+    || !["on-chain-finalized", "provider-observed"].includes(event.source.evidenceClass)
+    || (event.source.name === "solana-mainnet-rpc" && event.source.evidenceClass !== "on-chain-finalized")
+    || (event.source.name === "pumpportal" && event.source.evidenceClass !== "provider-observed")) {
+    throw new TypeError("actor event values did not match the minimized observation contract");
+  }
+  timestamp(event.timestamps.observedAt, "actor event observedAt");
+  if (event.timestamps.source.state === "available") timestamp(event.timestamps.source.value, "actor event source timestamp");
+  else if (event.timestamps.source.state !== "missing" || event.timestamps.source.value !== null) {
+    throw new TypeError("actor event source timestamp state was invalid");
+  }
+  if (event.transactionProvenance.state !== "internal-only"
+    || event.transactionProvenance.evidenceClass !== "locally-derived"
+    || !["available", "missing"].includes(event.transactionProvenance.slot.state)
+    || (event.transactionProvenance.slot.state === "available"
+      && (!Number.isSafeInteger(event.transactionProvenance.slot.value) || event.transactionProvenance.slot.value < 1))
+    || (event.transactionProvenance.slot.state === "missing" && event.transactionProvenance.slot.value !== null)) {
+    throw new TypeError("actor event provenance did not match the minimized observation contract");
+  }
+  return event;
+}
+
+function rejectActorSummaryIdentity(value, mint, path = "actor summary") {
+  if (typeof value === "string") {
+    if ((MINT_PATTERN.test(value) && value !== mint) || SOLANA_SIGNATURE_PATTERN.test(value)
+      || RAW_SOCIAL_PROFILE_PATTERN.test(value)) {
+      throw new TypeError(`${path} contained raw identity or transaction material`);
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, entry] of Object.entries(value)) rejectActorSummaryIdentity(entry, mint, `${path}.${key}`);
+}
+
+function validateActorSummaryContract(summary, mint) {
+  actorSummaryObject(summary, "actor summary", "root");
+  const coverage = actorSummaryObject(summary.coverage, "actor summary.coverage", "coverage");
+  if (coverage.launchObservedAt !== undefined) actorSummaryObject(coverage.launchObservedAt, "actor summary.coverage.launchObservedAt", "launchObservedAt");
+  if (coverage.sourceTimestamps !== undefined) actorSummaryObject(coverage.sourceTimestamps, "actor summary.coverage.sourceTimestamps", "sourceTimestamps");
+  if (coverage.gate !== undefined) actorSummaryObject(coverage.gate, "actor summary.coverage.gate", "gate");
+  if (summary.metrics !== null && summary.metrics !== undefined) {
+    const metrics = actorSummaryObject(summary.metrics, "actor summary.metrics", "metrics");
+    for (const key of ["timing", "uniqueActors", "repeatActivity", "holdingDurationEvidence", "amountConcentration", "activityBurst"]) {
+      if (metrics[key] !== undefined) actorSummaryObject(metrics[key], `actor summary.metrics.${key}`, key);
+    }
+    if (metrics.timing?.actorFirstObservationOffsetMs !== null && metrics.timing?.actorFirstObservationOffsetMs !== undefined) {
+      actorSummaryObject(metrics.timing.actorFirstObservationOffsetMs,
+        "actor summary.metrics.timing.actorFirstObservationOffsetMs", "actorFirstObservationOffsetMs");
+    }
+    if (metrics.amountConcentration?.amountCoverage !== undefined) {
+      actorSummaryObject(metrics.amountConcentration.amountCoverage,
+        "actor summary.metrics.amountConcentration.amountCoverage", "amountCoverage");
+    }
+  }
+  rejectActorSummaryIdentity(summary, mint);
+  return summary;
 }
 
 function sensitiveText(value) {
@@ -599,7 +719,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS actor_installation (
         id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
         secret BLOB NOT NULL CHECK(length(secret)=32),
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        method_revision TEXT NOT NULL DEFAULT 'uninitialized'
       );
       CREATE TABLE IF NOT EXISTS actor_cohort (
         mint TEXT PRIMARY KEY NOT NULL,
@@ -656,7 +777,11 @@ export class Store {
       ]) {
         if (!eventColumns.has(name)) this.db.exec(`ALTER TABLE events ADD COLUMN ${name} ${definition}`);
       }
-      if (existingVersion > 0 && existingVersion < STORE_SCHEMA_VERSION) {
+      const actorInstallationColumns = new Set(this.db.prepare("PRAGMA table_info(actor_installation)").all().map(({ name }) => name));
+      if (!actorInstallationColumns.has("method_revision")) {
+        this.db.exec("ALTER TABLE actor_installation ADD COLUMN method_revision TEXT NOT NULL DEFAULT 'uninitialized'");
+      }
+      if (existingVersion > 0 && existingVersion < LEGACY_ACTOR_SCHEMA_VERSION) {
         this.db.exec(`
         ALTER TABLE events RENAME TO events_schema_legacy;
         CREATE TABLE events (
@@ -1361,6 +1486,40 @@ export class Store {
     }
     return Buffer.from(row.secret);
   }
+  prepareActorMethodRevision(revision) {
+    const normalizedRevision = text(revision, "actor method revision", { max: 64, code: true });
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.db.prepare("SELECT method_revision AS methodRevision FROM actor_installation WHERE id=1").get();
+      if (!row) throw new Error("actor installation metadata is unavailable");
+      if (row.methodRevision === normalizedRevision) {
+        this.db.exec("COMMIT");
+        return {
+          changed: false,
+          previousRevision: normalizedRevision,
+          currentRevision: normalizedRevision,
+          reset: { cohort: 0, observations: 0, summaries: 0 }
+        };
+      }
+      const reset = {
+        cohort: Number(this.db.prepare("SELECT count(*) AS count FROM actor_cohort").get().count),
+        observations: Number(this.db.prepare("SELECT count(*) AS count FROM actor_observations").get().count),
+        summaries: Number(this.db.prepare("SELECT count(*) AS count FROM actor_summaries").get().count)
+      };
+      this.db.exec("DELETE FROM actor_summaries; DELETE FROM actor_observations; DELETE FROM actor_cohort");
+      this.db.prepare("UPDATE actor_installation SET method_revision=? WHERE id=1").run(normalizedRevision);
+      this.db.exec("COMMIT");
+      return {
+        changed: true,
+        previousRevision: row.methodRevision,
+        currentRevision: normalizedRevision,
+        reset
+      };
+    } catch (error) {
+      try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
   admitActorMint({ mint, launchObservedAt, admittedAt = new Date().toISOString(), nextAttemptAt, limit = 16 } = {}) {
     const normalizedMint = text(mint, "actor mint", { max: 44 });
     if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor mint must be a Solana base58 address");
@@ -1427,10 +1586,14 @@ export class Store {
     const normalizedObservedAt = timestamp(observedAt, "actor observedAt");
     const normalizedSourceAt = sourceAt === null ? null : timestamp(sourceAt, "actor sourceAt");
     const normalizedRetainedUntil = timestamp(retainedUntil, "actor retainedUntil");
-    if (normalizedRetainedUntil <= normalizedObservedAt) throw new RangeError("actor retainedUntil must follow observedAt");
+    const retentionMs = Date.parse(normalizedRetainedUntil) - Date.parse(normalizedObservedAt);
+    if (retentionMs <= 0 || retentionMs > ACTOR_OBSERVATION_MAX_RETENTION_MS) {
+      throw new RangeError("actor retainedUntil must follow observedAt by no more than 72 hours");
+    }
     if (!event || typeof event !== "object" || Array.isArray(event) || event.mint !== normalizedMint
       || typeof event.actor !== "string" || !/^Actor [1-9][0-9]{0,19}$/.test(event.actor)
       || !["buy", "sell"].includes(event.side)) throw new TypeError("actor event did not match the minimized persistence contract");
+    validateActorObservationContract(event);
     const encoded = JSON.stringify(event);
     if (Buffer.byteLength(encoded) > 8 * 1_024 || /(?:traderPublicKey|actorAddress|signature|cookie|authorization|privateKey)/i.test(encoded)) {
       throw new TypeError("actor event contained raw identity, transaction, credential, or oversized data");
@@ -1468,10 +1631,12 @@ export class Store {
   }
   saveActorSummary(mint, summary) {
     const normalizedMint = text(mint, "actor summary mint", { max: 44 });
+    if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor summary mint must be a Solana base58 address");
     if (!summary || typeof summary !== "object" || Array.isArray(summary) || summary.mint !== normalizedMint
       || !summary.coverage || !["missing", "insufficient-sample", "available"].includes(summary.coverage.state)) {
       throw new TypeError("actor summary did not match the public aggregate contract");
     }
+    validateActorSummaryContract(summary, normalizedMint);
     const encoded = JSON.stringify(summary);
     if (Buffer.byteLength(encoded) > 32 * 1_024 || /(?:traderPublicKey|actorAddress|signature|transactionProvenance|cookie|authorization|privateKey)/i.test(encoded)) {
       throw new TypeError("actor summary contained private, raw, or oversized data");
@@ -1484,16 +1649,25 @@ export class Store {
   }
   actorSummaries(limit = 64) {
     const normalizedLimit = boundedInteger(limit, "actor summary limit", { min: 1, max: 200 });
-    return this.db.prepare("SELECT summary,updated_at AS updatedAt FROM actor_summaries ORDER BY updated_at DESC,mint ASC LIMIT ?")
-      .all(normalizedLimit).flatMap(({ summary, updatedAt }) => {
-        try { return [{ ...JSON.parse(summary), updatedAt }]; } catch { return []; }
+    return this.db.prepare("SELECT mint,summary,updated_at AS updatedAt FROM actor_summaries ORDER BY updated_at DESC,mint ASC LIMIT ?")
+      .all(normalizedLimit).flatMap(({ mint, summary, updatedAt }) => {
+        try {
+          const decoded = JSON.parse(summary);
+          if (decoded.mint !== mint) return [];
+          validateActorSummaryContract(decoded, mint);
+          return [{ ...decoded, updatedAt }];
+        } catch { return []; }
       });
   }
   actorSummary(mint) {
     const normalizedMint = text(mint, "actor summary mint", { max: 44 });
     const row = this.db.prepare("SELECT summary,updated_at AS updatedAt FROM actor_summaries WHERE mint=?").get(normalizedMint);
     if (!row) return null;
-    try { return { ...JSON.parse(row.summary), updatedAt: row.updatedAt }; } catch { return null; }
+    try {
+      const decoded = JSON.parse(row.summary);
+      validateActorSummaryContract(decoded, normalizedMint);
+      return { ...decoded, updatedAt: row.updatedAt };
+    } catch { return null; }
   }
   countBySource(source) {
     if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");

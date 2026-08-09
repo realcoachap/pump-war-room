@@ -16,28 +16,138 @@ test("installation-scoped actor labels are stable, opaque, and namespace-separat
   assert.notEqual(first, opaqueActorLabel(wallet, { installationSecret: secret, namespace: "profile" }));
 });
 
-test("public token projection replaces raw wallet identities without mutating private storage", () => {
-  const token = { mint: "11111111111111111111111111111111", creator: wallet, deployer: wallet, smartWallets: 9, symbol: "SAFE" };
+test("public token projection uses a strict nested allowlist and freshly derived actor labels", () => {
+  const token = {
+    ingestSchemaVersion: 2,
+    mint: "11111111111111111111111111111111",
+    creator: wallet,
+    deployer: wallet,
+    creatorActor: "Actor 1",
+    deployerActor: "Actor 2",
+    smartWallets: 9,
+    name: "Contact https://x.com/private_profile",
+    symbol: wallet,
+    description: `Contact https://x.com/private_profile or ${wallet}`,
+    signature: "3".repeat(64),
+    unknownNested: { walletAddress: wallet, profileUrl: "https://x.com/private_profile" },
+    marketCapEvidence: {
+      evidenceClass: "locally-derived",
+      basis: "feed-market-cap-sol-times-operator-sol-usd",
+      solUsd: 150,
+      raw: { signer: wallet }
+    },
+    migrationEvidence: {
+      evidenceClass: "feed-observed-processed",
+      source: "pumpportal",
+      observedAt: "2026-08-09T12:00:00.000Z",
+      pool: "pump",
+      limitation: "Processed observation.",
+      wallet: wallet
+    },
+    riskIdentity: {
+      schemaVersion: 1,
+      methodVersion: "risk-identity-exact-match-v1",
+      overallEvidence: "locally-derived",
+      rankingImpact: "none-uncalibrated",
+      factors: {
+        concentration: {
+          evidenceClass: "provider-observed",
+          holderCount: 42,
+          sourceFields: ["data.attributes.holders.count"],
+          raw: { ownerAddress: wallet }
+        },
+        identity: {
+          evidenceClass: "locally-derived",
+          exactDuplicateCount: 1,
+          exactDuplicateCounts: { xHandle: 1, nameSymbol: 0, wallet: wallet },
+          profileUrl: "https://x.com/private_profile"
+        }
+      },
+      duplicateEvidence: {
+        exactDeclaredIdentifierReuse: { value: true, evidenceClass: "locally-derived", signer: wallet }
+      },
+      providerObservation: {
+        sourceStatus: "available",
+        missingReasonCode: null,
+        lastAttemptAt: "2026-08-09T12:00:00.000Z",
+        nextAttemptAt: null,
+        account: wallet
+      },
+      missing: ["developer"],
+      profile: "@private_profile"
+    }
+  };
   const projected = projectPublicToken(token, { installationSecret: secret });
   assert.equal(projected.creator, undefined);
   assert.equal(projected.deployer, undefined);
   assert.equal(projected.smartWallets, undefined);
+  assert.equal(projected.name, undefined);
+  assert.equal(projected.symbol, undefined);
+  assert.equal(projected.description, undefined);
+  assert.equal(projected.signature, undefined);
+  assert.equal(projected.unknownNested, undefined);
   assert.equal(projected.creatorActor, projected.deployerActor);
+  assert.notEqual(projected.creatorActor, "Actor 1");
+  assert.notEqual(projected.deployerActor, "Actor 2");
+  assert.deepEqual(projected.marketCapEvidence, {
+    evidenceClass: "locally-derived",
+    basis: "feed-market-cap-sol-times-operator-sol-usd",
+    solUsd: 150
+  });
+  assert.deepEqual(projected.migrationEvidence, {
+    evidenceClass: "feed-observed-processed",
+    source: "pumpportal",
+    observedAt: "2026-08-09T12:00:00.000Z",
+    pool: "pump",
+    limitation: "Processed observation."
+  });
+  assert.deepEqual(projected.riskIdentity.factors.concentration, {
+    evidenceClass: "provider-observed",
+    holderCount: 42,
+    sourceFields: ["data.attributes.holders.count"]
+  });
+  assert.deepEqual(projected.riskIdentity.factors.identity.exactDuplicateCounts, { xHandle: 1, nameSymbol: 0 });
+  assert.deepEqual(projected.riskIdentity.duplicateEvidence.exactDeclaredIdentifierReuse, {
+    value: true,
+    evidenceClass: "locally-derived"
+  });
+  assert.equal(projected.riskIdentity.profile, undefined);
+  assert.equal(projected.riskIdentity.providerObservation.account, undefined);
   assert.equal(token.creator, wallet);
+  assert.equal(token.description.includes(wallet), true);
+  projected.riskIdentity.missing.push("liquidity");
+  assert.deepEqual(token.riskIdentity.missing, ["developer"]);
   assert.equal(containsRawIdentityKey(projected), false);
-  const malformed = projectPublicToken({ mint: token.mint, creator: "not-an-address", deployer: "also-invalid" }, { installationSecret: secret });
+  assert.doesNotMatch(JSON.stringify(projected), /private_profile|walletAddress|ownerAddress/);
+  const malformed = projectPublicToken({
+    mint: token.mint,
+    creator: "not-an-address",
+    deployer: "also-invalid",
+    creatorActor: "Actor 1",
+    deployerActor: "Actor 2"
+  }, { installationSecret: secret });
   assert.equal(malformed.creator, undefined);
   assert.equal(malformed.deployer, undefined);
   assert.equal(malformed.creatorActor, undefined);
   assert.equal(malformed.deployerActor, undefined);
+  assert.equal(projectPublicToken([{ creator: wallet }], { installationSecret: secret }), null);
+  assert.equal(projectPublicToken(Object.assign(new Date(), { creator: wallet }), { installationSecret: secret }), null);
 });
 
 test("public callout projection replaces profile identity and omits internal event IDs", () => {
-  const callout = { externalId: "private-event", mint: "11111111111111111111111111111111", caller: "@alpha", source: "bark" };
+  const callout = {
+    externalId: "private-event", mint: "11111111111111111111111111111111", caller: "@alpha", source: "bark",
+    name: "Contact https://x.com/raw_profile", walletAddress: wallet,
+    unknownNested: { transactionId: "3".repeat(64), profile: "@raw_profile" }
+  };
   const projected = projectPublicCallout(callout, { installationSecret: secret });
   assert.match(projected.sourceActor, /^Actor /);
   assert.equal(projected.caller, undefined);
   assert.equal(projected.externalId, undefined);
+  assert.equal(projected.name, undefined);
+  assert.equal(projected.walletAddress, undefined);
+  assert.equal(projected.unknownNested, undefined);
+  assert.doesNotMatch(JSON.stringify(projected), /raw_profile|walletAddress|transactionId/);
   assert.equal(JSON.stringify(projected).includes("alpha"), false);
   assert.equal(callout.caller, "@alpha");
   assert.equal(projectPublicCallout({ mint: callout.mint, caller: "x".repeat(300) }, { installationSecret: secret }).sourceActor, null);

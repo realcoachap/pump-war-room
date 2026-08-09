@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
+import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
 const version = "0.9.0";
 
@@ -114,13 +115,13 @@ function riskCoverage({ stateCount = 120, successCount = 90, statusCounts = { av
   };
 }
 
-function actorDownstreamGate() {
+function actorDownstreamGate({ eligibleMintCount = 1, acquisitionCoverage = 1 } = {}) {
   return {
     status: "withheld",
     minimumEligibleMints: 20,
     minimumAcquisitionCoverage: 0.6,
-    eligibleMintCount: 1,
-    acquisitionCoverage: 1,
+    eligibleMintCount,
+    acquisitionCoverage,
     labeledHoldoutCalibrationPassed: false,
     rankingImpact: "none",
     riskProbabilityImpact: "none",
@@ -179,6 +180,7 @@ function actorEngine() {
   return {
     schemaVersion: 1,
     source: "solana-mainnet-rpc",
+    parserRevision: SOLANA_ACTOR_PARSER_REVISION,
     status: "observing",
     started: true,
     queueDepth: 0,
@@ -186,7 +188,11 @@ function actorEngine() {
     lastSuccessAt: "2026-08-08T12:00:00.000Z",
     lastErrorAt: null,
     lastErrorCode: null,
-    cohort: { limit: 32, admittedCount: 1, evidenceMintCount: 1, eligibleMintCount: 1, statusCounts: { observing: 1 } },
+    cohort: {
+      limit: 32, admittedCount: 1, evidenceMintCount: 1, eligibleMintCount: 1,
+      attemptedMintCount: 1, failureStateCount: 0, failureRatio: 0,
+      pendingAttemptCount: 1, terminalCount: 0, terminalFailureCount: 0, statusCounts: { observing: 1 }
+    },
     correlationGate: actorDownstreamGate(),
     counters: { admissions: 1, attempts: 1, observationsAccepted: 1, observationsDeduplicated: 0, failures: 0 }
   };
@@ -199,6 +205,7 @@ function actorIntelligence() {
     generatedAt: "2026-08-08T12:00:00.000Z",
     source: {
       id: "solana-mainnet-rpc",
+      parserRevision: SOLANA_ACTOR_PARSER_REVISION,
       evidenceClass: "on-chain-finalized",
       endpointClass: "documented-rate-limited-public-rpc",
       attributionUrl: "https://solana.com/docs/references/clusters",
@@ -245,6 +252,80 @@ function actorIntelligence() {
     downstream: actorDownstreamGate(),
     disclaimer: "Bounded finalized observations are partial and do not establish identity, coordination, or a trade signal."
   };
+}
+
+function actorObservation({
+  mintIndex = 0,
+  status = "queued",
+  attemptCount = 0,
+  lastAttemptAt = null,
+  nextAttemptAt = "2026-08-08T12:15:00.000Z",
+  lastSuccessAt = null,
+  errorCode = null,
+  summary = null
+} = {}) {
+  return {
+    mint: cohortMint(mintIndex),
+    name: `Token ${mintIndex + 1}`,
+    symbol: `T${mintIndex + 1}`,
+    launchObservedAt: "2026-08-08T11:45:00.000Z",
+    acquisition: {
+      status,
+      attemptCount,
+      lastAttemptAt,
+      nextAttemptAt,
+      lastSuccessAt,
+      missingReason: summary ? "Minimum per-coin event/actor/source-time gate not yet met" : "Evidence remains unavailable",
+      errorCode
+    },
+    summary
+  };
+}
+
+function configureActorScenario(engine, observations, status) {
+  const admittedCount = observations.length;
+  const evidenceMintCount = observations.filter((observation) => observation.summary?.coverage?.eventCount > 0).length;
+  const eligibleMintCount = observations.filter((observation) => observation.summary?.coverage?.state === "available").length;
+  const attemptedMintCount = observations.filter((observation) => observation.acquisition.attemptCount > 0).length;
+  const failureStateCount = observations.filter((observation) => observation.acquisition.attemptCount > 0
+    && ["rate-limited", "degraded", "invalid-response"].includes(observation.acquisition.status)).length;
+  const failureRatio = attemptedMintCount ? failureStateCount / attemptedMintCount : null;
+  const pendingAttemptCount = observations.filter((observation) => observation.acquisition.nextAttemptAt !== null).length;
+  const terminalCount = admittedCount - pendingAttemptCount;
+  const terminalFailureCount = observations.filter((observation) => observation.acquisition.nextAttemptAt === null
+    && ["rate-limited", "degraded", "invalid-response"].includes(observation.acquisition.status)).length;
+  const statusCounts = Object.fromEntries(observations.reduce((counts, observation) => {
+    counts.set(observation.acquisition.status, (counts.get(observation.acquisition.status) || 0) + 1);
+    return counts;
+  }, new Map()));
+  const acquisitionCoverage = admittedCount ? evidenceMintCount / admittedCount : null;
+  engine.status = status;
+  engine.cohort = {
+    limit: 32,
+    admittedCount,
+    evidenceMintCount,
+    eligibleMintCount,
+    attemptedMintCount,
+    failureStateCount,
+    failureRatio,
+    pendingAttemptCount,
+    terminalCount,
+    terminalFailureCount,
+    statusCounts
+  };
+  engine.correlationGate = actorDownstreamGate({ eligibleMintCount, acquisitionCoverage });
+  return engine.correlationGate;
+}
+
+function configureActorHealth(health, observations, status) {
+  configureActorScenario(health.earlyActors, observations, status);
+}
+
+function configureActorSnapshot(snapshot, observations, status) {
+  const actor = snapshot.earlyActorIntelligence;
+  const gate = configureActorScenario(actor.engine, observations, status);
+  actor.cohort = { limit: 32, admittedCount: observations.length, observations };
+  actor.downstream = { ...gate };
 }
 
 async function fixture(t, overrides = {}, headerOverrides = {}) {
@@ -444,6 +525,20 @@ test("fails when early-actor sampling loses its bounded raw-data retention contr
   );
 });
 
+test("fails when the early-actor parser revision does not match the account-bound parser", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => { health.earlyActors.parserRevision = "legacy-parser"; }),
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.earlyActorIntelligence.source.parserRevision = "legacy-parser";
+      snapshot.earlyActorIntelligence.engine.parserRevision = "legacy-parser";
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && /early-actor engine contract/.test(error.message)
+  );
+});
+
 test("fails when actor evidence is allowed into any downstream decision surface", async (t) => {
   const baseUrl = await fixture(t, {
     "/api/health": jsonOverride((health) => {
@@ -460,6 +555,97 @@ test("fails when actor evidence is allowed into any downstream decision surface"
   );
 });
 
+test("fails when every admitted actor mint is terminal with zero evidence", async (t) => {
+  const terminal = () => [actorObservation({
+    status: "complete",
+    attemptCount: 3,
+    lastAttemptAt: "2026-08-08T12:15:00.000Z",
+    nextAttemptAt: null,
+    lastSuccessAt: "2026-08-08T12:15:00.000Z"
+  })];
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => configureActorHealth(health, terminal(), "complete-with-missing")),
+    "/api/snapshot": jsonOverride((snapshot) => configureActorSnapshot(snapshot, terminal(), "complete-with-missing"))
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /exhausted every admitted mint with zero actor evidence/.test(error.message)
+  );
+});
+
+test("allows fresh prospective actor acquisition with no evidence yet", async (t) => {
+  const prospective = () => [actorObservation()];
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => configureActorHealth(health, prospective(), "observing")),
+    "/api/snapshot": jsonOverride((snapshot) => configureActorSnapshot(snapshot, prospective(), "observing"))
+  });
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
+  assert.equal(result.ok, true);
+});
+
+test("fails when one failed attempted mint is hidden by one untouched prospective admission", async (t) => {
+  const partial = () => [
+    actorObservation({
+      status: "invalid-response",
+      attemptCount: 3,
+      lastAttemptAt: "2026-08-08T12:15:00.000Z",
+      nextAttemptAt: null,
+      errorCode: "invalid-transaction-response"
+    }),
+    actorObservation({ mintIndex: 1 })
+  ];
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => configureActorHealth(health, partial(), "degraded")),
+    "/api/snapshot": jsonOverride((snapshot) => configureActorSnapshot(snapshot, partial(), "degraded"))
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /failure-state ratio 1\/1 exceeded 25%/.test(error.message)
+  );
+});
+
+test("fails a pending-retry false green when the attempted cohort is entirely failed", async (t) => {
+  const retrying = () => [
+    actorObservation({
+      status: "rate-limited",
+      attemptCount: 1,
+      lastAttemptAt: "2026-08-08T12:00:00.000Z",
+      errorCode: "rate-limited"
+    }),
+    actorObservation({ mintIndex: 1 })
+  ];
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => configureActorHealth(health, retrying(), "degraded")),
+    "/api/snapshot": jsonOverride((snapshot) => configureActorSnapshot(snapshot, retrying(), "degraded"))
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /failure-state ratio 1\/1 exceeded 25%/.test(error.message)
+  );
+});
+
+test("accepts actor acquisition at the 25% attempted-mint failure boundary", async (t) => {
+  const boundary = () => [
+    actorObservation({
+      status: "invalid-response", attemptCount: 1, lastAttemptAt: "2026-08-08T12:00:00.000Z",
+      errorCode: "invalid-transaction-response"
+    }),
+    ...[1, 2, 3].map((mintIndex) => actorObservation({
+      mintIndex, status: "unavailable", attemptCount: 1,
+      lastAttemptAt: "2026-08-08T12:00:00.000Z", lastSuccessAt: "2026-08-08T12:00:00.000Z"
+    }))
+  ];
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => configureActorHealth(health, boundary(), "degraded")),
+    "/api/snapshot": jsonOverride((snapshot) => configureActorSnapshot(snapshot, boundary(), "degraded"))
+  });
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
+  assert.equal(result.ok, true);
+});
+
 test("recursively rejects raw identity keys from every public JSON surface", async (t) => {
   const baseUrl = await fixture(t, {
     [`/api/coins/${cohortMint(0)}`]: jsonOverride((dossier) => {
@@ -470,6 +656,62 @@ test("recursively rejects raw identity keys from every public JSON surface", asy
     runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
     (error) => error instanceof SmokeCheckError && error.check === "dossier" && /raw public identity key/.test(error.message)
   );
+});
+
+test("recursively rejects normalized wallet, owner, signer, account, and profile aliases", async (t) => {
+  for (const alias of [
+    "wallet", "wallet_address", "owner", "signerPublicKey", "userWallet", "participantAddress",
+    "authority", "feePayer", "account", "public_key", "profile", "profileUrl", "username"
+  ]) {
+    await t.test(alias, async (t) => {
+      const baseUrl = await fixture(t, {
+        [`/api/coins/${cohortMint(0)}`]: jsonOverride((dossier) => {
+          dossier.earlyActor.audit = { nested: { [alias]: cohortMint(15) } };
+        })
+      });
+      await assert.rejects(
+        runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+        (error) => error instanceof SmokeCheckError && error.check === "dossier"
+          && /raw public identity key/.test(error.message)
+      );
+    });
+  }
+});
+
+test("rejects raw Solana identities in controlled labels and unknown narrative fields", async (t) => {
+  for (const [name, pathname, update] of [
+    ["risk cohort name", "/api/snapshot", (snapshot) => {
+      snapshot.riskIntelligence.cohort.observations[0].name = cohortMint(15);
+    }],
+    ["actor cohort symbol", "/api/snapshot", (snapshot) => {
+      snapshot.earlyActorIntelligence.cohort.observations[0].symbol = "3".repeat(64);
+    }],
+    ["unknown narrative scalar", `/api/coins/${cohortMint(0)}`, (dossier) => {
+      dossier.researchNarrative = { observation: `Controller ${cohortMint(15)}` };
+    }]
+  ]) {
+    await t.test(name, async (t) => {
+      const baseUrl = await fixture(t, { [pathname]: jsonOverride(update) });
+      await assert.rejects(
+        runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+        (error) => error instanceof SmokeCheckError && /raw Solana identity value/.test(error.message)
+      );
+    });
+  }
+});
+
+test("allows exact Solana identifiers only in mint, pool, and ordinary URL contexts", async (t) => {
+  const baseUrl = await fixture(t, {
+    [`/api/coins/${cohortMint(0)}`]: jsonOverride((dossier) => {
+      dossier.references = {
+        mint: cohortMint(15),
+        selectedPool: cohortMint(16),
+        explorerUrl: `https://solscan.io/account/${cohortMint(17)}`
+      };
+    })
+  });
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
+  assert.equal(result.ok, true);
 });
 
 test("recursively rejects hidden actor mapping or provenance material", async (t) => {

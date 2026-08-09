@@ -25,6 +25,7 @@ import {
 } from "../src/database-backup.js";
 import { Store, STORE_SCHEMA_VERSION } from "../src/store.js";
 import { parseGeckoTerminalTokenInfo } from "../src/risk-identity.js";
+import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
 const createdAt = "2026-08-08T12:00:00.000Z";
 const actorMint = "So11111111111111111111111111111111111111112";
@@ -58,6 +59,7 @@ function digest(filePath) {
 function seededStore(directory) {
   const databasePath = path.join(directory, "live.db");
   const store = new Store(databasePath);
+  store.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
   store.upsertToken({ mint: "LiveMintPump", symbol: "LIVE", source: "pumpportal", createdAt });
   store.addEvent("mint", { mint: "LiveMintPump", source: "pumpportal" });
   store.addAlert({ level: "signal", title: "Observed", message: "Live row", mint: "LiveMintPump", createdAt });
@@ -151,6 +153,7 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
     actor_observations: 0, actor_summaries: 0
   });
   assert.equal(report.backup.actorInstallationSecretValid, true);
+  assert.equal(report.backup.actorMethodRevision, SOLANA_ACTOR_PARSER_REVISION);
   assert.equal(report.backup.actorPrivacyViolations, 0);
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(digest(databasePath), sourceBefore);
@@ -539,6 +542,69 @@ test("verifies an exact schema 801 artifact and adds actor storage only to the d
   assert.equal(report.disposableRestore.rowCounts.actor_summaries, 0);
   assert.equal(report.disposableRestore.actorInstallationSecretValid, true);
   assert.equal(report.disposableRestore.actorPrivacyViolations, 0);
+  assert.equal(digest(databasePath), before.hash);
+  assert.equal(statSync(databasePath).mtime.toISOString(), before.modifiedAt);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
+test("migrates schema 900 by preserving the installation secret and clearing pre-revision actor evidence", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const { store, databasePath } = seededStore(directory);
+  const actorSecretBefore = store.actorPrivacySecret().toString("hex");
+  store.db.exec(`
+    ALTER TABLE actor_installation RENAME TO actor_installation_schema_901;
+    CREATE TABLE actor_installation (
+      id INTEGER PRIMARY KEY NOT NULL CHECK(id=1),
+      secret BLOB NOT NULL CHECK(length(secret)=32),
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO actor_installation (id,secret,created_at)
+      SELECT id,secret,created_at FROM actor_installation_schema_901;
+    DROP TABLE actor_installation_schema_901;
+    PRAGMA user_version = 900;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    PRAGMA journal_mode = DELETE;
+  `);
+  store.db.close();
+  const before = { hash: digest(databasePath), modifiedAt: statSync(databasePath).mtime.toISOString() };
+
+  const artifact = inspectDatabaseFile(databasePath, { allowLegacy: true });
+  assert.equal(artifact.userVersion, 900);
+  assert.equal(artifact.actorMethodRevision, null);
+  assert.equal(artifact.rowCounts.actor_cohort, 1);
+  assert.equal(artifact.rowCounts.actor_observations, 1);
+  assert.equal(artifact.rowCounts.actor_summaries, 1);
+
+  const report = verifyRestorableBackup(databasePath, { scratchRoot: scratchDirectory });
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, 900);
+  assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
+  assert.equal(report.disposableRestore.actorMethodRevision, SOLANA_ACTOR_PARSER_REVISION);
+  assert.equal(report.disposableRestore.rowCounts.actor_cohort, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_observations, 0);
+  assert.equal(report.disposableRestore.rowCounts.actor_summaries, 0);
+
+  const migrationPath = path.join(directory, "schema-900-migration.db");
+  copyFileSync(databasePath, migrationPath);
+  let migrated = new Store(migrationPath);
+  const prepared = migrated.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION);
+  assert.equal(prepared.changed, true);
+  assert.deepEqual(prepared.reset, { cohort: 1, observations: 1, summaries: 1 });
+  assert.equal(migrated.actorPrivacySecret().toString("hex"), actorSecretBefore);
+  assert.equal(migrated.actorStates().length, 0);
+  assert.equal(migrated.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION).changed, false);
+  migrated.admitActorMint({
+    mint: actorMint,
+    launchObservedAt: createdAt,
+    admittedAt: createdAt,
+    nextAttemptAt: createdAt
+  });
+  migrated.db.close();
+  migrated = new Store(migrationPath);
+  assert.equal(migrated.prepareActorMethodRevision(SOLANA_ACTOR_PARSER_REVISION).changed, false);
+  assert.equal(migrated.actorStates().length, 1);
+  migrated.db.close();
+
   assert.equal(digest(databasePath), before.hash);
   assert.equal(statSync(databasePath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);

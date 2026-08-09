@@ -60,6 +60,10 @@ test("prospective actor admission is restart-safe, bounded, and rejects replay b
   assert.equal(ingestor.admit({ mint: MINT, source: "pumpportal", createdAt: LAUNCH }).admitted, true);
   assert.equal(ingestor.admit({ mint: MINT, source: "pumpportal", createdAt: LAUNCH }).reason, "already-admitted");
   assert.equal(ingestor.admit({ mint: "22222222222222222222222222222222", source: "pumpportal", createdAt: "2026-08-09T17:00:00.000Z" }).reason, "replay-too-old-or-invalid");
+  const prospective = ingestor.getStatus().cohort;
+  assert.equal(prospective.attemptedMintCount, 0);
+  assert.equal(prospective.failureStateCount, 0);
+  assert.equal(prospective.failureRatio, null);
   const reopenedSecret = state.store.actorPrivacySecret();
   state.store.db.close();
   state.store = new Store(path.join(state.directory, "test.db"));
@@ -81,7 +85,11 @@ test("bounded acquisition persists minimized deduped evidence and explicit missi
   assert.equal(state.store.actorSummaries()[0].coverage.state, "available");
   assert.equal(state.store.actorSummaries()[0].coverage.uniqueActorCount, 3);
   assert.equal(state.store.actorObservationEvents(MINT).length, 5);
-  assert.equal(ingestor.getStatus().correlationGate.rankingImpact, "none");
+  const status = ingestor.getStatus();
+  assert.equal(status.correlationGate.rankingImpact, "none");
+  assert.equal(status.cohort.attemptedMintCount, 1);
+  assert.equal(status.cohort.failureStateCount, 0);
+  assert.equal(status.cohort.failureRatio, 0);
   assert.equal(JSON.stringify(state.store.actorSummaries()).includes("actorAddress"), false);
 });
 
@@ -97,10 +105,79 @@ test("store enforces actor dedupe conflicts, retention, and aggregate privacy", 
   };
   const retainedUntil = "2026-08-09T18:28:00.000Z";
   assert.equal(state.store.saveActorObservation({ eventKey: "actor:one", mint: MINT, event, sourceAt: LAUNCH, observedAt: LAUNCH, retainedUntil }).written, true);
+  assert.throws(() => state.store.saveActorObservation({
+    eventKey: "actor:too-long", mint: MINT, event, sourceAt: LAUNCH, observedAt: LAUNCH,
+    retainedUntil: new Date(Date.parse(LAUNCH) + 72 * 60 * 60 * 1_000 + 1).toISOString()
+  }), /no more than 72 hours/);
   assert.equal(state.store.saveActorObservation({ eventKey: "actor:one", mint: MINT, event, sourceAt: LAUNCH, observedAt: LAUNCH, retainedUntil }).written, false);
   assert.throws(() => state.store.saveActorObservation({ eventKey: "actor:one", mint: MINT, event: { ...event, side: "sell" }, sourceAt: LAUNCH, observedAt: LAUNCH, retainedUntil }), /conflicts/);
   const summary = { mint: MINT, coverage: { state: "insufficient-sample", eventCount: 1 }, metrics: null };
   state.store.saveActorSummary(MINT, summary);
+  assert.throws(() => state.store.saveActorSummary(MINT, {
+    ...summary,
+    audit: { wallet: ACTORS[0], transactionId: "3".repeat(64), provenanceDigest: "hidden" }
+  }), /outside the public aggregate contract/);
   assert.equal(JSON.stringify(state.store.actorSummaries()).includes("transactionProvenance"), false);
   assert.deepEqual(state.store.pruneActorObservations({ now: "2026-08-09T19:00:00.000Z", maximum: 10 }), { expired: 1, excess: 0, retained: 0 });
+});
+
+test("retention runs without due acquisition work and a mid-batch failure still publishes partial evidence", async (t) => {
+  const state = await fixture();
+  t.after(state.close);
+  let now = NOW;
+  const fake = clientWithObservations();
+  let transactionCount = 0;
+  fake.transaction = async () => {
+    transactionCount += 1;
+    if (transactionCount === 2) throw Object.assign(new Error("provider stopped mid-batch"), { code: "network-error" });
+    return { marker: true };
+  };
+  const bySignature = new Map(fake.inputs.map((input) => [input.transactionId, input]));
+  const extract = ({ signatureInfo }) => ({ status: "observed", reason: null, observations: [bySignature.get(signatureInfo.signature)] });
+  const ingestor = new EarlyActorIngestor({ store: state.store, client: fake, now: () => now, extract });
+  ingestor.start();
+  ingestor.admit({ mint: MINT, source: "pumpportal", createdAt: LAUNCH });
+  assert.equal(await ingestor.drainDue(), true);
+  assert.equal(state.store.actorState(MINT).status, "degraded");
+  assert.equal(state.store.actorSummary(MINT).coverage.eventCount, 1);
+  assert.equal(state.store.actorObservationEvents(MINT).length, 1);
+  assert.match(state.store.actorState(MINT).missingReason, /Partial bounded evidence retained/);
+
+  state.store.db.prepare("UPDATE actor_cohort SET next_attempt_at=NULL WHERE mint=?").run(MINT);
+  now += 73 * 60 * 60 * 1_000;
+  assert.equal(await ingestor.drainDue(), false);
+  assert.equal(state.store.actorObservationEvents(MINT).length, 0);
+});
+
+test("headline status distinguishes retrying degradation from terminal zero-evidence failure", async (t) => {
+  const state = await fixture();
+  t.after(state.close);
+  let now = NOW;
+  const client = {
+    signaturesForAddress: async () => { throw Object.assign(new Error("rpc unavailable"), { code: "network-error" }); },
+    transaction: async () => null
+  };
+  const ingestor = new EarlyActorIngestor({ store: state.store, client, now: () => now });
+  ingestor.start();
+  ingestor.admit({ mint: MINT, source: "pumpportal", createdAt: LAUNCH });
+  assert.equal(await ingestor.drainDue(), true);
+  const retryingStatus = ingestor.getStatus();
+  assert.equal(retryingStatus.status, "degraded");
+  assert.equal(retryingStatus.cohort.attemptedMintCount, 1);
+  assert.equal(retryingStatus.cohort.failureStateCount, 1);
+  assert.equal(retryingStatus.cohort.failureRatio, 1);
+
+  now = Date.parse(LAUNCH) + 10 * 60_000;
+  assert.equal(await ingestor.drainDue(), true);
+  now = Date.parse(LAUNCH) + 30 * 60_000;
+  assert.equal(await ingestor.drainDue(), true);
+  const status = ingestor.getStatus();
+  assert.equal(status.status, "failed");
+  assert.equal(status.cohort.pendingAttemptCount, 0);
+  assert.equal(status.cohort.terminalCount, 1);
+  assert.equal(status.cohort.terminalFailureCount, 1);
+  assert.equal(status.cohort.attemptedMintCount, 1);
+  assert.equal(status.cohort.failureStateCount, 1);
+  assert.equal(status.cohort.failureRatio, 1);
+  assert.equal(status.cohort.evidenceMintCount, 0);
 });
