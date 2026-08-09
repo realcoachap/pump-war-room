@@ -4,7 +4,7 @@ import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.9.0";
+const version = "0.9.1";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -511,6 +511,23 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
     actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
     parserRevision: true, anonymousEarlyActors: true, legalNotices: true
   });
+});
+
+test("accepts an explicitly disabled live actor worker while reconciling persisted cohort telemetry", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => {
+      health.earlyActors.status = "disabled";
+      health.earlyActors.started = false;
+    }),
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.earlyActorIntelligence.engine.status = "disabled";
+      snapshot.earlyActorIntelligence.engine.started = false;
+    })
+  });
+
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
+  assert.equal(result.ok, true);
+  assert.equal(result.health.earlyActorState, "disabled");
 });
 
 test("fails when early-actor sampling loses its bounded raw-data retention contract", async (t) => {

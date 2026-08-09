@@ -8,14 +8,33 @@ import {
   EARLY_ACTOR_METHOD_VERSION,
   EARLY_ACTOR_RPC_EVIDENCE_CLASS,
   EARLY_ACTOR_RPC_SOURCE,
+  isCanonicalSolanaAddress,
   normalizeEarlyActorTrade
 } from "../src/early-actors.js";
 
-const firstMint = "11111111111111111111111111111111";
-const secondMint = "22222222222222222222222222222222";
-const actorA = "So11111111111111111111111111111111111111112";
-const actorB = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
-const actorC = "9xQeWvG816bUx9EPfEZzj3E4rFZzNQGqYt1h3D6Y8kP";
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function encodeBase58(bytes) {
+  let value = BigInt(`0x${Buffer.from(bytes).toString("hex") || "0"}`);
+  let encoded = "";
+  while (value > 0n) {
+    encoded = BASE58[Number(value % 58n)] + encoded;
+    value /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    encoded = `1${encoded}`;
+  }
+  return encoded || "1";
+}
+
+const key = (byte) => encodeBase58(Buffer.alloc(32, byte));
+const firstMint = key(1);
+const secondMint = key(2);
+const thirdMint = key(3);
+const actorA = key(4);
+const actorB = key(5);
+const actorC = key(6);
 const installationSecret = "installation-secret-material-00001";
 const alternateSecret = "installation-secret-material-00002";
 const startMs = Date.parse("2026-08-09T12:00:00Z");
@@ -25,8 +44,7 @@ function at(offsetMs) {
 }
 
 function signature(index) {
-  const alphabet = "3456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  return alphabet[index % alphabet.length].repeat(88);
+  return encodeBase58(Buffer.alloc(64, index + 10));
 }
 
 function frame({
@@ -184,8 +202,13 @@ test("requires exact observed mints and rejects malformed or unbounded inputs", 
   );
 
   const core = new EarlyActorCore(options({ maxNativeAmount: 10, maxTokenAmount: 100 }));
+  const decoded31ByteAddress = encodeBase58(Buffer.alloc(31, 7));
+  assert.match(decoded31ByteAddress, /^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+  assert.equal(isCanonicalSolanaAddress(firstMint), true);
+  assert.equal(isCanonicalSolanaAddress(decoded31ByteAddress), false);
   const cases = [
-    [frame({ mint: "33333333333333333333333333333333" }), "mint-not-observed"],
+    [frame({ mint: thirdMint }), "mint-not-observed"],
+    [frame({ mint: decoded31ByteAddress }), "invalid-mint"],
     [{ ...frame(), traderPublicKey: "not-base58" }, "invalid-actor-address"],
     [{ ...frame(), signature: "3".repeat(20) }, "invalid-transaction-provenance"],
     [{ ...frame(), source: "pumpfun" }, "unsupported-source"],

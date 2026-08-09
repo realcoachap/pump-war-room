@@ -13,6 +13,7 @@ const rawCaller = "@privacy-contract-caller";
 const rawSignature = "3".repeat(64);
 const privacyMarker = "RAW_PRIVATE_TOKEN_MARKER";
 const staleActorLabel = "Actor 1";
+const actorFixtureMint = "11111111111111111111111111111111";
 const forbiddenIdentityKeys = new Set([
   "creator", "deployer", "caller", "trader", "traderaddress", "traderwallet", "traderpublickey",
   "actoraddress", "signature", "transactionid", "txid", "wallet", "walletaddress", "walletid",
@@ -153,7 +154,7 @@ test("action intelligence API enforces strict methods, bounds, and public contra
     });
   }
   privateStore.admitActorMint({
-    mint: privateToken.mint,
+    mint: actorFixtureMint,
     launchObservedAt: privateToken.createdAt,
     admittedAt: privateToken.createdAt,
     nextAttemptAt: new Date(Date.parse(privateToken.createdAt) + 120_000).toISOString(),
@@ -192,7 +193,7 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   const riskCohortToken = snapshot.riskIntelligence.cohort.observations.find(({ mint }) => mint === privateToken.mint);
   assert.equal(riskCohortToken.name, "Unnamed mint");
   assert.equal(riskCohortToken.symbol, "???");
-  const actorCohortToken = snapshot.earlyActorIntelligence.cohort.observations.find(({ mint }) => mint === privateToken.mint);
+  const actorCohortToken = snapshot.earlyActorIntelligence.cohort.observations.find(({ mint }) => mint === actorFixtureMint);
   assert.equal(actorCohortToken.name, "Unnamed mint");
   assert.equal(actorCohortToken.symbol, "???");
   const projectedCallout = snapshot.callouts.find(({ mint }) => mint === privateToken.mint);
@@ -205,6 +206,9 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   assert.doesNotMatch(JSON.stringify(snapshot.alerts || []), /telegram|dedupeKey/i,
     "public alerts must not expose per-delivery or dedupe metadata");
   assert.equal(snapshot.earlyActorIntelligence.engine.status, "simulation-disabled");
+  assert.equal(snapshot.earlyActorIntelligence.engine.cohort.admittedCount, 1);
+  assert.equal(snapshot.earlyActorIntelligence.engine.cohort.pendingAttemptCount, 1);
+  assert.equal(snapshot.earlyActorIntelligence.engine.cohort.statusCounts.queued, 1);
   assert.equal(snapshot.earlyActorIntelligence.cohort.admittedCount, 1);
   assert.equal(snapshot.earlyActorIntelligence.privacy.rawWalletsPublic, false);
   assert.equal(snapshot.earlyActorIntelligence.privacy.rawProfilesPublic, false);
@@ -217,6 +221,10 @@ test("action intelligence API enforces strict methods, bounds, and public contra
     telegram: snapshot.earlyActorIntelligence.downstream.telegramAlertImpact,
     recommendation: snapshot.earlyActorIntelligence.downstream.recommendationImpact
   }, { ranking: "none", risk: "none", telegram: "none", recommendation: "none" });
+  const { body: health } = await json(baseUrl, "/api/health");
+  assert.equal(health.earlyActors.status, "simulation-disabled");
+  assert.equal(health.earlyActors.cohort.admittedCount, 1);
+  assert.equal(health.earlyActors.cohort.pendingAttemptCount, 1);
   const mints = snapshot.tokens.slice(0, 2).map(({ mint }) => mint);
   assert.equal(mints.length, 2);
 

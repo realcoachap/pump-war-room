@@ -43,6 +43,22 @@ test("material alerts label processed migration evidence without claiming finali
   assert.doesNotMatch(alerts[0].title + alerts[0].message, /graduated|finalized/i);
 });
 
+test("material alert text rejects raw profile-like token symbols before persistence", () => {
+  const alerts = detectMaterialAlerts({
+    previous: token(),
+    current: token({
+      symbol: "@private_handle",
+      status: "migration-observed",
+      migrationEvidence: { evidenceClass: "feed-observed-processed", observedAt: "2026-08-09T11:59:00.000Z" }
+    }),
+    observedAt: now
+  });
+
+  assert.equal(alerts.length, 1);
+  assert.doesNotMatch(alerts[0].message, /private_handle|@[A-Za-z0-9_]+/);
+  assert.match(alerts[0].message, new RegExp(`^${mintA.slice(0, 8)} appeared`));
+});
+
 test("score alerts require two numeric observations and dedupe only an exact occurrence replay", () => {
   assert.deepEqual(detectMaterialAlerts({ current: token(), previous: token(), currentScore: null, previousScore: 20, observedAt: now }), []);
   assert.deepEqual(detectMaterialAlerts({ current: token(), previous: null, currentScore: 80, previousScore: 20, observedAt: now }), []);

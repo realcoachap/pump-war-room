@@ -1,3 +1,5 @@
+import { projectPublicToken } from "./privacy.js";
+
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const OUTCOME_WINDOWS = Object.freeze(["5m", "15m", "1h", "6h", "24h"]);
 const PERIODS = Object.freeze({ daily: 86_400_000, weekly: 7 * 86_400_000 });
@@ -73,7 +75,11 @@ export function detectMaterialAlerts({ current, previous = null, currentScore = 
     throw new TypeError("previous must be null or the same mint");
   }
   const at = timestamp(observedAt, "observedAt");
-  const symbol = text(current.symbol, current.mint.slice(0, 8), 24);
+  // Alert text is persisted and may later reach the public API, SSE, and
+  // Telegram. Derive display text through the same strict public projection
+  // used by those surfaces so an untrusted name/symbol cannot become a raw
+  // profile or wallet leak before projection happens.
+  const symbol = text(projectPublicToken(current)?.symbol, current.mint.slice(0, 8), 24);
   const alerts = [];
 
   const migration = current.migrationEvidence;

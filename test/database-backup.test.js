@@ -711,6 +711,65 @@ test("requires actor retention schema and rejects persisted raw actor identities
     (error) => error instanceof DatabaseVerificationError && /raw identity or hidden mapping field/.test(error.message)
   );
   assert.deepEqual(readdirSync(scratchDirectory), []);
+
+  for (const [label, rawValue] of [
+    ["wallet-scalar", "So11111111111111111111111111111111111111112"],
+    ["signature-scalar", "3".repeat(64)],
+    ["profile-scalar", "Contact https://x.com/private_profile"],
+    ["nested-mint-scalar", "11111111111111111111111111111111"]
+  ]) {
+    const scalarDirectory = path.join(directory, label);
+    const { store: scalarStore, databasePath: scalarPath } = seededStore(scalarDirectory);
+    const summary = JSON.parse(scalarStore.db.prepare("SELECT summary FROM actor_summaries WHERE mint=?").get(actorMint).summary);
+    if (label === "nested-mint-scalar") summary.coverage.mint = rawValue;
+    else summary.coverage.state = rawValue;
+    scalarStore.db.prepare("UPDATE actor_summaries SET summary=? WHERE mint=?").run(JSON.stringify(summary), actorMint);
+    scalarStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+    scalarStore.db.close();
+    assert.throws(
+      () => verifyRestorableBackup(scalarPath, { scratchRoot: scratchDirectory }),
+      (error) => error instanceof DatabaseVerificationError
+        && /raw identity or hidden mapping field/.test(error.message),
+      `${label} must be rejected even under an allowlisted scalar key`
+    );
+    assert.deepEqual(readdirSync(scratchDirectory), []);
+  }
+
+  for (const [label, table, column, key] of [
+    ["observation-mint-mismatch", "actor_observations", "event", "event_key='seeded-actor-observation'"],
+    ["summary-mint-mismatch", "actor_summaries", "summary", `mint='${actorMint}'`]
+  ]) {
+    const mismatchDirectory = path.join(directory, label);
+    const { store: mismatchStore, databasePath: mismatchPath } = seededStore(mismatchDirectory);
+    const payload = JSON.parse(mismatchStore.db.prepare(`SELECT ${column} FROM ${table} WHERE ${key}`).get()[column]);
+    payload.mint = "11111111111111111111111111111111";
+    mismatchStore.db.prepare(`UPDATE ${table} SET ${column}=? WHERE ${key}`).run(JSON.stringify(payload));
+    mismatchStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+    mismatchStore.db.close();
+    assert.throws(
+      () => verifyRestorableBackup(mismatchPath, { scratchRoot: scratchDirectory }),
+      (error) => error instanceof DatabaseVerificationError
+        && /raw identity or hidden mapping field/.test(error.message),
+      `${label} must reject a payload mint that differs from its actor table key`
+    );
+    assert.deepEqual(readdirSync(scratchDirectory), []);
+  }
+
+  const missingMintDirectory = path.join(directory, "summary-mint-missing");
+  const { store: missingMintStore, databasePath: missingMintPath } = seededStore(missingMintDirectory);
+  const summaryWithoutMint = JSON.parse(missingMintStore.db.prepare("SELECT summary FROM actor_summaries WHERE mint=?").get(actorMint).summary);
+  delete summaryWithoutMint.mint;
+  missingMintStore.db.prepare("UPDATE actor_summaries SET summary=? WHERE mint=?")
+    .run(JSON.stringify(summaryWithoutMint), actorMint);
+  missingMintStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+  missingMintStore.db.close();
+  assert.throws(
+    () => verifyRestorableBackup(missingMintPath, { scratchRoot: scratchDirectory }),
+    (error) => error instanceof DatabaseVerificationError
+      && /raw identity or hidden mapping field/.test(error.message),
+    "missing root mint must fail the actor backup privacy contract"
+  );
+  assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 
 test("rejects corrupt, truncated, and wrong-schema artifacts and cleans scratch space", (t) => {

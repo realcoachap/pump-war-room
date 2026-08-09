@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { isCanonicalSolanaAddress } from "./early-actors.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "./solana-rpc.js";
 import { Store, STORE_SCHEMA_VERSION } from "./store.js";
 
@@ -496,12 +497,32 @@ function normalizeSchemaSql(value) {
 }
 
 const FORBIDDEN_ACTOR_IDENTITY_KEY = /^(?:actorAddress|traderPublicKey|wallet|walletAddress|owner|signer|user|participant|address|account|accountKey|accountAddress|publicKey|creator|deployer|caller|username|handle|profile|profileId|profileUrl|signature|transactionId|txid|rawAddress|identity|identityLookup|lookupMapping|mapping|dedupeKey|integrityKey|secret|digest)$/i;
+const RAW_ACTOR_SOCIAL_VALUE = /(?:^|[\s(])(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)]+)/i;
+const RAW_ACTOR_SOLANA_VALUE = /(?:^|[^1-9A-HJ-NP-Za-km-z])(?:[1-9A-HJ-NP-Za-km-z]{64,88}|[1-9A-HJ-NP-Za-km-z]{32,44})(?=$|[^1-9A-HJ-NP-Za-km-z])/;
 
-function actorIdentityViolation(value, pathParts = [], depth = 0) {
+function actorIdentityViolation(value, expectedMint, pathParts = [], depth = 0) {
   if (depth > 32) return `${pathParts.join(".") || "root"} exceeds the supported nesting depth`;
+  if (depth === 0 && (!value || typeof value !== "object" || Array.isArray(value)
+    || !isCanonicalSolanaAddress(expectedMint) || value.mint !== expectedMint)) {
+    return "mint does not match its canonical actor table key";
+  }
+  if (typeof value === "string") {
+    const key = pathParts.at(-1) || "";
+    // The actor schema intentionally exposes the cohort mint and an opaque
+    // Actor number. No other scalar may carry a wallet, transaction, or raw
+    // social-profile identity, even when its field name is otherwise allowed.
+    if (pathParts.length === 1 && key === "mint") {
+      return null;
+    }
+    if (key === "actor" && /^Actor [1-9][0-9]{0,19}$/.test(value)) return null;
+    if (RAW_ACTOR_SOCIAL_VALUE.test(value) || RAW_ACTOR_SOLANA_VALUE.test(value)) {
+      return `${pathParts.join(".") || "root"} contains raw identity or transaction material`;
+    }
+    return null;
+  }
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
-      const violation = actorIdentityViolation(value[index], [...pathParts, String(index)], depth + 1);
+      const violation = actorIdentityViolation(value[index], expectedMint, [...pathParts, String(index)], depth + 1);
       if (violation) return violation;
     }
     return null;
@@ -513,7 +534,7 @@ function actorIdentityViolation(value, pathParts = [], depth = 0) {
     if (key === "actor" && (typeof child !== "string" || !/^Actor [1-9][0-9]{0,19}$/.test(child))) {
       return `${childPath.join(".")} is not an opaque actor label`;
     }
-    const violation = actorIdentityViolation(child, childPath, depth + 1);
+    const violation = actorIdentityViolation(child, expectedMint, childPath, depth + 1);
     if (violation) return violation;
   }
   return null;
@@ -521,12 +542,12 @@ function actorIdentityViolation(value, pathParts = [], depth = 0) {
 
 function verifyActorPrivacyRows(database) {
   for (const [table, column] of [["actor_observations", "event"], ["actor_summaries", "summary"]]) {
-    const rows = database.prepare(`SELECT ${column} AS payload FROM ${table}`).all();
-    for (const { payload } of rows) {
+    const rows = database.prepare(`SELECT mint,${column} AS payload FROM ${table}`).all();
+    for (const { mint, payload } of rows) {
       let value;
       try { value = JSON.parse(payload); }
       catch { continue; }
-      const violation = actorIdentityViolation(value);
+      const violation = actorIdentityViolation(value, mint);
       if (violation) fail(`Database ${table}.${column} persists a raw identity or hidden mapping field: ${violation}`);
     }
   }
@@ -771,7 +792,7 @@ function verifyApplicationWrites(databasePath) {
         JSON.stringify({ source: "restore-verification", feedCoverage: "unmeasured" }), createdAt);
 
     database.exec("DELETE FROM actor_summaries; DELETE FROM actor_observations; DELETE FROM actor_cohort");
-    const actorMint = `Actor${suffix.replaceAll("-", "").replaceAll("0", "2")}`;
+    const actorMint = "So11111111111111111111111111111111111111112";
     const actorEvent = {
       schemaVersion: 1,
       mint: actorMint,

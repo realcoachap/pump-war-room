@@ -119,6 +119,64 @@ let telegramDeliveryRunning = false;
 let telegramLastAttemptAt = 0;
 let briefBoundaryTimer = null;
 
+const ACTOR_FAILURE_STATES = new Set(["rate-limited", "degraded", "invalid-response"]);
+
+function persistedActorStatus(
+  states = store.actorStates({ limit: ACTOR_COHORT_LIMIT }),
+  summaries = store.actorSummaries(ACTOR_COHORT_LIMIT)
+) {
+  const statusCounts = Object.fromEntries(states.reduce((counts, state) => {
+    counts.set(state.status, (counts.get(state.status) || 0) + 1);
+    return counts;
+  }, new Map()));
+  const admittedCount = states.length;
+  const evidenceMintCount = summaries.filter((summary) => summary.coverage?.eventCount > 0).length;
+  const eligibleMintCount = summaries.filter((summary) => summary.coverage?.state === "available").length;
+  const attemptedMintCount = states.filter((state) => state.attemptCount > 0).length;
+  const failureStateCount = states.filter((state) => state.attemptCount > 0
+    && ACTOR_FAILURE_STATES.has(state.status)).length;
+  const pendingAttemptCount = states.filter((state) => state.nextAttemptAt !== null).length;
+  const terminalCount = admittedCount - pendingAttemptCount;
+  const terminalFailureCount = states.filter((state) => state.nextAttemptAt === null
+    && ACTOR_FAILURE_STATES.has(state.status)).length;
+  const acquisitionCoverage = admittedCount ? evidenceMintCount / admittedCount : null;
+  return {
+    schemaVersion: 1,
+    source: SOLANA_MAINNET_RPC.id,
+    parserRevision: SOLANA_ACTOR_PARSER_REVISION,
+    status: mode === "live" ? "disabled" : "simulation-disabled",
+    started: false,
+    queueDepth: 0,
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    lastErrorAt: null,
+    lastErrorCode: null,
+    cohort: {
+      limit: ACTOR_COHORT_LIMIT, admittedCount, evidenceMintCount, eligibleMintCount,
+      attemptedMintCount, failureStateCount,
+      failureRatio: attemptedMintCount ? failureStateCount / attemptedMintCount : null,
+      pendingAttemptCount, terminalCount, terminalFailureCount, statusCounts
+    },
+    correlationGate: {
+      status: "withheld",
+      minimumEligibleMints: 20,
+      minimumAcquisitionCoverage: 0.6,
+      eligibleMintCount,
+      acquisitionCoverage,
+      labeledHoldoutCalibrationPassed: false,
+      rankingImpact: "none",
+      riskProbabilityImpact: "none",
+      telegramAlertImpact: "none",
+      recommendationImpact: "none"
+    },
+    counters: {
+      admissions: 0, duplicates: 0, cohortFull: 0, replayTooOld: 0, attempts: 0,
+      signaturesReturned: 0, transactionsRequested: 0, transactionsUnavailable: 0,
+      transactionsRejected: 0, observationsAccepted: 0, observationsDeduplicated: 0, failures: 0
+    }
+  };
+}
+
 function feedObservation() {
   const telemetry = pumpPortalIngestor?.getStatus?.() || null;
   const counters = {
@@ -561,23 +619,7 @@ function snapshot() {
   const actorStates = store.actorStates({ limit: ACTOR_COHORT_LIMIT });
   const actorSummaries = store.actorSummaries(ACTOR_COHORT_LIMIT);
   const actorSummaryByMint = new Map(actorSummaries.map((summary) => [summary.mint, summary]));
-  const actorStatus = actorIngestor?.getStatus() || {
-    schemaVersion: 1,
-    source: SOLANA_MAINNET_RPC.id,
-    parserRevision: SOLANA_ACTOR_PARSER_REVISION,
-    status: mode === "live" ? "disabled" : "simulation-disabled",
-    queueDepth: 0,
-    cohort: {
-      limit: ACTOR_COHORT_LIMIT, admittedCount: 0, evidenceMintCount: 0, eligibleMintCount: 0,
-      attemptedMintCount: 0, failureStateCount: 0, failureRatio: null,
-      pendingAttemptCount: 0, terminalCount: 0, terminalFailureCount: 0, statusCounts: {}
-    },
-    correlationGate: {
-      status: "withheld", minimumEligibleMints: 20, minimumAcquisitionCoverage: 0.6,
-      eligibleMintCount: 0, acquisitionCoverage: null, labeledHoldoutCalibrationPassed: false,
-      rankingImpact: "none", riskProbabilityImpact: "none", telegramAlertImpact: "none", recommendationImpact: "none"
-    }
-  };
+  const actorStatus = actorIngestor?.getStatus() || persistedActorStatus(actorStates, actorSummaries);
   const earlyActorIntelligence = {
     schemaVersion: 1,
     generatedAt,
@@ -1032,18 +1074,7 @@ const server = http.createServer(async (req, res) => {
         materialPersistence: "atomic-with-durable-baseline",
         telegram: telegramHealth()
       },
-      earlyActors: actorIngestor?.getStatus() || {
-        schemaVersion: 1,
-        source: SOLANA_MAINNET_RPC.id,
-        parserRevision: SOLANA_ACTOR_PARSER_REVISION,
-        status: mode === "live" ? "disabled" : "simulation-disabled",
-        queueDepth: 0,
-        cohort: {
-          limit: ACTOR_COHORT_LIMIT, admittedCount: 0, evidenceMintCount: 0, eligibleMintCount: 0,
-          attemptedMintCount: 0, failureStateCount: 0, failureRatio: null,
-          pendingAttemptCount: 0, terminalCount: 0, terminalFailureCount: 0, statusCounts: {}
-        }
-      }
+      earlyActors: actorIngestor?.getStatus() || persistedActorStatus()
     });
     }
     if (url.pathname === "/api/snapshot") {

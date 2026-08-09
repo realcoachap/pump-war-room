@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import {
   EARLY_ACTOR_RPC_SOURCE,
+  isCanonicalSolanaAddress,
   normalizeEarlyActorTrade,
   summarizeEarlyActorEvents
 } from "./early-actors.js";
@@ -95,6 +96,7 @@ export class EarlyActorIngestor {
 
   admit(token) {
     if (!token || token.source !== "pumpportal" || typeof token.mint !== "string") return { admitted: false, reason: "ineligible-source" };
+    if (!isCanonicalSolanaAddress(token.mint)) return { admitted: false, reason: "invalid-mint" };
     const launchAt = Date.parse(token.createdAt);
     const now = this.now();
     if (!Number.isFinite(launchAt) || launchAt > now + 5 * 60_000 || now - launchAt > REPLAY_MAX_AGE_MS) {

@@ -294,18 +294,17 @@ export class SolanaRpcClient {
 function accountKeys(message) {
   const rawKeys = message?.accountKeys;
   const header = message?.header;
+  const hasHeader = header !== undefined;
   if (!Array.isArray(rawKeys) || rawKeys.length < 1 || rawKeys.length > 256
-    || !header || typeof header !== "object" || Array.isArray(header)) return null;
+    || (hasHeader && (!header || typeof header !== "object" || Array.isArray(header)))) return null;
   const firstLookupIndex = rawKeys.findIndex((entry) => entry?.source === "lookupTable");
   const staticCount = firstLookupIndex === -1 ? rawKeys.length : firstLookupIndex;
-  if (rawKeys.some((entry, index) => entry?.source !== undefined
-    && entry.source !== (index < staticCount ? "transaction" : "lookupTable"))) return null;
-  const requiredSignatures = header.numRequiredSignatures;
-  const readonlySigned = header.numReadonlySignedAccounts;
-  const readonlyUnsigned = header.numReadonlyUnsignedAccounts;
-  if (!Number.isSafeInteger(requiredSignatures) || requiredSignatures < 1 || requiredSignatures > staticCount
-    || !Number.isSafeInteger(readonlySigned) || readonlySigned < 0 || readonlySigned > requiredSignatures
-    || !Number.isSafeInteger(readonlyUnsigned) || readonlyUnsigned < 0 || readonlyUnsigned > staticCount - requiredSignatures) return null;
+  if (rawKeys.some((entry, index) => {
+    const expectedSource = index < staticCount ? "transaction" : "lookupTable";
+    return hasHeader
+      ? entry?.source !== undefined && entry.source !== expectedSource
+      : entry?.source !== expectedSource;
+  })) return null;
   const entries = [];
   const known = new Set();
   for (const [index, entry] of rawKeys.entries()) {
@@ -317,6 +316,21 @@ function accountKeys(message) {
     catch { return null; }
     if (known.has(normalized)) return null;
     known.add(normalized);
+    entries.push({ address: normalized, signer: entry.signer, writable: entry.writable, index });
+  }
+  if (!hasHeader) {
+    const requiredSignatures = entries.filter((entry) => entry.signer).length;
+    if (requiredSignatures < 1 || requiredSignatures > staticCount
+      || entries.some((entry, index) => entry.signer !== (index < requiredSignatures))) return null;
+    return { entries, requiredSignatures };
+  }
+  const requiredSignatures = header.numRequiredSignatures;
+  const readonlySigned = header.numReadonlySignedAccounts;
+  const readonlyUnsigned = header.numReadonlyUnsignedAccounts;
+  if (!Number.isSafeInteger(requiredSignatures) || requiredSignatures < 1 || requiredSignatures > staticCount
+    || !Number.isSafeInteger(readonlySigned) || readonlySigned < 0 || readonlySigned > requiredSignatures
+    || !Number.isSafeInteger(readonlyUnsigned) || readonlyUnsigned < 0 || readonlyUnsigned > staticCount - requiredSignatures) return null;
+  for (const [index, entry] of entries.entries()) {
     const signer = index < requiredSignatures;
     const writable = index < requiredSignatures
       ? index < requiredSignatures - readonlySigned
@@ -324,7 +338,6 @@ function accountKeys(message) {
         ? index < staticCount - readonlyUnsigned
         : entry.writable;
     if (entry.signer !== signer || entry.writable !== writable) return null;
-    entries.push({ address: normalized, signer, writable: entry.writable, index });
   }
   return { entries, requiredSignatures };
 }
@@ -395,7 +408,7 @@ function findProgramAddress(seeds, programId) {
   if (normalizedSeeds.length > 15 || normalizedSeeds.some((seed) => seed.length > 32)) return null;
   const program = decodeBase58(programId);
   if (!program || program.length !== 32) return null;
-  for (let bump = 255; bump >= 0; bump -= 1) {
+  for (let bump = 255; bump >= 1; bump -= 1) {
     const digest = createHash("sha256")
       .update(Buffer.concat([...normalizedSeeds, Buffer.from([bump]), program, Buffer.from("ProgramDerivedAddress")]))
       .digest();

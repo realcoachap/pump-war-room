@@ -409,6 +409,44 @@ test("fails closed when success or exact-mint balance fields are missing or malf
   assert.equal(extract(unrelatedMalformed).status, "observed");
 });
 
+test("accepts canonical headerless jsonParsed account metadata and rejects malformed or spoofed roles", () => {
+  const headerless = transaction();
+  delete headerless.transaction.message.header;
+  for (const entry of headerless.transaction.message.accountKeys) entry.source = "transaction";
+  assert.equal(extract(headerless).status, "observed");
+
+  const malformedRole = structuredClone(headerless);
+  delete malformedRole.transaction.message.accountKeys[1].writable;
+  assert.equal(extract(malformedRole).reason, "token-balance-evidence-invalid");
+
+  const missingSource = structuredClone(headerless);
+  delete missingSource.transaction.message.accountKeys[0].source;
+  assert.equal(extract(missingSource).reason, "token-balance-evidence-invalid");
+
+  const signerGap = structuredClone(headerless);
+  signerGap.transaction.message.accountKeys[0].signer = false;
+  signerGap.transaction.message.accountKeys[1].signer = true;
+  assert.equal(extract(signerGap).reason, "token-balance-evidence-invalid");
+
+  const extraSigner = structuredClone(headerless);
+  extraSigner.transaction.message.accountKeys[1].signer = true;
+  extraSigner.transaction.signatures.push(OTHER_SIGNATURE);
+  assert.equal(extract(extraSigner).reason, "official-pump-instruction-invalid");
+
+  const writableSpoof = structuredClone(headerless);
+  writableSpoof.transaction.message.accountKeys.find(({ pubkey }) => pubkey === PUMP_EVENT_AUTHORITY).writable = true;
+  assert.equal(extract(writableSpoof).reason, "official-pump-instruction-invalid");
+
+  const staticAfterLookup = structuredClone(headerless);
+  staticAfterLookup.transaction.message.accountKeys.at(-2).source = "lookupTable";
+  assert.equal(extract(staticAfterLookup).reason, "token-balance-evidence-invalid");
+
+  const partialLookupMetadata = structuredClone(headerless);
+  partialLookupMetadata.transaction.message.accountKeys.at(-2).source = "lookupTable";
+  delete partialLookupMetadata.transaction.message.accountKeys.at(-1).source;
+  assert.equal(extract(partialLookupMetadata).reason, "token-balance-evidence-invalid");
+});
+
 test("derives signers from the message header and rejects signer metadata spoofing", () => {
   const actorSpoof = transaction();
   actorSpoof.transaction.message.accountKeys[0].signer = false;

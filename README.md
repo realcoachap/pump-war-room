@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.9.0**
+Current release: **v0.9.1**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, and reports bounded anonymous early-actor observations without presenting an uncalibrated probability or trade signal.
 
@@ -111,6 +111,8 @@ No new SaaS, charting package, ORM, bot framework, account system, or paid provi
 
 v0.9.0 adds an isolated, prospective cohort of at most 32 exact PumpPortal mints. At 2, 10, and 30 minutes after each admitted launch, a conservatively paced reader asks Solana's documented public mainnet RPC for at most 16 finalized signatures referencing that mint and inspects at most eight in-window transactions per attempt. A buy or sell is accepted only when the transaction succeeded, the exact mint changed in the instruction-designated signed user token account, and the instruction matches the reviewed official Pump or PumpSwap discriminator, complete account-role contract, fixed programs, and derivable PDA/ATA addresses. The decoded instruction token amount must exactly equal the designated account's balance delta in the required direction. Exact-input and newer v2 variants whose arguments do not provide that auditable output amount remain explicitly unavailable. A generic or transaction-wide token-balance delta, transfer, mint, burn, liquidity action, unsupported variant or program, malformed transaction, missing signer, or contradictory delta is rejected rather than inferred as a trade.
 
+v0.9.1 hardens that evidence and privacy boundary. Actor evidence is pinned to account-bound parser revision `official-pump-account-bound-v3`; upgrading preserves the installation secret and stable Actor labels while clearing evidence collected under an earlier parser revision. The RPC parser accepts canonical headerless `jsonParsed` account-role metadata while enforcing signer and lookup-source ordering, and repeated acquisition of the same finalized evidence deduplicates without rewriting its original observation time. Explicit public-response allowlists and recursive release smoke checks reject raw wallet, signer, account, profile, signature, and hidden provenance material; backup verification also binds each actor payload mint to its canonical table key. Retention cleanup is time-driven, and attempted, pending, terminal, and disabled-worker telemetry must reconcile so untouched future admissions cannot dilute the 25% attempted-mint failure cap. This patch adds no scoring, alerts, execution, promotion, wallet, connector, provider, or dependency scope.
+
 The default public mainnet RPC is keyless, rate-limited, and explicitly not production-grade. Acquisition is therefore best-effort, partial, and unmeasured; rate limits, gaps, missing transactions, and invalid responses remain visible. The worker never backfills launches from before it became active. PumpPortal's metered token-trade stream stays disabled because it requires a funded linked wallet and spend, and its response-frame fields are not documented in the official material reviewed for this release. The worker pins the reviewed `https://api.mainnet.solana.com` origin; changing providers requires a separately reviewed code change rather than an arbitrary environment URL. Set `EARLY_ACTOR_ENRICHMENT=false` to disable the worker without affecting the rest of the War Room.
 
 An installation-random 32-byte secret maps each observed wallet through a domain-separated keyed digest to a stable `Actor N` label. Raw wallet addresses, transaction signatures, source payloads, and reversible lookup mappings are not persisted in actor tables or exposed publicly. Each minimized observation stores a domain-separated keyed dedupe digest derived from internal transaction provenance; it cannot be used for public lookup, is never returned by an endpoint, and expires with that observation. Minimized normalized observations are retained for at most 72 hours, with independent time-driven cleanup and a global 4,096-row prune bound; aggregate per-mint summaries remain auditable after observation expiry. Backup/restore verification proves that the installation secret—and therefore Actor labels—survives a recovery drill without exposing the secret.
@@ -176,7 +178,7 @@ The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.0 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.1 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
+import { isCanonicalSolanaAddress } from "./early-actors.js";
 
 export const STORE_SCHEMA_VERSION = 901;
 const LEGACY_ACTOR_SCHEMA_VERSION = 900;
@@ -335,6 +336,25 @@ function validateActorObservationContract(event) {
     throw new TypeError("actor event provenance did not match the minimized observation contract");
   }
   return event;
+}
+
+function actorObservationEvidenceKey(event) {
+  return JSON.stringify([
+    event.schemaVersion,
+    event.mint,
+    event.actor,
+    event.side,
+    event.amounts.native,
+    event.amounts.token,
+    event.source.name,
+    event.source.evidenceClass,
+    event.timestamps.source.state,
+    event.timestamps.source.value,
+    event.transactionProvenance.state,
+    event.transactionProvenance.evidenceClass,
+    event.transactionProvenance.slot.state,
+    event.transactionProvenance.slot.value
+  ]);
 }
 
 function rejectActorSummaryIdentity(value, mint, path = "actor summary") {
@@ -1522,7 +1542,7 @@ export class Store {
   }
   admitActorMint({ mint, launchObservedAt, admittedAt = new Date().toISOString(), nextAttemptAt, limit = 16 } = {}) {
     const normalizedMint = text(mint, "actor mint", { max: 44 });
-    if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor mint must be a Solana base58 address");
+    if (!isCanonicalSolanaAddress(normalizedMint)) throw new TypeError("actor mint must be a canonical 32-byte Solana base58 address");
     const normalizedLaunchAt = timestamp(launchObservedAt, "actor launchObservedAt");
     const normalizedAdmittedAt = timestamp(admittedAt, "actor admittedAt");
     const normalizedNextAt = timestamp(nextAttemptAt, "actor nextAttemptAt");
@@ -1582,7 +1602,7 @@ export class Store {
   saveActorObservation({ eventKey, mint, event, sourceAt = null, observedAt, retainedUntil } = {}) {
     const normalizedEventKey = text(eventKey, "actor event key", { max: 192, code: true });
     const normalizedMint = text(mint, "actor observation mint", { max: 44 });
-    if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor observation mint must be a Solana base58 address");
+    if (!isCanonicalSolanaAddress(normalizedMint)) throw new TypeError("actor observation mint must be a canonical 32-byte Solana base58 address");
     const normalizedObservedAt = timestamp(observedAt, "actor observedAt");
     const normalizedSourceAt = sourceAt === null ? null : timestamp(sourceAt, "actor sourceAt");
     const normalizedRetainedUntil = timestamp(retainedUntil, "actor retainedUntil");
@@ -1594,6 +1614,10 @@ export class Store {
       || typeof event.actor !== "string" || !/^Actor [1-9][0-9]{0,19}$/.test(event.actor)
       || !["buy", "sell"].includes(event.side)) throw new TypeError("actor event did not match the minimized persistence contract");
     validateActorObservationContract(event);
+    const eventSourceAt = event.timestamps.source.state === "available" ? event.timestamps.source.value : null;
+    if (event.timestamps.observedAt !== normalizedObservedAt || eventSourceAt !== normalizedSourceAt) {
+      throw new TypeError("actor event timestamps did not match persistence metadata");
+    }
     const encoded = JSON.stringify(event);
     if (Buffer.byteLength(encoded) > 8 * 1_024 || /(?:traderPublicKey|actorAddress|signature|cookie|authorization|privateKey)/i.test(encoded)) {
       throw new TypeError("actor event contained raw identity, transaction, credential, or oversized data");
@@ -1605,8 +1629,19 @@ export class Store {
     if (result.changes === 0) {
       const existing = this.db.prepare(`SELECT mint,event,source_at AS sourceAt,observed_at AS observedAt
         FROM actor_observations WHERE event_key=?`).get(normalizedEventKey);
-      if (!existing || existing.mint !== normalizedMint || existing.event !== encoded
-        || existing.sourceAt !== normalizedSourceAt || existing.observedAt !== normalizedObservedAt) {
+      let existingEvent = null;
+      try {
+        existingEvent = validateActorObservationContract(JSON.parse(existing?.event));
+      } catch {}
+      const existingSourceAt = existingEvent?.timestamps.source.state === "available"
+        ? existingEvent.timestamps.source.value
+        : null;
+      if (!existing || !existingEvent || existing.mint !== normalizedMint
+        || existingEvent.mint !== normalizedMint
+        || existingEvent.timestamps.observedAt !== existing.observedAt
+        || existingSourceAt !== existing.sourceAt
+        || existing.sourceAt !== normalizedSourceAt
+        || actorObservationEvidenceKey(existingEvent) !== actorObservationEvidenceKey(event)) {
         throw new Error("actor observation dedupe key conflicts with retained evidence");
       }
     }
@@ -1631,7 +1666,7 @@ export class Store {
   }
   saveActorSummary(mint, summary) {
     const normalizedMint = text(mint, "actor summary mint", { max: 44 });
-    if (!MINT_PATTERN.test(normalizedMint)) throw new TypeError("actor summary mint must be a Solana base58 address");
+    if (!isCanonicalSolanaAddress(normalizedMint)) throw new TypeError("actor summary mint must be a canonical 32-byte Solana base58 address");
     if (!summary || typeof summary !== "object" || Array.isArray(summary) || summary.mint !== normalizedMint
       || !summary.coverage || !["missing", "insufficient-sample", "available"].includes(summary.coverage.state)) {
       throw new TypeError("actor summary did not match the public aggregate contract");

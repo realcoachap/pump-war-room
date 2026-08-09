@@ -1,6 +1,6 @@
 {
   "name": "opencaesar-pump-war-room",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "private": true,
   "type": "module",
   "description": "Read-only Pump.fun intelligence radar with auditable outcomes, risk evidence, and anonymous early-actor observations.",

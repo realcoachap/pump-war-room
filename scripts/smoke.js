@@ -229,7 +229,7 @@ function validateActorEngine(engine, path, check, expectedMode) {
   const allowedStates = expectedMode === "live"
     ? [
       "awaiting-prospective-admission", "queued", "acquiring", "observing", "complete", "complete-partial",
-      "complete-with-missing", "failed", "unavailable", "rate-limited", "degraded", "invalid-response"
+      "complete-with-missing", "failed", "unavailable", "rate-limited", "degraded", "invalid-response", "disabled"
     ]
     : ["simulation-disabled"];
   requireValue(engine?.schemaVersion === 1 && engine.source === "solana-mainnet-rpc"
@@ -237,7 +237,8 @@ function validateActorEngine(engine, path, check, expectedMode) {
     && allowedStates.includes(engine.status) && Number.isSafeInteger(engine.queueDepth) && engine.queueDepth >= 0,
   check, `${path} early-actor engine contract was missing`);
   if (expectedMode !== "live") return;
-  requireValue(engine.started === true, check, `${path} was not started`);
+  requireValue(engine.status === "disabled" ? engine.started === false : engine.started === true,
+    check, `${path} enabled/started state was inconsistent`);
   requireValue(engine.cohort?.limit === ACTOR_COHORT_LIMIT
     && Number.isSafeInteger(engine.cohort?.admittedCount) && engine.cohort.admittedCount >= 0
     && engine.cohort.admittedCount <= ACTOR_COHORT_LIMIT
@@ -270,12 +271,14 @@ function validateActorEngine(engine, path, check, expectedMode) {
   requireValue(engine.correlationGate.eligibleMintCount === engine.cohort.eligibleMintCount
     && engine.correlationGate.acquisitionCoverage === expectedCoverage,
   check, `${path} acquisition coverage did not reconcile with the admitted cohort`);
-  requireValue(engine.cohort.failureRatio === null || engine.cohort.failureRatio <= ACTOR_MAXIMUM_FAILURE_RATIO,
-    check, `${path} failure-state ratio ${engine.cohort.failureStateCount}/${engine.cohort.attemptedMintCount} exceeded 25% of attempted mints`);
-  requireValue(!(engine.cohort.admittedCount > 0
-    && engine.cohort.evidenceMintCount === 0
-    && engine.cohort.pendingAttemptCount === 0),
-  check, `${path} exhausted every admitted mint with zero actor evidence`);
+  if (engine.status !== "disabled") {
+    requireValue(engine.cohort.failureRatio === null || engine.cohort.failureRatio <= ACTOR_MAXIMUM_FAILURE_RATIO,
+      check, `${path} failure-state ratio ${engine.cohort.failureStateCount}/${engine.cohort.attemptedMintCount} exceeded 25% of attempted mints`);
+    requireValue(!(engine.cohort.admittedCount > 0
+      && engine.cohort.evidenceMintCount === 0
+      && engine.cohort.pendingAttemptCount === 0),
+    check, `${path} exhausted every admitted mint with zero actor evidence`);
+  }
 }
 
 function validatePublicRiskIdentity(identity, path) {

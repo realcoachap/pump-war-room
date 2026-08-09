@@ -18,8 +18,10 @@ export const EARLY_ACTOR_SOURCES = Object.freeze({
   })
 });
 
-const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const ADDRESS_PATTERN = MINT_PATTERN;
+const SOLANA_ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const ADDRESS_PATTERN = SOLANA_ADDRESS_PATTERN;
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_VALUES = new Map([...BASE58_ALPHABET].map((character, index) => [character, BigInt(index)]));
 const SIGNATURE_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|[+-]\d{2}:\d{2})$/;
 const DECIMAL = /^(?:0|[1-9]\d{0,17})(?:\.\d{1,12})?$/;
@@ -72,8 +74,30 @@ function requireBase58(value, label, pattern, code) {
   return normalized;
 }
 
+export function isCanonicalSolanaAddress(value) {
+  if (typeof value !== "string" || value !== value.trim() || !SOLANA_ADDRESS_PATTERN.test(value)) return false;
+  let numeric = 0n;
+  for (const character of value) {
+    const digit = BASE58_VALUES.get(character);
+    if (digit === undefined) return false;
+    numeric = numeric * 58n + digit;
+  }
+  let decodedLength = 0;
+  while (value[decodedLength] === "1") decodedLength += 1;
+  while (numeric > 0n) {
+    decodedLength += 1;
+    numeric >>= 8n;
+  }
+  return decodedLength === 32;
+}
+
+function requireSolanaAddress(value, label, code) {
+  if (!isCanonicalSolanaAddress(value)) fail(code, `${label} must be canonical 32-byte Solana base58 data`);
+  return value;
+}
+
 function requireMint(value, label = "mint") {
-  return requireBase58(value, label, MINT_PATTERN, "invalid-mint");
+  return requireSolanaAddress(value, label, "invalid-mint");
 }
 
 function requireAddress(value, label = "actor address") {
