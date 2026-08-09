@@ -111,6 +111,10 @@ No new SaaS, charting package, ORM, bot framework, account system, or paid provi
 
 Set `BARK_API_KEY` to enable the optional read-only callout stream. The adapter connects to Bark's documented `wss://news.bark.gg/ws`, accepts only `PUMPFUN_CALLOUT` events, persists them by external event ID, and surfaces third-party provenance in the dashboard. Without a key, the rest of the War Room continues normally and the panel remains explicitly disabled. No Pump.fun JWT, wallet connection, or undocumented frontend scraping is used.
 
+## v0.9 connector authorization
+
+The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permission gate. Fomo denied authorized API, webhook, export, and external-integration access under support ticket `#123208746`, so Fomo feed ingestion is closed and disabled. The Pump.fun request remains pending. Ordinary outbound token-page links do not ingest source data.
+
 ## Features
 
 - Live/demo launch stream with local SQLite persistence
