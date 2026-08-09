@@ -136,17 +136,42 @@ function parseJson(result, check) {
   catch { throw new SmokeCheckError(check, "response was not valid JSON"); }
 }
 
+function validateMeasuredBrief(brief, period, check) {
+  requireValue(brief?.schemaVersion === 1 && brief.methodVersion === "measured-closed-brief-v1" && brief.period === period,
+    check, `${period} frozen brief contract was missing`);
+  requireValue(brief.timezone === "UTC" && brief.feedCoverage === "unmeasured"
+    && brief.rawProviderPayloadsIncluded === false, check, `${period} brief truthfulness boundary was missing`);
+  requireValue(Number.isFinite(Date.parse(brief.windowStart)) && Number.isFinite(Date.parse(brief.windowEnd))
+    && Date.parse(brief.windowStart) < Date.parse(brief.windowEnd), check, `${period} brief closed interval was invalid`);
+  requireValue(brief.activity && Number.isSafeInteger(brief.activity.launchesObserved)
+    && Number.isSafeInteger(brief.activity.materialAlerts), check, `${period} brief activity denominators were missing`);
+  requireValue(brief.priorPeriod?.windowEnd === brief.windowStart, check, `${period} prior-period comparison boundary was missing`);
+  for (const windowName of ["5m", "15m", "1h", "6h", "24h"]) {
+    const metric = brief.outcomes?.windows?.[windowName];
+    requireValue(metric && Number.isSafeInteger(metric.eligibleCount) && Number.isSafeInteger(metric.evidenceCount)
+      && metric.evidenceCount <= metric.eligibleCount, check, `${period} ${windowName} denominator was invalid`);
+    requireValue(metric.eligibleCount === 0 ? metric.coverageRatio === null
+      : Number.isFinite(metric.coverageRatio) && metric.coverageRatio >= 0 && metric.coverageRatio <= 1,
+    check, `${period} ${windowName} coverage did not distinguish an empty denominator from 0%`);
+    if (metric.status === "insufficient-evidence") {
+      requireValue(metric.hitRatePct === null && metric.medianReturnPct === null && metric.maximumDrawdownPct === null,
+        check, `${period} ${windowName} sparse evidence was presented as performance`);
+    }
+  }
+}
+
 export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, timeoutMs = 10_000, fetchImpl = fetch } = {}) {
   requireValue(typeof baseUrl === "string" && /^https?:\/\//.test(baseUrl), "configuration", "baseUrl must use http or https");
   requireValue(typeof expectedVersion === "string" && /^\d+\.\d+\.\d+$/.test(expectedVersion), "configuration", "expectedVersion must be semantic x.y.z");
   requireValue(["live", "demo"].includes(expectedMode), "configuration", "expectedMode must be live or demo");
 
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-  const [healthResult, snapshotResult, htmlResult, scriptResult, stylesResult, termsResult, privacyResult] = await Promise.all([
+  const [healthResult, snapshotResult, htmlResult, scriptResult, preferencesResult, stylesResult, termsResult, privacyResult] = await Promise.all([
     request(normalizedBaseUrl, "/api/health", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/api/snapshot", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/app.js", { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, "/preferences.js", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/styles.css", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/terms.html", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/privacy.html", { timeoutMs, fetchImpl })
@@ -154,19 +179,73 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   const health = parseJson(healthResult, "health");
   const snapshot = parseJson(snapshotResult, "snapshot");
   const expectedFeedState = expectedMode === "live" ? "live" : "simulated";
+  requireValue(snapshot.version === expectedVersion, "snapshot", `version ${snapshot.version ?? "missing"} did not match ${expectedVersion}`);
+  requireValue(snapshot.mode === expectedMode, "snapshot", `mode ${snapshot.mode ?? "missing"} did not match ${expectedMode}`);
+  requireValue(snapshot.status === "healthy", "snapshot", `status ${snapshot.status ?? "missing"} was not healthy`);
+  if (expectedMode === "live" && (!Array.isArray(snapshot.riskIntelligence?.cohort?.observations)
+    || snapshot.riskIntelligence.cohort.observations.length !== RISK_COHORT_LIMIT)) {
+    throw new SmokeCheckError("snapshot", "risk identity fixed cohort did not expose 120 unique inspectable observations");
+  }
+  const endpointMints = [...new Set([
+    ...(snapshot.riskIntelligence?.cohort?.observations || []).map(({ mint }) => mint),
+    ...(snapshot.tokens || []).map(({ mint }) => mint),
+    ...(snapshot.leaderboard?.top100 || []).map((entry) => entry?.token?.mint)
+  ].filter((mint) => typeof mint === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)))].slice(0, 2);
+  requireValue(endpointMints.length === 2, "snapshot", "two exact retained mints were unavailable for release endpoint smoke checks");
+  const [dossierResult, timelineResult, compareResult, dailyBriefResult, weeklyBriefResult] = await Promise.all([
+    request(normalizedBaseUrl, `/api/coins/${endpointMints[0]}`, { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, `/api/coins/${endpointMints[0]}/timeline?limit=2`, { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, `/api/compare?mints=${encodeURIComponent(endpointMints.join(","))}`, { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, "/api/briefs/daily", { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, "/api/briefs/weekly", { timeoutMs, fetchImpl })
+  ]);
+  const dossier = parseJson(dossierResult, "dossier");
+  const timeline = parseJson(timelineResult, "timeline");
+  const comparison = parseJson(compareResult, "compare");
+  const dailyBrief = parseJson(dailyBriefResult, "daily brief");
+  const weeklyBrief = parseJson(weeklyBriefResult, "weekly brief");
 
   for (const [check, result, expectedType] of [
     ["health", healthResult, "application/json"],
     ["snapshot", snapshotResult, "application/json"],
     ["html", htmlResult, "text/html"],
     ["app.js", scriptResult, "text/javascript"],
+    ["preferences.js", preferencesResult, "text/javascript"],
     ["styles.css", stylesResult, "text/css"],
     ["terms", termsResult, "text/html"],
-    ["privacy", privacyResult, "text/html"]
+    ["privacy", privacyResult, "text/html"],
+    ["dossier", dossierResult, "application/json"],
+    ["timeline", timelineResult, "application/json"],
+    ["compare", compareResult, "application/json"],
+    ["daily brief", dailyBriefResult, "application/json"],
+    ["weekly brief", weeklyBriefResult, "application/json"]
   ]) {
     requireValue(result.contentType.toLowerCase().includes(expectedType), check, `content-type ${result.contentType || "missing"} did not include ${expectedType}`);
     requireValue(result.nosniff.toLowerCase() === "nosniff", check, "x-content-type-options nosniff was missing");
   }
+
+  requireValue(dossier?.schemaVersion === 1 && dossier?.token?.mint === endpointMints[0]
+    && dossier?.radar && dossier?.timeline === `/api/coins/${endpointMints[0]}/timeline`, "dossier", "strict public dossier contract was missing");
+  requireValue(timeline?.schemaVersion === 1 && timeline?.mint === endpointMints[0] && timeline?.limit === 2
+    && Array.isArray(timeline.entries) && timeline.rawProviderPayloadsIncluded === false
+    && (timeline.nextBefore === null || typeof timeline.nextBefore === "string"), "timeline", "typed paginated timeline contract was missing");
+  requireValue(comparison?.schemaVersion === 1 && JSON.stringify(comparison.requestedMints) === JSON.stringify(endpointMints)
+    && Array.isArray(comparison.coins) && comparison.coins.length === endpointMints.length
+    && Array.isArray(comparison.missingMints) && comparison.missingMints.length === 0
+    && comparison.rankingBoundary === "uncalibrated risk factors do not affect radar rank", "compare", "bounded comparison contract was missing");
+  const comparedDossier = comparison.coins.find((coin) => coin.mint === endpointMints[0]);
+  requireValue(comparedDossier?.riskEvidence === (dossier.token?.riskIdentity?.overallEvidence || "unavailable"),
+    "compare", "comparison and dossier risk projections disagreed");
+  for (const windowName of ["5m", "15m", "1h", "6h", "24h"]) {
+    const dossierWindow = dossier.outcome?.windows?.[windowName];
+    if (dossierWindow?.status === "observed") {
+      requireValue(comparedDossier?.outcomes?.[windowName]?.status === "observed"
+        && comparedDossier.outcomes[windowName].returnPct === dossierWindow.returnPct,
+      "compare", `${windowName} retained outcome disagreed with the dossier`);
+    }
+  }
+  validateMeasuredBrief(dailyBrief, "daily", "daily brief");
+  validateMeasuredBrief(weeklyBrief, "weekly", "weekly brief");
 
   requireValue(health.ok === true, "health", "ok was not true");
   requireValue(health.status === "healthy", "health", `status ${health.status ?? "missing"} was not healthy`);
@@ -179,6 +258,18 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   if (expectedMode === "live") requireValue(health.storage?.mountPointVerified === true, "health", "database mount point was not verified");
   requireValue(health.telemetry?.format === "json-lines" && Number.isFinite(health.telemetry?.errorsTotal), "health", "structured error telemetry was missing");
   requireValue(health.telemetry?.responses5xx === 0, "health", `runtime recorded ${health.telemetry?.responses5xx ?? "missing"} HTTP 5xx responses`);
+  requireValue(health.actionIntelligence?.schemaVersion === 1
+    && health.actionIntelligence?.watchlistPersistence === "browser-local"
+    && health.actionIntelligence?.alertDedupe === "persistent"
+    && health.actionIntelligence?.materialPersistence === "atomic-with-durable-baseline",
+  "health", "action intelligence health contract was missing");
+  requireValue(["configured", "not-configured"].includes(health.actionIntelligence?.telegram?.status)
+    && typeof health.actionIntelligence?.telegram?.tokenConfigured === "boolean"
+    && typeof health.actionIntelligence?.telegram?.chatConfigured === "boolean"
+    && health.actionIntelligence?.telegram?.outbox
+    && Number.isSafeInteger(health.actionIntelligence.telegram.outbox.total), "health", "aggregate Telegram outbox health was missing");
+  requireValue(!/(?:bot\d*:|telegram_chat_id|telegram_bot_token|chatId|token\s*[=:])/i.test(JSON.stringify(health.actionIntelligence)),
+    "health", "Telegram credentials or destination identifiers leaked into health");
   requireValue(health.outcomes?.source === "geckoterminal", "health", "outcome provider identity was missing");
   const allowedOutcomeStates = expectedMode === "live"
     ? ["idle", "enriching", "pool-selected", "observing", "awaiting-data", "awaiting-pool", "awaiting-price", "baseline-unavailable", "rate-limited", "degraded", "invalid-response", "complete"]
@@ -275,6 +366,29 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     }
   }
   requireValue(Array.isArray(snapshot.outcomes?.cohorts?.narrative?.cohorts) && Array.isArray(snapshot.outcomes?.cohorts?.lifecycle?.cohorts), "snapshot", "outcome cohort contracts were missing");
+  const action = snapshot.actionIntelligence;
+  requireValue(action?.schemaVersion === 1 && action.watchlists?.persistence === "browser-local"
+    && action.watchlists?.maximumMints === 50 && action.watchlists?.sharedServerWatchlist === false,
+  "snapshot", "browser-local watchlist boundary was missing");
+  requireValue(action.alerts?.deduplicatedPersistently === true && action.alerts?.scoreChangeThreshold === 15
+    && action.alerts?.riskFactorsAreUncalibrated === true
+    && action.alerts?.persistence === "atomic-event-alert-outbox-with-durable-baseline"
+    && action.alerts?.publicDeliveryMetadata === "aggregate-only"
+    && ["risk-identity-reuse", "risk-creator-history", "migration-observed"].every((kind) => action.alerts?.supportedKinds?.includes(kind)),
+  "snapshot", "material-change policy contract was missing");
+  requireValue(action.timelines?.cursorPagination === true && action.timelines?.maximumEntries === 200
+    && action.timelines?.rawProviderPayloadsIncluded === false
+    && action.compare?.minimumMints === 2 && action.compare?.maximumMints === 4,
+  "snapshot", "timeline or comparison contract was missing");
+  validateMeasuredBrief(action.briefs?.daily, "daily", "snapshot");
+  validateMeasuredBrief(action.briefs?.weekly, "weekly", "snapshot");
+  requireValue(!/(?:telegram_chat_id|telegram_bot_token|chatId|bot\d*:)/i.test(JSON.stringify(action.alerts?.telegram)),
+    "snapshot", "Telegram credentials or destination identifiers leaked into snapshot");
+  for (const [index, alert] of (Array.isArray(snapshot.alerts) ? snapshot.alerts : []).entries()) {
+    requireAllowedKeys(alert, new Set([
+      "level", "title", "message", "mint", "kind", "evidenceClass", "evidenceAt", "createdAt"
+    ]), `snapshot.alerts[${index}]`);
+  }
   requireValue(snapshot.riskIntelligence?.schemaVersion === 1, "snapshot", "risk identity schema was missing");
   requireAllowedKeys(snapshot.riskIntelligence, new Set([
     "schemaVersion", "generatedAt", "evidenceClasses", "rankingImpact", "source", "engine",
@@ -410,16 +524,29 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(htmlResult.body.includes("NO WALLET · NO EXECUTION"), "html", "read-only safety marker was missing");
   requireValue(htmlResult.body.includes('data-release-marker="provider-observed-outcome-engine"') && htmlResult.body.includes("On-chain data provided by GeckoTerminal") && htmlResult.body.includes("Powered by CoinGecko"), "html", "outcome engine attribution marker was missing");
   requireValue(htmlResult.body.includes('data-release-marker="risk-identity-evidence-v1"') && htmlResult.body.includes("NO COMPOSITE SCORE"), "html", "risk identity release marker was missing");
+  requireValue(htmlResult.body.includes('data-release-marker="actionable-intelligence-v1"')
+    && htmlResult.body.includes("BROWSER-LOCAL WORKBENCH") && htmlResult.body.includes("MATERIALITY POLICY v1"),
+  "html", "actionable intelligence release marker was missing");
   requireValue(scriptResult.body.includes("renderFeedObservability"), "app.js", "feed observability UI marker was missing");
   requireValue(scriptResult.body.includes("renderOutcomes") && scriptResult.body.includes("raw candle retention off"), "app.js", "outcome engine UI marker was missing");
   requireValue(scriptResult.body.includes("renderRiskIntelligence")
     && scriptResult.body.includes("identifier reuse only—not duplicate content")
     && scriptResult.body.includes("SYNTHETIC DEMO"), "app.js", "risk identity UI truthfulness markers were missing");
+  requireValue(scriptResult.body.includes("PREFERENCE_KEY") && scriptResult.body.includes("localStorage")
+    && scriptResult.body.includes("renderActionIntelligence") && scriptResult.body.includes("renderCoinTimeline")
+    && scriptResult.body.includes("/api/compare?mints="), "app.js", "watchlist, timeline, or compare UI markers were missing");
+  requireValue(preferencesResult.body.includes("normalizePreferences") && preferencesResult.body.includes("WATCHLIST_LIMIT = 50")
+    && preferencesResult.body.includes("PRESET_LIMIT = 12"), "preferences.js", "bounded browser preference contract was missing");
   requireValue(stylesResult.body.includes(".outcome-source,footer{font-size:10px}"), "styles.css", "minimum-size provider attribution style was missing");
   requireValue(stylesResult.body.includes(".risk-intelligence-source"), "styles.css", "risk identity responsive style was missing");
+  requireValue(stylesResult.body.includes(".action-intelligence") && stylesResult.body.includes(".comparison-table")
+    && stylesResult.body.includes(".timeline-entry"), "styles.css", "action intelligence responsive styles were missing");
   requireValue(termsResult.body.includes("CoinGecko API Terms") && termsResult.body.includes("not verified prices")
-    && termsResult.body.includes("does not prove duplicate content") && termsResult.body.includes("common control"), "terms", "provider ownership or risk-evidence terms were missing");
+    && termsResult.body.includes("does not prove duplicate content") && termsResult.body.includes("common control")
+    && termsResult.body.includes("materiality policy") && termsResult.body.includes("migration observation"), "terms", "provider ownership, alert, or risk-evidence terms were missing");
   requireValue(privacyResult.body.includes("Minimal data by design") && privacyResult.body.includes("does not persist or expose bulk GeckoTerminal responses") && privacyResult.body.includes("domain-separated hashes"), "privacy", "privacy and retention notice was missing");
+  requireValue(privacyResult.body.includes("browser-local") && privacyResult.body.includes("Telegram")
+    && privacyResult.body.includes("Bot API") && privacyResult.body.includes("opt out"), "privacy", "watchlist or Telegram privacy notice was missing");
 
   return {
     ok: true,
@@ -435,8 +562,14 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       outcomeState: health.outcomes.status,
       riskIdentityState: health.riskIntelligence.status
     },
-    http: { health: 200, snapshot: 200, html: 200, appJs: 200, styles: 200, terms: 200, privacy: 200 },
-    markers: { version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true, parserRevision: true, legalNotices: true }
+    http: {
+      health: 200, snapshot: 200, html: 200, appJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
+      dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200
+    },
+    markers: {
+      version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
+      actionableIntelligence: true, parserRevision: true, legalNotices: true
+    }
   };
 }
 

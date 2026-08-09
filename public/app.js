@@ -1,8 +1,25 @@
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, mode: "live", feedStatus: "connecting" };
+import {
+  PRESET_LIMIT,
+  PREFERENCE_KEY,
+  PUBLIC_MINT,
+  WATCHLIST_LIMIT,
+  normalizeFilterState,
+  normalizePreferences,
+  readPreferences,
+  writePreferences
+} from "./preferences.js";
+
+void PREFERENCE_KEY;
+
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let refreshInFlight = false;
 let caesarRequestPending = false;
+let deepLinkOpened = false;
+let compareRequestSequence = 0;
+let compareCacheKey = "";
+let compareCache = null;
 
 const LEGACY_STALE_AFTER_MS = 90_000;
 const CAESAR_MAX_QUESTION = 500;
@@ -44,6 +61,72 @@ const cappedText = (value, limit) => {
   const text = typeof value === "string" ? value.trim() : "";
   return text.length > limit ? `${text.slice(0, limit).trimEnd()}… [truncated]` : text;
 };
+
+let preferenceStorageAvailable = true;
+
+function loadPreferences() {
+  let storage = null;
+  try { storage = globalThis.localStorage; } catch {}
+  const result = readPreferences(storage);
+  preferenceStorageAvailable = result.available;
+  return result.preferences;
+}
+
+let preferences = loadPreferences();
+const compareMints = new Set();
+
+function savePreferences() {
+  let storage = null;
+  try { storage = globalThis.localStorage; } catch {}
+  const result = writePreferences(storage, preferences);
+  preferences = result.preferences;
+  preferenceStorageAvailable = result.available;
+  return result.available;
+}
+
+function watched(mint) { return preferences.watchedMints.includes(mint); }
+
+function filterState() {
+  return normalizeFilterState({
+    search: $("#leaderboard-search")?.value,
+    lens: $("#leaderboard-lens")?.value,
+    freshness: $("#leaderboard-freshness")?.value,
+    risk: $("#leaderboard-risk")?.value,
+    watchlist: $("#leaderboard-watchlist")?.value
+  });
+}
+
+function applyFilterState(filters) {
+  const value = normalizeFilterState(filters);
+  if ($("#leaderboard-search")) $("#leaderboard-search").value = value.search;
+  if ($("#leaderboard-lens")) $("#leaderboard-lens").value = value.lens;
+  if ($("#leaderboard-freshness")) $("#leaderboard-freshness").value = value.freshness;
+  if ($("#leaderboard-risk")) $("#leaderboard-risk").value = value.risk;
+  if ($("#leaderboard-watchlist")) $("#leaderboard-watchlist").value = value.watchlist;
+}
+
+function filtersFromUrl() {
+  const query = new URLSearchParams(location.search);
+  return normalizeFilterState({
+    search: query.get("q") || "",
+    lens: query.get("lens") || "radar",
+    freshness: query.get("fresh") || "all",
+    risk: query.get("risk") || "all",
+    watchlist: query.get("watch") || "all"
+  });
+}
+
+function syncFiltersToUrl() {
+  const filters = filterState();
+  const url = new URL(location.href);
+  for (const key of ["q", "lens", "fresh", "risk", "watch"]) url.searchParams.delete(key);
+  if (filters.search) url.searchParams.set("q", filters.search);
+  if (filters.lens !== "radar") url.searchParams.set("lens", filters.lens);
+  if (filters.freshness !== "all") url.searchParams.set("fresh", filters.freshness);
+  if (filters.risk !== "all") url.searchParams.set("risk", filters.risk);
+  if (filters.watchlist !== "all") url.searchParams.set("watch", filters.watchlist);
+  history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
 
 function feedTelemetry() {
   const feedHealth = state.feedHealth;
@@ -223,11 +306,15 @@ function leaderboardEntries() {
   const query = String($("#leaderboard-search")?.value || "").trim().toLowerCase();
   const freshness = $("#leaderboard-freshness")?.value || "all";
   const risk = $("#leaderboard-risk")?.value || "all";
+  const watchlist = $("#leaderboard-watchlist")?.value || "all";
   const lens = $("#leaderboard-lens")?.value || "radar";
   const filtered = entries.filter((entry) => {
     const token = entry.token || {};
     const haystack = `${token.name || ""} ${token.symbol || ""} ${token.mint || ""}`.toLowerCase();
-    return (!query || haystack.includes(query)) && (freshness === "all" || entry.freshness?.state === freshness) && (risk === "all" || entry.riskConfidence === risk);
+    return (!query || haystack.includes(query))
+      && (freshness === "all" || entry.freshness?.state === freshness)
+      && (risk === "all" || entry.riskConfidence === risk)
+      && (watchlist === "all" || watched(token.mint));
   });
   return filtered.sort((a, b) => {
     if (lens === "radar") {
@@ -258,16 +345,155 @@ function renderLeaderboard() {
     const token = entry.token || {};
     const symbol = String(token.symbol || "??");
     const reason = Array.isArray(entry.reasons) ? entry.reasons.slice(0, 2).join(" · ") : "Observed-feed ranking";
-    return `<button type="button" class="leaderboard-row" data-mint="${esc(token.mint)}" aria-label="Open ${esc(token.name || symbol)} details">
+    return `<div class="leaderboard-row" data-mint="${esc(token.mint)}" role="button" tabindex="0" aria-label="Open ${esc(token.name || symbol)} details">
       <span class="leaderboard-rank">${number(entry.rank)}</span>
       <span class="leaderboard-asset"><i>${esc(symbol.slice(0, 2))}</i><span><b>${esc(token.name || "Unnamed mint")} <em>${esc(symbol)}</em></b><small>${esc(shortMint(token.mint))} · ${esc(reason)}</small></span></span>
       <span class="leaderboard-score"><b>${hasNumber(entry.score) ? number(entry.score).toFixed(1) : "—"}</b><small>${hasNumber(entry.score) ? "/100" : "RECENCY"}</small></span>
       <span class="freshness ${esc(entry.freshness?.state || "unverified")}">${esc(entry.freshness?.state || "unverified")}<small>${entry.freshness?.ageSeconds === null ? "—" : ago(entry.freshness?.observedAt)}</small></span>
       <span class="confidence ${esc(entry.riskConfidence || "unverified")}">${esc(entry.riskConfidence || "unverified")}</span>
       ${outcomeCell(entry, "5m")}${outcomeCell(entry, "1h")}${outcomeCell(entry, "24h")}
-    </button>`;
+      <button type="button" class="watch-toggle ${watched(token.mint) ? "active" : ""}" data-watch-mint="${esc(token.mint)}" aria-label="${watched(token.mint) ? "Remove" : "Add"} ${esc(symbol)} ${watched(token.mint) ? "from" : "to"} browser watchlist" aria-pressed="${watched(token.mint)}">${watched(token.mint) ? "★" : "☆"}</button>
+    </div>`;
   }).join("");
-  document.querySelectorAll(".leaderboard-row").forEach((row) => row.addEventListener("click", () => openToken(row.dataset.mint)));
+  document.querySelectorAll(".leaderboard-row").forEach((row) => {
+    row.addEventListener("click", (event) => { if (!event.target.closest(".watch-toggle")) void openCoin(row.dataset.mint); });
+    row.addEventListener("keydown", (event) => {
+      if (["Enter", " "].includes(event.key) && !event.target.closest(".watch-toggle")) { event.preventDefault(); void openCoin(row.dataset.mint); }
+    });
+  });
+  document.querySelectorAll(".watch-toggle").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleWatch(button.dataset.watchMint);
+  }));
+}
+
+function toggleWatch(mint) {
+  if (!PUBLIC_MINT.test(mint)) return;
+  if (watched(mint)) {
+    preferences.watchedMints = preferences.watchedMints.filter((candidate) => candidate !== mint);
+    compareMints.delete(mint);
+  } else if (preferences.watchedMints.length >= WATCHLIST_LIMIT) {
+    toast(`Watchlist is capped at ${WATCHLIST_LIMIT} exact mints`);
+    return;
+  } else preferences.watchedMints = [...preferences.watchedMints, mint];
+  savePreferences();
+  compareCacheKey = "";
+  compareCache = null;
+  renderLeaderboard();
+  renderActionIntelligence();
+}
+
+function watchedToken(mint) {
+  return allTokens().find((token) => token.mint === mint)
+    || state.leaderboard?.top100?.find((entry) => entry.token?.mint === mint)?.token
+    || null;
+}
+
+function renderWatchlist() {
+  $("#watchlist-count").textContent = `${preferences.watchedMints.length}/${WATCHLIST_LIMIT}`;
+  $("#preference-status").textContent = preferenceStorageAvailable
+    ? "Origin-local only; not cross-device and does not control operator Telegram delivery."
+    : "Browser storage is unavailable; changes last only for this page session. Export JSON to retain them.";
+  $("#watchlist-items").innerHTML = preferences.watchedMints.length ? preferences.watchedMints.map((mint) => {
+    const token = watchedToken(mint);
+    const label = token ? `${token.name || "Unnamed mint"} · ${token.symbol || "???"}` : "Retained mint · outside current snapshot";
+    return `<div class="watchlist-item"><button type="button" class="watch-open" data-open-watch="${esc(mint)}"><b>${esc(label)}</b><small>${esc(shortMint(mint))}</small></button><label><input type="checkbox" data-compare-mint="${esc(mint)}" ${compareMints.has(mint) ? "checked" : ""}>COMPARE</label><button type="button" class="watch-remove" data-remove-watch="${esc(mint)}" aria-label="Remove ${esc(shortMint(mint))} from watchlist">×</button></div>`;
+  }).join("") : '<div class="action-empty">Star an observed coin to keep it in this browser.</div>';
+  document.querySelectorAll("[data-open-watch]").forEach((button) => button.addEventListener("click", () => void openCoin(button.dataset.openWatch)));
+  document.querySelectorAll("[data-remove-watch]").forEach((button) => button.addEventListener("click", () => toggleWatch(button.dataset.removeWatch)));
+  document.querySelectorAll("[data-compare-mint]").forEach((input) => input.addEventListener("change", () => {
+    if (input.checked && compareMints.size >= 4) { input.checked = false; toast("Compare is capped at four exact mints"); return; }
+    if (input.checked) compareMints.add(input.dataset.compareMint); else compareMints.delete(input.dataset.compareMint);
+    compareCacheKey = "";
+    compareCache = null;
+    renderComparison();
+  }));
+}
+
+function renderPresets() {
+  const select = $("#preset-select");
+  const current = select.value;
+  select.innerHTML = preferences.presets.length
+    ? '<option value="">Choose a saved lens</option>' + preferences.presets.map((preset) => `<option value="${esc(preset.id)}">${esc(preset.name)}</option>`).join("")
+    : '<option value="">No saved lenses</option>';
+  if (preferences.presets.some((preset) => preset.id === current)) select.value = current;
+  $("#delete-preset").disabled = !select.value;
+}
+
+function comparisonCell(value, formatter = (entry) => entry) {
+  return value === null || value === undefined ? '<span class="comparison-missing">—</span>' : esc(formatter(value));
+}
+
+function renderComparisonResult(result) {
+  const coins = Array.isArray(result?.coins) ? result.coins : [];
+  const missing = Array.isArray(result?.missingMints) ? result.missingMints : [];
+  if (!coins.length) {
+    $("#compare-results").innerHTML = '<div class="action-empty">No retained public evidence matched this comparison.</div>';
+    return;
+  }
+  const rows = [
+    ["RADAR", (coin) => comparisonCell(coin.radarScore, (value) => Number(value).toFixed(1))],
+    ["MOMENTUM", (coin) => comparisonCell(coin.momentum)],
+    ["TOP 10", (coin) => comparisonCell(coin.factors?.top10Percentage?.value, (value) => `${value}%`)],
+    ["DEV HOLDING", (coin) => comparisonCell(coin.factors?.developerHoldingPercentage?.value, (value) => `${value}%`)],
+    ["POOL RESERVE", (coin) => comparisonCell(coin.factors?.liquidityUsd?.value, money)],
+    ["5M RETURN", (coin) => comparisonCell(coin.outcomes?.["5m"]?.returnPct, signedPct)],
+    ["1H RETURN", (coin) => comparisonCell(coin.outcomes?.["1h"]?.returnPct, signedPct)],
+    ["24H RETURN", (coin) => comparisonCell(coin.outcomes?.["24h"]?.returnPct, signedPct)]
+  ];
+  $("#compare-results").innerHTML = `<div class="comparison-table" style="--comparison-columns:${coins.length}"><div class="comparison-head"><span>MEASURE</span>${coins.map((coin) => `<button type="button" data-compare-open="${esc(coin.mint)}"><b>${esc(coin.symbol)}</b><small>${esc(shortMint(coin.mint))}</small></button>`).join("")}</div>${rows.map(([label, value]) => `<div class="comparison-row"><b>${label}</b>${coins.map((coin) => `<span>${value(coin)}</span>`).join("")}</div>`).join("")}</div>${missing.length ? `<p class="comparison-warning">No retained row for ${missing.map(shortMint).map(esc).join(", ")}.</p>` : ""}<p class="comparison-footnote">Risk factors are uncalibrated and excluded from rank. Missing values are not zeros.</p>`;
+  document.querySelectorAll("[data-compare-open]").forEach((button) => button.addEventListener("click", () => void openCoin(button.dataset.compareOpen)));
+}
+
+async function renderComparison() {
+  const mints = [...compareMints];
+  $("#compare-selection").textContent = mints.length ? `${mints.length}/4 selected · ${mints.map(shortMint).join(" · ")}` : "Select two watched coins to compare.";
+  if (mints.length < 2) {
+    $("#compare-results").innerHTML = '<div class="action-empty">Select at least two exact mints. Unavailable values stay unavailable.</div>';
+    return;
+  }
+  const key = mints.join(",");
+  if (compareCacheKey === key && compareCache) { renderComparisonResult(compareCache); return; }
+  const sequence = ++compareRequestSequence;
+  $("#compare-results").innerHTML = '<div class="action-empty">Loading bounded comparison…</div>';
+  try {
+    const response = await fetch(`/api/compare?mints=${encodeURIComponent(key)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Compare returned ${response.status}`);
+    const result = await response.json();
+    if (sequence !== compareRequestSequence) return;
+    compareCacheKey = key;
+    compareCache = result;
+    renderComparisonResult(result);
+  } catch {
+    if (sequence === compareRequestSequence) $("#compare-results").innerHTML = '<div class="action-empty error">Comparison is temporarily unavailable.</div>';
+  }
+}
+
+function renderBrief(target, brief) {
+  const element = $(target);
+  if (!brief || typeof brief !== "object") {
+    element.innerHTML = '<span class="kicker">MEASURED BRIEF</span><div class="action-empty">No frozen closed-period brief is available.</div>';
+    return;
+  }
+  const metric = brief.outcomes?.windows?.["1h"] || {};
+  const measured = metric.status === "sufficient-evidence";
+  element.innerHTML = `<span class="kicker">${brief.period === "weekly" ? "LAST CLOSED UTC WEEK" : "LAST CLOSED UTC DAY"}</span><div class="brief-title"><h3>${esc(brief.windowStart.slice(0, 10))} → ${esc(brief.windowEnd.slice(0, 10))}</h3><span>${esc(metric.status || "unavailable")}</span></div><div class="brief-metrics"><div><b>${nf.format(number(brief.activity?.launchesObserved))}</b><small>OBSERVED LAUNCHES</small></div><div><b>${nf.format(number(brief.activity?.migrationObservations))}</b><small>MIGRATION OBSERVATIONS</small></div><div><b>${nf.format(number(brief.activity?.materialAlerts))}</b><small>MATERIAL EVENTS</small></div><div><b>${measured ? signedPct(metric.medianReturnPct) : "—"}</b><small>1H MEDIAN · ${number(metric.evidenceCount)}/${number(metric.eligibleCount)}</small></div></div><p>Frozen at ${esc(brief.generatedAt)} · feed coverage unmeasured · raw provider payloads excluded.</p>`;
+}
+
+function renderActionIntelligence() {
+  if (!$("#watchlist-items")) return;
+  renderWatchlist();
+  renderPresets();
+  void renderComparison();
+  const action = state.actionIntelligence && typeof state.actionIntelligence === "object" ? state.actionIntelligence : {};
+  const telegram = action.alerts?.telegram || {};
+  $("#telegram-alert-state").textContent = telegram.status === "configured" ? "TELEGRAM CONFIGURED" : "TELEGRAM NOT CONFIGURED";
+  const counts = telegram.outbox?.statusCounts || {};
+  $("#action-method-state").textContent = telegram.status === "configured"
+    ? `MATERIALITY POLICY v1 · ${number(counts.pending) + number(counts.retrying)} PENDING · ${number(counts["dead-letter"])} DEAD-LETTER`
+    : "MATERIALITY POLICY v1 · NOT CALIBRATED RISK";
+  renderBrief("#daily-brief", action.briefs?.daily);
+  renderBrief("#weekly-brief", action.briefs?.weekly);
 }
 
 function signedPct(value) {
@@ -328,7 +554,7 @@ function renderRiskIntelligence() {
   }).join("") : syntheticDemo
     ? '<div class="risk-cohort-empty">SYNTHETIC DEMO has no rows; no provider cohort admission is implied.</div>'
     : '<div class="risk-cohort-empty">The independent v0.7 cohort admits new feed observations while the worker is active; no historical backfill is implied.</div>';
-  document.querySelectorAll(".risk-cohort-row").forEach((row) => row.addEventListener("click", () => openToken(row.dataset.riskMint)));
+  document.querySelectorAll(".risk-cohort-row").forEach((row) => row.addEventListener("click", () => void openCoin(row.dataset.riskMint)));
 }
 
 function renderOutcomes() {
@@ -628,6 +854,7 @@ function render() {
   renderFeedObservability();
   renderStats();
   renderLeaderboard();
+  renderActionIntelligence();
   renderRiskIntelligence();
   renderOutcomes();
   renderTokens();
@@ -653,10 +880,16 @@ async function refresh() {
       stats: snapshot.stats && typeof snapshot.stats === "object" ? snapshot.stats : {},
       leaderboard: snapshot.leaderboard && typeof snapshot.leaderboard === "object" ? snapshot.leaderboard : { top100: [] },
       outcomes: snapshot.outcomes && typeof snapshot.outcomes === "object" ? snapshot.outcomes : {},
-      riskIntelligence: snapshot.riskIntelligence && typeof snapshot.riskIntelligence === "object" ? snapshot.riskIntelligence : {}
+      riskIntelligence: snapshot.riskIntelligence && typeof snapshot.riskIntelligence === "object" ? snapshot.riskIntelligence : {},
+      actionIntelligence: snapshot.actionIntelligence && typeof snapshot.actionIntelligence === "object" ? snapshot.actionIntelligence : {}
     };
     snapshotFailed = false;
     render();
+    const deepLinkMint = new URLSearchParams(location.search).get("coin");
+    if (!deepLinkOpened && PUBLIC_MINT.test(deepLinkMint || "")) {
+      deepLinkOpened = true;
+      void openCoin(deepLinkMint);
+    }
   } catch (error) {
     snapshotFailed = true;
     renderFeedObservability();
@@ -666,10 +899,36 @@ async function refresh() {
   }
 }
 
-function openToken(mint) {
-  const token = rankedTokens().find((candidate) => candidate.mint === mint);
+async function renderCoinTimeline(mint) {
+  const target = $("#coin-timeline");
+  if (!target) return;
+  try {
+    const response = await fetch(`/api/coins/${encodeURIComponent(mint)}/timeline`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Timeline returned ${response.status}`);
+    const timeline = await response.json();
+    const entries = Array.isArray(timeline.entries) ? timeline.entries : [];
+    target.innerHTML = entries.length ? entries.map((entry) => `<div class="timeline-entry"><time>${esc(entry.at)}</time><span class="confidence ${esc(entry.evidenceClass || "unavailable")}">${esc(entry.evidenceClass || "unavailable")}</span><div><b>${esc(entry.title || "Observation")}</b><p>${esc(entry.detail || "Evidence detail unavailable.")}</p></div></div>`).join("") : '<div class="action-empty">No discrete retained events are available for this coin.</div>';
+  } catch {
+    target.innerHTML = '<div class="action-empty error">Timeline is temporarily unavailable.</div>';
+  }
+}
+
+async function openCoin(mint) {
+  if (!PUBLIC_MINT.test(mint)) return;
+  if (rankedTokens().some((candidate) => candidate.mint === mint)) { openToken(mint); return; }
+  try {
+    const response = await fetch(`/api/coins/${encodeURIComponent(mint)}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Coin dossier returned ${response.status}`);
+    const dossier = await response.json();
+    openToken(mint, dossier);
+  } catch { toast("Retained coin dossier is unavailable"); }
+}
+
+function openToken(mint, dossier = null) {
+  const token = dossier?.token || rankedTokens().find((candidate) => candidate.mint === mint);
   if (!token) return;
-  const leaderboardEntry = Array.isArray(state.leaderboard?.top100) ? state.leaderboard.top100.find((entry) => entry.token?.mint === mint) : null;
+  const leaderboardEntry = dossier ? { token, outcome: dossier.outcome, ...dossier.radar }
+    : Array.isArray(state.leaderboard?.top100) ? state.leaderboard.top100.find((entry) => entry.token?.mint === mint) : null;
   const confidence = riskConfidence(token);
   const momentum = [];
   if (hasNumber(token.volume5m) && number(token.volume5m) > 7000) momentum.push("5m volume acceleration");
@@ -677,10 +936,17 @@ function openToken(mint) {
   if (hasNumber(token.buyRatio) && number(token.buyRatio) >= .64) momentum.push("buy-side pressure");
   if (hasNumber(token.bondingProgress) && number(token.bondingProgress) >= 75) momentum.push("approaching migration");
   $("#token-detail").innerHTML = `<div class="detail"><span class="kicker">${esc(token.narrative || "Unclassified")} // ${esc(token.status || "observed")}</span><h2>${esc(token.name || "Unnamed mint")} <span class="risk-low">${esc(token.symbol || "??")}</span></h2><div class="mint">${esc(token.mint)}</div>
-    <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>COMPOSITE RISK</label><strong class="risk-unverified">—</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>SMART WALLETS</label><strong>${hasNumber(token.smartWallets) ? nf.format(number(token.smartWallets)) : "—"}</strong></div></div>
+    <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>RISK PROBABILITY</label><strong class="risk-unverified">WITHHELD</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>SMART WALLETS</label><strong>${hasNumber(token.smartWallets) ? nf.format(number(token.smartWallets)) : "—"}</strong></div></div>
     <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${riskIdentityDetail(token)}${outcomeDetail(leaderboardEntry)}
-    <div class="detail-actions"><button class="primary" id="export-coin">EXPORT TO OBSIDIAN</button><a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
+    <div class="coin-timeline"><span class="kicker">DISCRETE RETAINED TIMELINE // NO INTERPOLATION</span><div id="coin-timeline"><div class="action-empty">Loading typed observations…</div></div></div>
+    <div class="detail-actions"><button class="primary" id="watch-coin" aria-pressed="${watched(token.mint)}">${watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER"}</button><button id="export-coin">EXPORT TO OBSIDIAN</button><a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
   $("#token-dialog").showModal();
+  void renderCoinTimeline(token.mint);
+  $("#watch-coin").onclick = () => {
+    toggleWatch(token.mint);
+    $("#watch-coin").textContent = watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER";
+    $("#watch-coin").setAttribute("aria-pressed", String(watched(token.mint)));
+  };
   $("#export-coin").onclick = async () => {
     try {
       const response = await fetch(`/api/export/coin/${encodeURIComponent(token.mint)}`, { method: "POST" });
@@ -723,9 +989,79 @@ document.querySelectorAll(".quick-prompt").forEach((button) => button.addEventLi
   $("#caesar-question").value = String(button.dataset.question || "").slice(0, CAESAR_MAX_QUESTION);
   $("#caesar-form").requestSubmit();
 }));
-for (const id of ["leaderboard-search", "leaderboard-lens", "leaderboard-freshness", "leaderboard-risk"]) {
-  $(`#${id}`).addEventListener(id === "leaderboard-search" ? "input" : "change", renderLeaderboard);
+for (const id of ["leaderboard-search", "leaderboard-lens", "leaderboard-freshness", "leaderboard-risk", "leaderboard-watchlist"]) {
+  $(`#${id}`).addEventListener(id === "leaderboard-search" ? "input" : "change", () => {
+    syncFiltersToUrl();
+    renderLeaderboard();
+  });
 }
+
+$("#save-preset").addEventListener("click", () => {
+  const name = $("#preset-name").value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 32);
+  if (!name) { toast("Name the filter lens first"); $("#preset-name").focus(); return; }
+  if (preferences.presets.length >= PRESET_LIMIT) { toast(`Saved lenses are capped at ${PRESET_LIMIT}`); return; }
+  const id = `lens-${Date.now().toString(36)}`;
+  preferences.presets = [...preferences.presets, { id, name, filters: filterState() }];
+  savePreferences();
+  $("#preset-name").value = "";
+  renderPresets();
+  $("#preset-select").value = id;
+  $("#delete-preset").disabled = false;
+  toast("Filter lens saved in this browser");
+});
+
+$("#preset-select").addEventListener("change", () => {
+  const preset = preferences.presets.find((candidate) => candidate.id === $("#preset-select").value);
+  $("#delete-preset").disabled = !preset;
+  if (!preset) return;
+  applyFilterState(preset.filters);
+  syncFiltersToUrl();
+  renderLeaderboard();
+});
+
+$("#delete-preset").addEventListener("click", () => {
+  const id = $("#preset-select").value;
+  if (!id) return;
+  preferences.presets = preferences.presets.filter((preset) => preset.id !== id);
+  savePreferences();
+  renderPresets();
+  toast("Saved lens deleted");
+});
+
+$("#clear-compare").addEventListener("click", () => {
+  compareMints.clear();
+  compareCacheKey = "";
+  compareCache = null;
+  renderWatchlist();
+  void renderComparison();
+});
+
+$("#export-preferences").addEventListener("click", () => {
+  const blob = new Blob([`${JSON.stringify(preferences, null, 2)}\n`], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "pump-war-room-preferences-v1.json";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+});
+
+$("#import-preferences").addEventListener("click", () => $("#preference-file").click());
+$("#preference-file").addEventListener("change", async () => {
+  const file = $("#preference-file").files?.[0];
+  $("#preference-file").value = "";
+  if (!file || file.size > 50_000) { if (file) toast("Preference JSON is too large"); return; }
+  try {
+    preferences = normalizePreferences(JSON.parse(await file.text()), { strict: true });
+    compareMints.clear();
+    savePreferences();
+    renderLeaderboard();
+    renderActionIntelligence();
+    toast("Browser preferences imported");
+  } catch { toast("Preference JSON is invalid"); }
+});
+
+addEventListener("popstate", () => { applyFilterState(filtersFromUrl()); renderLeaderboard(); });
 
 function tickClock() {
   $("#clock").textContent = `${new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false })} ET`;
@@ -734,9 +1070,10 @@ function tickClock() {
 
 tickClock();
 setInterval(tickClock, 1000);
+applyFilterState(filtersFromUrl());
 await refresh();
 const stream = new EventSource("/api/stream");
 stream.onopen = () => { dashboardStreamState = "open"; renderFeedObservability(); };
-for (const event of ["new-token", "token-update", "callout", "alert", "status"]) stream.addEventListener(event, () => refresh());
+for (const event of ["new-token", "token-update", "callout", "alert", "material-change", "status"]) stream.addEventListener(event, () => refresh());
 stream.onerror = () => { dashboardStreamState = "reconnecting"; renderFeedObservability(); };
 setInterval(refresh, 15_000);

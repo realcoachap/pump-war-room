@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
+  copyFileSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -87,10 +88,10 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
   assert.equal(report.disposableRestore.verified, true);
   assert.deepEqual(report.disposableRestore.applicationWriteProbe, { verified: true, rolledBack: true });
   assert.deepEqual(report.backup.rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1, risk_identity_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
   assert.deepEqual(report.backup.invalidJsonPayloads, {
-    tokens: 0, events: 0, callouts: 0, outcome_enrichment: 0, risk_identity_enrichment: 0
+    tokens: 0, events: 0, callouts: 0, brief_runs: 0, outcome_enrichment: 0, risk_identity_enrichment: 0
   });
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(digest(databasePath), sourceBefore);
@@ -152,7 +153,7 @@ test("standalone restore verification is read-only and removes its disposable co
   assert.equal(statSync(destination).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
   assert.deepEqual(inspectDatabaseFile(destination).rowCounts, {
-    tokens: 1, events: 1, alerts: 1, callouts: 1, outcome_enrichment: 1, risk_identity_enrichment: 1
+    tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
   });
 });
 
@@ -177,10 +178,11 @@ test("verifies an exact v0.5.1 artifact by migrating only the disposable restore
 
   assert.equal(report.artifact.userVersion, 501);
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 501);
-  assert.equal(report.disposableRestore.userVersion, 700);
+  assert.equal(report.disposableRestore.userVersion, 800);
   assert.equal(report.disposableRestore.rowCounts.tokens, 1);
   assert.equal(report.disposableRestore.rowCounts.outcome_enrichment, 0);
   assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
+  assert.equal(report.disposableRestore.rowCounts.brief_runs, 0);
   assert.equal(digest(legacyPath), before.hash);
   assert.equal(statSync(legacyPath).mtime.toISOString(), before.modifiedAt);
   assert.deepEqual(readdirSync(scratchDirectory), []);
@@ -190,17 +192,27 @@ test("verifies an exact v0.6.0 artifact by migrating only the disposable restore
   const directory = temporaryWorkspace(t);
   const scratchDirectory = path.join(directory, "scratch");
   const outcomePath = path.join(directory, "v0.6.0-backup.db");
-  const outcomeStore = new Store(outcomePath);
-  outcomeStore.upsertToken({ mint: "outcome-mint", source: "pumpportal", createdAt });
-  outcomeStore.db.exec(`
-    DROP INDEX risk_identity_provider_due;
-    DROP INDEX risk_identity_provider_status_updated;
-    DROP TABLE risk_identity_enrichment;
+  const outcomeStore = new DatabaseSync(outcomePath);
+  outcomeStore.exec(`
+    CREATE TABLE tokens (mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE callouts (external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC);
+    CREATE TABLE outcome_enrichment (
+      mint TEXT PRIMARY KEY NOT NULL, provider TEXT, pool TEXT, token_side TEXT, dex TEXT, source_url TEXT,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence) = 'object'),
+      status TEXT NOT NULL, missing_reason TEXT, error_code TEXT,
+      attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0), last_attempt_at TEXT,
+      next_attempt_at TEXT, last_success_at TEXT, updated_at TEXT NOT NULL,
+      CHECK(token_side IS NULL OR token_side IN ('base','quote'))
+    );
+    CREATE INDEX outcome_enrichment_provider_status_updated ON outcome_enrichment(provider, status, updated_at DESC, mint);
+    CREATE INDEX outcome_enrichment_provider_due ON outcome_enrichment(provider, next_attempt_at, mint);
+    INSERT INTO tokens VALUES ('outcome-mint','{"mint":"outcome-mint","source":"pumpportal"}','${createdAt}','${createdAt}');
     PRAGMA user_version = 600;
-    PRAGMA wal_checkpoint(TRUNCATE);
-    PRAGMA journal_mode = DELETE;
   `);
-  outcomeStore.db.close();
+  outcomeStore.close();
   const before = { hash: digest(outcomePath), modifiedAt: statSync(outcomePath).mtime.toISOString() };
 
   const report = verifyRestorableBackup(outcomePath, { scratchRoot: scratchDirectory });
@@ -208,11 +220,147 @@ test("verifies an exact v0.6.0 artifact by migrating only the disposable restore
   assert.equal(report.artifact.userVersion, 600);
   assert.equal(report.artifact.rowCounts.outcome_enrichment, 0);
   assert.equal(report.disposableRestore.migratedFromSchemaVersion, 600);
-  assert.equal(report.disposableRestore.userVersion, 700);
+  assert.equal(report.disposableRestore.userVersion, 800);
   assert.equal(report.disposableRestore.rowCounts.tokens, 1);
   assert.equal(report.disposableRestore.rowCounts.risk_identity_enrichment, 0);
+  assert.equal(report.disposableRestore.rowCounts.brief_runs, 0);
   assert.equal(digest(outcomePath), before.hash);
   assert.equal(statSync(outcomePath).mtime.toISOString(), before.modifiedAt);
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
+test("verifies an exact v0.7 artifact and migrates only the disposable restore copy", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const riskPath = path.join(directory, "v0.7-backup.db");
+  const riskMint = "11111111111111111111111111111111";
+  const migrationEvent = {
+    id: 7, kind: "risk-evidence", mint: riskMint,
+    payload: { mint: riskMint, source: "geckoterminal", factor: "concentration", value: 52, unit: "%" },
+    createdAt
+  };
+  const migrationAlert = {
+    id: 11, level: "risk", title: "Holder concentration changed",
+    message: "Provider-observed concentration moved to 52%", mint: riskMint, createdAt
+  };
+  const outcomeState = {
+    mint: riskMint, provider: "dexscreener", pool: "Pool111", tokenSide: "base", dex: "raydium",
+    sourceUrl: "https://dex.example/pools/Pool111",
+    evidence: {
+      outcome: {
+        baseline: { observedAt: createdAt, nonempty: true },
+        windows: { "5m": { returnPct: 12.5, maximumDrawdownPct: 4.25 } }
+      }
+    },
+    status: "partial", missingReason: "missing-24h", errorCode: null, attemptCount: 2,
+    lastAttemptAt: "2026-08-08T12:02:00.000Z", nextAttemptAt: "2026-08-08T12:10:00.000Z",
+    lastSuccessAt: "2026-08-08T12:01:00.000Z", updatedAt: "2026-08-08T12:02:01.000Z"
+  };
+  const riskIdentityState = {
+    mint: riskMint, provider: "geckoterminal",
+    evidence: parseGeckoTerminalTokenInfo({ data: {
+      id: `solana_${riskMint}`,
+      type: "token",
+      attributes: {
+        address: riskMint, name: "Observed", symbol: "OBS",
+        holders: { count: 42, distribution_percentage: { top_10: "52" }, last_updated: createdAt },
+        developer_address: null, developer_holding_percentage: null,
+        twitter_handle: null, telegram_handle: null, websites: []
+      }
+    } }, { mint: riskMint, fetchedAt: createdAt }),
+    status: "available", missingReason: null, errorCode: null, attemptCount: 2,
+    lastAttemptAt: createdAt, nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
+  };
+  const risk = new DatabaseSync(riskPath);
+  risk.exec(`
+    CREATE TABLE tokens (mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE callouts (external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC);
+    CREATE TABLE outcome_enrichment (
+      mint TEXT PRIMARY KEY NOT NULL, provider TEXT, pool TEXT, token_side TEXT, dex TEXT, source_url TEXT,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence) = 'object'),
+      status TEXT NOT NULL, missing_reason TEXT, error_code TEXT,
+      attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0), last_attempt_at TEXT,
+      next_attempt_at TEXT, last_success_at TEXT, updated_at TEXT NOT NULL,
+      CHECK(token_side IS NULL OR token_side IN ('base','quote'))
+    );
+    CREATE INDEX outcome_enrichment_provider_status_updated ON outcome_enrichment(provider, status, updated_at DESC, mint);
+    CREATE INDEX outcome_enrichment_provider_due ON outcome_enrichment(provider, next_attempt_at, mint);
+    CREATE TABLE risk_identity_enrichment (
+      mint TEXT PRIMARY KEY NOT NULL, provider TEXT NOT NULL,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence) = 'object'),
+      status TEXT NOT NULL, missing_reason TEXT, error_code TEXT,
+      attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0 AND attempt_count <= 2), last_attempt_at TEXT,
+      next_attempt_at TEXT, last_success_at TEXT, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX risk_identity_provider_status_updated ON risk_identity_enrichment(provider, status, updated_at DESC, mint);
+    CREATE INDEX risk_identity_provider_due ON risk_identity_enrichment(provider, next_attempt_at, mint);
+    PRAGMA user_version = 700;
+  `);
+  risk.prepare("INSERT INTO tokens VALUES (?,?,?,?)")
+    .run(riskMint, JSON.stringify({ mint: riskMint, source: "pumpportal" }), createdAt, createdAt);
+  risk.prepare("INSERT INTO events (id,kind,mint,payload,created_at) VALUES (?,?,?,?,?)")
+    .run(migrationEvent.id, migrationEvent.kind, migrationEvent.mint, JSON.stringify(migrationEvent.payload), migrationEvent.createdAt);
+  risk.prepare("INSERT INTO alerts (id,level,title,message,mint,created_at) VALUES (?,?,?,?,?,?)")
+    .run(migrationAlert.id, migrationAlert.level, migrationAlert.title, migrationAlert.message, migrationAlert.mint, migrationAlert.createdAt);
+  risk.prepare(`INSERT INTO outcome_enrichment
+    (mint,provider,pool,token_side,dex,source_url,evidence,status,missing_reason,error_code,attempt_count,last_attempt_at,next_attempt_at,last_success_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      outcomeState.mint, outcomeState.provider, outcomeState.pool, outcomeState.tokenSide, outcomeState.dex,
+      outcomeState.sourceUrl, JSON.stringify(outcomeState.evidence), outcomeState.status, outcomeState.missingReason,
+      outcomeState.errorCode, outcomeState.attemptCount, outcomeState.lastAttemptAt, outcomeState.nextAttemptAt,
+      outcomeState.lastSuccessAt, outcomeState.updatedAt
+    );
+  risk.prepare(`INSERT INTO risk_identity_enrichment
+    (mint,provider,evidence,status,missing_reason,error_code,attempt_count,last_attempt_at,next_attempt_at,last_success_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+      riskIdentityState.mint, riskIdentityState.provider, JSON.stringify(riskIdentityState.evidence), riskIdentityState.status,
+      riskIdentityState.missingReason, riskIdentityState.errorCode, riskIdentityState.attemptCount,
+      riskIdentityState.lastAttemptAt, riskIdentityState.nextAttemptAt, riskIdentityState.lastSuccessAt,
+      riskIdentityState.updatedAt
+    );
+  risk.close();
+  const before = { hash: digest(riskPath), modifiedAt: statSync(riskPath).mtime.toISOString() };
+
+  const report = verifyRestorableBackup(riskPath, { scratchRoot: scratchDirectory });
+
+  assert.equal(report.artifact.userVersion, 700);
+  assert.deepEqual(report.artifact.rowCounts, {
+    tokens: 1, events: 1, alerts: 1, callouts: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
+  });
+  assert.equal(report.disposableRestore.migratedFromSchemaVersion, 700);
+  assert.equal(report.disposableRestore.userVersion, 800);
+  assert.deepEqual(report.disposableRestore.rowCounts, {
+    tokens: 1, events: 1, alerts: 1, callouts: 0, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1
+  });
+
+  const disposableMigrationPath = path.join(directory, "v0.7-disposable-migration.db");
+  copyFileSync(riskPath, disposableMigrationPath);
+  assert.equal(digest(disposableMigrationPath), before.hash);
+  const migrated = new Store(disposableMigrationPath);
+  try {
+    assert.equal(migrated.db.prepare("PRAGMA user_version").get().user_version, 800);
+    assert.equal(migrated.db.prepare("SELECT id FROM events WHERE mint=?").get(riskMint).id, migrationEvent.id);
+    assert.deepEqual(migrated.eventsForMint(riskMint), [{
+      kind: migrationEvent.kind, mint: migrationEvent.mint, payload: migrationEvent.payload,
+      eventKey: null, evidenceClass: "unavailable", occurredAt: null, createdAt: migrationEvent.createdAt
+    }]);
+    assert.deepEqual(migrated.alertsForMint(riskMint).map((row) => ({ ...row })), [{
+      ...migrationAlert, kind: "legacy", evidenceClass: "unavailable", evidenceAt: null, dedupeKey: null,
+      telegramStatus: null, telegramAttemptedAt: null, telegramMessageId: null, telegramAttemptCount: 0,
+      telegramNextAttemptAt: null, telegramLastErrorCode: null
+    }]);
+    assert.deepEqual(migrated.enrichmentState(riskMint), outcomeState);
+    assert.deepEqual(migrated.riskIdentityState(riskMint), riskIdentityState);
+  } finally {
+    migrated.db.close();
+  }
+
+  assert.equal(digest(riskPath), before.hash);
+  assert.equal(statSync(riskPath).mtime.toISOString(), before.modifiedAt);
+  assert.equal(inspectDatabaseFile(riskPath, { allowLegacy: true }).userVersion, 700);
   assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 

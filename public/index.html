@@ -148,12 +148,55 @@
         <label><span>RANKING LENS</span><select id="leaderboard-lens"><option value="radar">Evidence score / recency</option><option value="momentum">Observed momentum</option><option value="newest">Newest</option></select></label>
         <label><span>FRESHNESS</span><select id="leaderboard-freshness"><option value="all">All observations</option><option value="fresh">Fresh</option><option value="aging">Aging</option><option value="stale">Stale</option></select></label>
         <label><span>RISK EVIDENCE</span><select id="leaderboard-risk"><option value="all">All evidence</option><option value="provider-observed">Provider observed</option><option value="locally-derived">Locally derived</option><option value="feed-observed-processed">Feed observed</option><option value="unavailable">Unavailable</option><option value="synthetic">Synthetic</option></select></label>
+        <label><span>WATCHLIST</span><select id="leaderboard-watchlist"><option value="all">All observed coins</option><option value="watched">Watched only</option></select></label>
       </form>
       <div class="leaderboard-scope" role="note"><b>Scope:</b> strict observed-feed inventory. Outcome windows show <strong>—</strong> until provider-observed follow-up candles exist; missing data is never interpreted as performance.</div>
       <div class="leaderboard-table" role="region" aria-label="Top 100 observed coins" tabindex="0">
-        <div class="leaderboard-columns" aria-hidden="true"><span>#</span><span>Asset / rank reason</span><span>Radar</span><span>Freshness</span><span>Risk</span><span>5m</span><span>1h</span><span>24h</span></div>
+        <div class="leaderboard-columns" aria-hidden="true"><span>#</span><span>Asset / rank reason</span><span>Radar</span><span>Freshness</span><span>Risk</span><span>5m</span><span>1h</span><span>24h</span><span>Watch</span></div>
         <div id="leaderboard-rows"><div class="loading">Building observed-feed ranking…</div></div>
       </div>
+    </section>
+
+    <section class="action-intelligence panel" aria-labelledby="action-intelligence-title" data-release-marker="actionable-intelligence-v1">
+      <header class="action-intelligence-header">
+        <div>
+          <span class="kicker">ACTIONABLE INTELLIGENCE // READ-ONLY</span>
+          <h2 id="action-intelligence-title">Save the lens. Compare the evidence. Review what changed.</h2>
+          <p>Browser-local watchlists and filters, discrete coin timelines, bounded comparisons, measured closed-period briefs, and optional operator Telegram delivery.</p>
+        </div>
+        <div class="action-status"><span id="telegram-alert-state">TELEGRAM NOT CONFIGURED</span><small id="action-method-state">MATERIALITY POLICY v1 · NOT CALIBRATED RISK</small></div>
+      </header>
+      <div class="action-grid">
+        <article class="watchlist-workbench">
+          <div class="action-card-header"><div><span class="kicker">BROWSER-LOCAL WORKBENCH</span><h3>Watchlist + saved filters</h3></div><strong id="watchlist-count">0/50</strong></div>
+          <div class="preset-composer">
+            <input id="preset-name" maxlength="32" placeholder="Name this filter lens" aria-label="Filter preset name">
+            <button id="save-preset" type="button">SAVE LENS</button>
+          </div>
+          <div class="preset-row">
+            <select id="preset-select" aria-label="Saved filter lenses"><option value="">No saved lenses</option></select>
+            <button id="delete-preset" type="button">DELETE</button>
+          </div>
+          <div id="watchlist-items" class="watchlist-items"><div class="action-empty">Star an observed coin to keep it in this browser.</div></div>
+          <div class="preference-actions">
+            <button id="export-preferences" type="button">EXPORT JSON</button>
+            <button id="import-preferences" type="button">IMPORT JSON</button>
+            <input id="preference-file" type="file" accept="application/json" hidden>
+          </div>
+          <p id="preference-status" class="action-note">Origin-local only; not cross-device and does not control operator Telegram delivery.</p>
+        </article>
+
+        <article class="compare-workbench">
+          <div class="action-card-header"><div><span class="kicker">2–4 EXACT MINTS</span><h3>Evidence compare</h3></div><button id="clear-compare" type="button">CLEAR</button></div>
+          <div id="compare-selection" class="compare-selection">Select two watched coins to compare.</div>
+          <div id="compare-results" class="compare-results"><div class="action-empty">Unavailable values stay unavailable; no risk composite is inferred.</div></div>
+        </article>
+      </div>
+      <div class="brief-grid">
+        <article id="daily-brief" class="brief-card"><span class="kicker">LAST CLOSED UTC DAY</span><div class="action-empty">Loading measured brief…</div></article>
+        <article id="weekly-brief" class="brief-card"><span class="kicker">LAST CLOSED UTC WEEK</span><div class="action-empty">Loading measured brief…</div></article>
+      </div>
+      <div class="action-boundary" role="note"><b>Boundary:</b> timelines are discrete retained observations—not continuous price charts. Briefs cover only this deployment and fixed cohorts. Score alerts remain unavailable when comparable numeric evidence is missing.</div>
     </section>
 
     <section class="risk-intelligence panel" aria-labelledby="risk-intelligence-title" data-release-marker="risk-identity-evidence-v1">

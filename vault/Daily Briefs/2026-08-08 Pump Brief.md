@@ -1,28 +1,27 @@
 ---
-type: pump-daily-brief
-date: 2026-08-08
-indexed: 27
-minted_today: 27
+type: pump-measured-daily-brief-example
+method_version: "measured-closed-brief-v1"
+period_start: "2026-08-08T00:00:00.000Z"
+period_end: "2026-08-09T00:00:00.000Z"
+timezone: UTC
+feed_coverage: unmeasured
 ---
 
-# Pump Brief — 2026-08-08
+# Pump War Room Daily Brief Example — 2026-08-08
 
-## Tape
+> Documentation-only example. No historical v0.8 frozen model exists for this period, so prior numeric claims were removed rather than reconstructed.
 
-- Indexed: **27**
-- New today: **27**
-- Graduations: **1**
+## Activity observed by this deployment
 
-## Movers
+- Launches: **unavailable**
+- Processed-feed migration observations: **unavailable** (finalization unverified)
+- Material events: **unavailable**
+- Telegram delivery: **unavailable**
+- Feed coverage: **unmeasured**; no completeness or market-wide rate is claimed
 
-1. [[NAPE - u8EJAQj1]] — momentum 80, risk 39
-2. [[BUTTON - hiHXcj5f]] — momentum 76, risk 20
-3. [[SCAT - VUeAgx2H]] — momentum 74, risk 7
-4. [[PREPE - YVoR2RQu]] — momentum 73, risk 26
-5. [[PENG - sHo1TzER]] — momentum 71, risk 53
-6. [[TERM - CZJqrZDR]] — momentum 70, risk 44
-7. [[MEMER - UBzWTwiE]] — momentum 66, risk 25
+## Fixed-cohort outcomes
 
-## Analyst notes
+- 5m/15m/1h/6h/24h evidence: **unavailable**
+- Hit rate, median return, and observed-close drawdown: **suppressed**
 
-- Add conclusions after evidence review.
+Raw provider prices, candles, and responses are excluded. Missing evidence is not performance.

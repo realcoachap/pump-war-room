@@ -228,7 +228,8 @@ test("writes one bounded, secret-free enrichment state per mint without stale re
   assert.deepEqual(store.dueEnrichmentTokens({ provider: "geckoterminal", now: "2026-08-08T12:18:00.000Z" }).map(({ mint }) => mint), [secondGeckoMint]);
   assert.throws(() => store.dueEnrichmentTokens({ provider: "geckoterminal", now: "bad" }), /RFC 3339/);
   assert.deepEqual(store.deleteEnrichmentByProvider("dexscreener"), {
-    provider: "dexscreener", removed: 1, removedOutcomes: 1, removedRiskIdentity: 0, exclusiveAccessVerified: true, secureDelete: true,
+    provider: "dexscreener", removed: 1, removedOutcomes: 1, removedRiskIdentity: 0,
+    removedEvents: 0, removedAlerts: 0, removedBriefs: 0, exclusiveAccessVerified: true, secureDelete: true,
     vacuumed: true, freelistCount: 0, walTruncated: true, journalModeRestored: "wal"
   });
   assert.equal(store.enrichmentState("OutcomeMintPump"), null);
@@ -245,7 +246,12 @@ test("provider purge securely scrubs deleted bytes, truncates WAL, and keeps dat
   });
   const marker = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
   const riskMarker = "ab".repeat(32);
+  const providerEventMarker = "gecko-risk-events-purge-marker";
+  const providerAlertMarker = "gecko-risk-alerts-purge-marker";
+  const providerBriefMarker = "gecko-brief-purge-marker";
+  const unrelatedMarker = "unrelated-provider-preservation-marker";
   store.upsertToken({ mint: geckoMint, source: "pumpportal", createdAt });
+  store.upsertToken({ mint: secondGeckoMint, source: "pumpportal", createdAt });
   store.upsertEnrichmentState({
     mint: geckoMint, provider: "geckoterminal", pool: marker, tokenSide: "base",
     sourceUrl: `https://www.geckoterminal.com/solana/pools/${marker}`, status: "queued",
@@ -269,20 +275,130 @@ test("provider purge securely scrubs deleted bytes, truncates WAL, and keeps dat
     missingReason: null, errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
     nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
   });
+  store.upsertEnrichmentState({
+    mint: secondGeckoMint, provider: "other-provider", pool: null, tokenSide: null,
+    dex: null, sourceUrl: null, status: "queued", missingReason: "Unrelated provider row",
+    errorCode: null, attemptCount: 0, lastAttemptAt: null, nextAttemptAt: createdAt,
+    lastSuccessAt: null, updatedAt: createdAt,
+    evidence: { source: "other-provider", marker: unrelatedMarker }
+  });
+  store.upsertRiskIdentityState({
+    mint: secondGeckoMint, provider: "other-provider",
+    evidence: { source: "other-provider", marker: unrelatedMarker }, status: "available",
+    missingReason: null, errorCode: null, attemptCount: 1, lastAttemptAt: createdAt,
+    nextAttemptAt: null, lastSuccessAt: createdAt, updatedAt: createdAt
+  });
+
+  const providerEvents = [
+    ["concentration", 100, "%", "geckoterminal", "provider-observed"],
+    ["developer-holding", 25, "%", "geckoterminal", "provider-observed"],
+    ["pool-reserve", 1_000, " USD", "geckoterminal", "provider-observed"],
+    ["identity-reuse", 2, " other mints", "locally-derived", "locally-derived"],
+    ["creator-history", 3, " observed launches", "locally-derived", "locally-derived"]
+  ];
+  for (const [factor, value, unit, source, evidenceClass] of providerEvents) {
+    store.addIntelligenceEvent({
+      kind: "risk-evidence", mint: geckoMint,
+      eventKey: `risk-evidence-v1:${factor}:${geckoMint}:${value}:${createdAt}`,
+      evidenceClass, occurredAt: createdAt,
+      payload: { mint: geckoMint, factor, value, unit, source, limitation: providerEventMarker }
+    });
+  }
+  const unrelatedEventKey = `risk-evidence-v1:external-sentiment:${secondGeckoMint}:1:${createdAt}`;
+  store.addIntelligenceEvent({
+    kind: "risk-evidence", mint: secondGeckoMint, eventKey: unrelatedEventKey,
+    evidenceClass: "provider-observed", occurredAt: createdAt,
+    payload: {
+      mint: secondGeckoMint, factor: "external-sentiment", value: 1, unit: null,
+      source: "other-provider", limitation: unrelatedMarker
+    }
+  });
+
+  const pendingRiskAlert = store.addAlert({
+    level: "risk", title: "Provider concentration alert", message: providerAlertMarker,
+    mint: geckoMint, kind: "risk-concentration", evidenceClass: "provider-observed",
+    evidenceAt: createdAt, dedupeKey: `risk-concentration:${geckoMint}:${createdAt}`, createdAt
+  }, { queueTelegram: true });
+  const retryingRiskAlert = store.addAlert({
+    level: "risk", title: "Derived identity alert", message: providerAlertMarker,
+    mint: geckoMint, kind: "risk-identity-reuse", evidenceClass: "locally-derived",
+    evidenceAt: createdAt, dedupeKey: `risk-identity-reuse:${geckoMint}:${createdAt}`, createdAt
+  }, { queueTelegram: true });
+  store.recordAlertTelegramAttempt(retryingRiskAlert.id, "retrying", {
+    attemptedAt: createdAt, nextAttemptAt: "2026-08-08T12:01:00.000Z", errorCode: "ambiguous-network-failure"
+  });
+  const unrelatedQueuedAlert = store.addAlert({
+    level: "signal", title: "Unrelated score alert", message: unrelatedMarker,
+    mint: secondGeckoMint, kind: "score-rise", evidenceClass: "locally-derived",
+    evidenceAt: createdAt, dedupeKey: `score-rise:${secondGeckoMint}:${createdAt}`, createdAt
+  }, { queueTelegram: true });
+
+  const providerBriefKey = "measured-closed-brief-v1:daily:2026-08-07T00:00:00.000Z:2026-08-08T00:00:00.000Z:UTC";
+  const providerBriefModel = {
+    briefId: providerBriefKey, methodVersion: "measured-closed-brief-v1", period: "daily",
+    windowStart: "2026-08-07T00:00:00.000Z", windowEnd: "2026-08-08T00:00:00.000Z",
+    generatedAt: createdAt, feedCoverage: "unmeasured", marker: providerBriefMarker
+  };
+  store.saveBriefRun({
+    briefKey: providerBriefKey, kind: "daily", periodStart: providerBriefModel.windowStart,
+    periodEnd: providerBriefModel.windowEnd, methodVersion: providerBriefModel.methodVersion,
+    provider: "geckoterminal", dataCutoff: providerBriefModel.generatedAt, model: providerBriefModel
+  });
+  const unrelatedBriefKey = "measured-closed-brief-v1:weekly:2026-07-27T00:00:00.000Z:2026-08-03T00:00:00.000Z:UTC";
+  const unrelatedBriefModel = {
+    briefId: unrelatedBriefKey, methodVersion: "measured-closed-brief-v1", period: "weekly",
+    windowStart: "2026-07-27T00:00:00.000Z", windowEnd: "2026-08-03T00:00:00.000Z",
+    generatedAt: createdAt, feedCoverage: "unmeasured", marker: unrelatedMarker
+  };
+  store.saveBriefRun({
+    briefKey: unrelatedBriefKey, kind: "weekly", periodStart: unrelatedBriefModel.windowStart,
+    periodEnd: unrelatedBriefModel.windowEnd, methodVersion: unrelatedBriefModel.methodVersion,
+    provider: "other-provider", dataCutoff: unrelatedBriefModel.generatedAt, model: unrelatedBriefModel
+  });
+
+  assert.deepEqual(
+    store.dueTelegramAlerts({ now: createdAt }).map(({ id }) => id).sort((left, right) => left - right),
+    [pendingRiskAlert.id, unrelatedQueuedAlert.id].sort((left, right) => left - right)
+  );
   store.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true, "probe marker never reached the database file");
-  assert.equal(readFileSync(databasePath).includes(Buffer.from(riskMarker)), true, "risk marker never reached the database file");
+  const beforePurge = readFileSync(databasePath);
+  for (const [value, label] of [
+    [marker, "outcome"], [riskMarker, "risk identity"], [providerEventMarker, "risk event"],
+    [providerAlertMarker, "risk alert"], [providerBriefMarker, "brief"]
+  ]) {
+    assert.equal(beforePurge.includes(Buffer.from(value)), true, `${label} probe marker never reached the database file`);
+  }
   assert.deepEqual(store.deleteEnrichmentByProvider("geckoterminal"), {
-    provider: "geckoterminal", removed: 2, removedOutcomes: 1, removedRiskIdentity: 1, exclusiveAccessVerified: true, secureDelete: true,
+    provider: "geckoterminal", removed: 10, removedOutcomes: 1, removedRiskIdentity: 1,
+    removedEvents: 5, removedAlerts: 2, removedBriefs: 1, exclusiveAccessVerified: true, secureDelete: true,
     vacuumed: true, freelistCount: 0, walTruncated: true, journalModeRestored: "wal"
   });
   assert.equal(store.enrichmentState(geckoMint), null);
+  assert.equal(store.riskIdentityState(geckoMint), null);
+  assert.equal(store.enrichmentState(secondGeckoMint).provider, "other-provider");
+  assert.equal(store.riskIdentityState(secondGeckoMint).provider, "other-provider");
+  assert.deepEqual(store.eventsForMint(geckoMint), []);
+  assert.equal(store.eventsForMint(secondGeckoMint)[0].eventKey, unrelatedEventKey);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM alerts WHERE id IN (?,?)")
+    .get(pendingRiskAlert.id, retryingRiskAlert.id).count, 0);
+  assert.deepEqual(store.dueTelegramAlerts({ now: createdAt }).map(({ id }) => id), [unrelatedQueuedAlert.id]);
+  assert.equal(store.alertsForMint(secondGeckoMint)[0].telegramStatus, "pending");
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM brief_runs WHERE brief_key=?").get(providerBriefKey).count, 0);
+  assert.equal(store.briefRun("weekly").briefKey, unrelatedBriefKey);
+  assert.deepEqual(store.tokens().map(({ mint }) => mint).sort(), [geckoMint, secondGeckoMint].sort());
   for (const candidate of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
     if (!existsSync(candidate)) continue;
-    assert.equal(readFileSync(candidate).includes(Buffer.from(marker)), false, `${path.basename(candidate)} retained deleted provider bytes`);
-    assert.equal(readFileSync(candidate).includes(Buffer.from(riskMarker)), false, `${path.basename(candidate)} retained deleted risk bytes`);
+    const contents = readFileSync(candidate);
+    for (const [value, label] of [
+      [marker, "outcome"], [riskMarker, "risk identity"], [providerEventMarker, "risk event"],
+      [providerAlertMarker, "risk alert"], [providerBriefMarker, "brief"]
+    ]) {
+      assert.equal(contents.includes(Buffer.from(value)), false, `${path.basename(candidate)} retained deleted ${label} bytes`);
+    }
     assert.equal(statSync(candidate).mode & 0o777, 0o600, `${path.basename(candidate)} was not owner-only`);
   }
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(unrelatedMarker)), true,
+    "provider purge removed unrelated row bytes");
 });
 
 test("persists bounded risk identity evidence with due scheduling and explicit unknowns", (t) => {
@@ -465,4 +581,63 @@ test("migrates an existing v0.5.1 database in place while preserving rows and WA
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name='outcome_enrichment_provider_status_updated'").get().count, 1);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name='outcome_enrichment_provider_due'").get().count, 1);
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name='risk_identity_provider_due'").get().count, 1);
+});
+
+test("persists deduplicated intelligence, restart-safe Telegram delivery, and frozen briefs", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "pump-war-room-action-store-"));
+  const databasePath = path.join(directory, "war-room.db");
+  let store = new Store(databasePath);
+  t.after(() => {
+    try { store.db.close(); } catch {}
+    rmSync(directory, { recursive: true, force: true });
+  });
+  store.upsertToken({ mint: geckoMint, symbol: "ACT", source: "pumpportal", createdAt });
+  const event = {
+    kind: "risk-evidence", mint: geckoMint, eventKey: `risk-evidence-v1:concentration:${geckoMint}:52:${createdAt}`,
+    evidenceClass: "provider-observed", occurredAt: createdAt,
+    payload: { mint: geckoMint, factor: "concentration", value: 52, unit: "%", source: "geckoterminal", limitation: "Uncalibrated provider observation." }
+  };
+  assert.equal(store.addIntelligenceEvent(event).written, true);
+  assert.equal(store.addIntelligenceEvent(event).written, false);
+  assert.equal(store.eventsForMint(geckoMint)[0].payload.value, 52);
+
+  const alert = store.addAlert({
+    level: "risk", title: "Factor changed", message: "Bounded evidence change", mint: geckoMint,
+    kind: "risk-concentration", evidenceClass: "provider-observed", evidenceAt: createdAt,
+    dedupeKey: `material-concentration-v1:${geckoMint}:52`, createdAt
+  }, { queueTelegram: true });
+  assert.equal(alert.telegramStatus, "pending");
+  assert.equal(store.addAlert({ ...alert, dedupeKey: alert.dedupeKey }), null);
+  assert.equal(store.dueTelegramAlerts({ now: createdAt })[0].id, alert.id);
+  store.recordAlertTelegramAttempt(alert.id, "retrying", {
+    attemptedAt: createdAt, nextAttemptAt: "2026-08-08T12:01:00.000Z", errorCode: "rate-limited"
+  });
+  store.db.close();
+  store = new Store(databasePath);
+  assert.equal(store.dueTelegramAlerts({ now: "2026-08-08T12:00:59.999Z" }).length, 0);
+  assert.equal(store.dueTelegramAlerts({ now: "2026-08-08T12:01:00.000Z" })[0].telegramAttemptCount, 1);
+  store.recordAlertTelegramAttempt(alert.id, "sent", { attemptedAt: "2026-08-08T12:01:00.000Z", messageId: 77 });
+  assert.deepEqual(store.telegramDeliveryCoverage(), { total: 1, statusCounts: { sent: 1 } });
+
+  const briefKey = "measured-closed-brief-v1:daily:2026-08-07T00:00:00.000Z:2026-08-08T00:00:00.000Z:UTC";
+  const model = {
+    briefId: briefKey, methodVersion: "measured-closed-brief-v1", period: "daily",
+    windowStart: "2026-08-07T00:00:00.000Z", windowEnd: "2026-08-08T00:00:00.000Z",
+    generatedAt: "2026-08-08T12:00:00.000Z", feedCoverage: "unmeasured", activity: { launchesObserved: 0 }
+  };
+  assert.equal(store.saveBriefRun({
+    briefKey, kind: "daily", periodStart: model.windowStart, periodEnd: model.windowEnd,
+    methodVersion: model.methodVersion, provider: "geckoterminal", dataCutoff: model.generatedAt, model
+  }).written, true);
+  const frozen = store.saveBriefRun({
+    briefKey, kind: "daily", periodStart: model.windowStart, periodEnd: model.windowEnd,
+    methodVersion: model.methodVersion, provider: "geckoterminal", dataCutoff: model.generatedAt,
+    model: { ...model, feedCoverage: "not-revised" }
+  });
+  assert.equal(frozen.written, false);
+  assert.equal(frozen.run.model.feedCoverage, "unmeasured");
+  assert.equal(store.db.prepare("PRAGMA user_version").get().user_version, 800);
+  for (const index of ["alerts_dedupe_key", "events_event_key", "brief_runs_kind_period_end"]) {
+    assert.equal(store.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type='index' AND name=?").get(index).count, 1);
+  }
 });

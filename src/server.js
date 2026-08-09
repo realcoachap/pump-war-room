@@ -8,7 +8,7 @@ import { Store } from "./store.js";
 import { createDemoToken, tickDemoToken } from "./demo.js";
 import { PumpPortalIngestor } from "./ingest.js";
 import { BarkCalloutIngestor } from "./callouts.js";
-import { exportCoin, exportDaily } from "./vault.js";
+import { exportCoin, exportMeasuredBrief } from "./vault.js";
 import { analyzeSnapshot } from "./analyst.js";
 import { createRateLimiter, HttpError, readJsonBody } from "./http.js";
 import { createTop100 } from "./ranking.js";
@@ -24,6 +24,15 @@ import {
 } from "./risk-identity.js";
 import { attachRiskIdentityEvidence } from "./risk-public.js";
 import { normalizePersistedLiveToken } from "./live-token.js";
+import {
+  buildCoinComparison,
+  buildCoinTimeline,
+  buildMeasuredBrief,
+  detectMaterialAlerts,
+  sendTelegramAlert,
+  telegramAlertStatus,
+  telegramRetryPlan
+} from "./action-intelligence.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
@@ -33,6 +42,12 @@ const dbPath = path.resolve(root, process.env.DB_PATH || "data/pump-war-room.db"
 const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
 const startedAt = new Date().toISOString();
 const runtimeTelemetry = createRuntimeTelemetry({ version: appVersion, mode, startedAt });
+const configuredPublicBaseUrl = process.env.PUBLIC_BASE_URL;
+const publicBaseUrl = typeof configuredPublicBaseUrl === "string" && /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(configuredPublicBaseUrl)
+  ? configuredPublicBaseUrl
+  : "https://pump-war-room-production.up.railway.app";
+const publicMintPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const MATERIAL_BASELINE_EVENT_KEY = "material-baseline-v1";
 process.on("uncaughtExceptionMonitor", (error, origin) => runtimeTelemetry.error("process.uncaught_exception", error, { origin }));
 const store = new Store(dbPath);
 const storage = observeStorage({
@@ -60,6 +75,10 @@ let pumpPortalIngestor = null;
 let outcomeIngestor = null;
 let riskIdentityIngestor = null;
 let geckoTerminalClient = null;
+let telegramDeliveryTimer = null;
+let telegramDeliveryRunning = false;
+let telegramLastAttemptAt = 0;
+let briefBoundaryTimer = null;
 
 function feedObservation() {
   const telemetry = pumpPortalIngestor?.getStatus?.() || null;
@@ -88,6 +107,10 @@ function feedHealth() {
   return feedObservation().state;
 }
 
+function telegramHealth() {
+  return { ...telegramAlertStatus(), outbox: store.telegramDeliveryCoverage() };
+}
+
 function healthStatus(feed = feedObservation()) {
   if (mode === "live" && !storage.mountPointVerified) return "degraded";
   if (["live", "simulated"].includes(feed.state)) return "healthy";
@@ -101,44 +124,226 @@ const send = (kind, payload) => {
   for (const client of clients) client.write(chunk);
 };
 
-function alertFor(token, previous) {
-  let alert = null;
-  if (token.status === "migration-observed" && previous?.status !== "migration-observed") {
-    alert = { level: "hot", title: "Migration observed", message: `${token.symbol} appeared in the processed migration feed; finalization is unverified`, mint: token.mint };
-  } else if (token.status === "graduated" && previous?.status !== "graduated") {
-    alert = { level: "hot", title: "Graduated", message: `${token.symbol} reached migration`, mint: token.mint };
-  } else if (token.momentum >= 78 && (!previous || previous.momentum < 78)) {
-    alert = { level: "signal", title: "Velocity spike", message: `${token.symbol} momentum crossed ${token.momentum}`, mint: token.mint };
-  } else if (token.smartWallets >= 4 && (!previous || previous.smartWallets < 4)) {
-    alert = { level: "signal", title: "Wallet convergence", message: `${token.smartWallets} tracked wallets entered ${token.symbol}`, mint: token.mint };
-  } else if (Number.isFinite(token.risk) && token.risk >= 72 && (!previous || !Number.isFinite(previous.risk) || previous.risk < 72)) {
-    alert = { level: "risk", title: "Risk escalation", message: `${token.symbol} risk reached ${token.risk}`, mint: token.mint };
-  }
-  if (alert) {
-    const saved = store.addAlert(alert);
-    send("alert", saved);
-    maybeSendTelegram(saved).catch((error) => runtimeTelemetry.error("telegram.send_failed", error, { mint: saved.mint }));
+function radarScore(token) {
+  if (!token) return null;
+  const [entry] = createTop100([normalizePersistedLiveToken(token, { mode })], { mode });
+  return typeof entry?.score === "number" && Number.isFinite(entry.score) ? entry.score : null;
+}
+
+function scheduleTelegramDelivery(delayMs = 0) {
+  if (telegramAlertStatus().status !== "configured" || telegramDeliveryTimer !== null) return;
+  telegramDeliveryTimer = setTimeout(() => {
+    telegramDeliveryTimer = null;
+    void processTelegramOutbox();
+  }, Math.max(0, delayMs));
+  telegramDeliveryTimer.unref?.();
+}
+
+async function processTelegramOutbox() {
+  if (telegramDeliveryRunning || telegramAlertStatus().status !== "configured") return;
+  const [alert] = store.dueTelegramAlerts({ limit: 1 });
+  if (!alert) return;
+  const throttleMs = Math.max(0, 1_000 - (Date.now() - telegramLastAttemptAt));
+  if (throttleMs > 0) { scheduleTelegramDelivery(throttleMs); return; }
+  telegramDeliveryRunning = true;
+  const attemptedAt = new Date().toISOString();
+  try {
+    const result = await sendTelegramAlert(alert, {
+      token: process.env.TELEGRAM_BOT_TOKEN,
+      chatId: process.env.TELEGRAM_CHAT_ID,
+      baseUrl: publicBaseUrl
+    });
+    store.recordAlertTelegramAttempt(alert.id, "sent", { attemptedAt, messageId: result.messageId });
+    runtimeTelemetry.info("telegram.alert_sent", { alertId: alert.id, kind: alert.kind, mint: alert.mint });
+  } catch (error) {
+    const attemptCount = Number(alert.telegramAttemptCount || 0) + 1;
+    const retry = telegramRetryPlan(error, { attemptCount });
+    if (retry.retry) {
+      store.recordAlertTelegramAttempt(alert.id, "retrying", {
+        attemptedAt,
+        nextAttemptAt: retry.nextAttemptAt,
+        errorCode: retry.errorCode
+      });
+      runtimeTelemetry.warn(retry.errorCode === "rate-limited" ? "telegram.rate_limited" : "telegram.retry_scheduled", {
+        alertId: alert.id, kind: alert.kind, mint: alert.mint, errorCode: retry.errorCode, nextAttemptAt: retry.nextAttemptAt
+      });
+      scheduleTelegramDelivery(retry.delayMs);
+    } else {
+      try { store.recordAlertTelegramAttempt(alert.id, "dead-letter", { attemptedAt, errorCode: retry.errorCode }); } catch {}
+      runtimeTelemetry.error("telegram.send_failed", error, {
+        alertId: alert.id, kind: alert.kind, mint: alert.mint, errorCode: retry.errorCode, attempts: attemptCount
+      });
+    }
+  } finally {
+    telegramLastAttemptAt = Date.now();
+    telegramDeliveryRunning = false;
+    scheduleTelegramDelivery(1_000);
   }
 }
 
-async function maybeSendTelegram(alert) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
-  const text = `🏛️ Pump War Room — ${alert.title}\n${alert.message}\nhttps://pump.fun/coin/${alert.mint}`;
-  const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true })
+function maybeSendTelegram(alert) {
+  if (telegramAlertStatus().status !== "configured") return;
+  scheduleTelegramDelivery();
+}
+
+function publicAlert(alert) {
+  return {
+    level: alert.level,
+    title: alert.title,
+    message: alert.message,
+    mint: alert.mint,
+    kind: alert.kind,
+    evidenceClass: alert.evidenceClass,
+    evidenceAt: alert.evidenceAt,
+    createdAt: alert.createdAt
+  };
+}
+
+function broadcastMaterialAlerts(savedAlerts) {
+  for (const saved of savedAlerts) {
+    send("alert", publicAlert(saved));
+    send("material-change", { mint: saved.mint, kind: saved.kind, evidenceAt: saved.evidenceAt });
+    maybeSendTelegram(saved);
+  }
+}
+
+function priorRiskToken(token, events) {
+  const byFactor = new Map();
+  for (const event of events) {
+    const factor = event?.payload?.factor;
+    if (event?.kind === "risk-evidence" && typeof factor === "string" && !byFactor.has(factor)) byFactor.set(factor, event);
+  }
+  const envelope = (name, field) => {
+    const event = byFactor.get(name);
+    return event && typeof event.payload?.value === "number" && Number.isFinite(event.payload.value)
+      ? { evidenceClass: event.evidenceClass, [field]: event.payload.value,
+        providerUpdatedAt: event.occurredAt, fetchedAt: event.occurredAt, observedAt: event.occurredAt, calculatedAt: event.occurredAt }
+      : { evidenceClass: "unavailable", [field]: null };
+  };
+  return {
+    mint: token.mint,
+    riskIdentity: { factors: {
+      concentration: envelope("concentration", "top10Percentage"),
+      developer: envelope("developer-holding", "holdingPercentage"),
+      liquidity: envelope("pool-reserve", "liquidityUsd"),
+      identity: envelope("identity-reuse", "exactDuplicateCount"),
+      creatorHistory: envelope("creator-history", "observedLaunchCount")
+    } }
+  };
+}
+
+function evaluateRiskMateriality({ seedOnly = !store.hasIntelligenceEvent(MATERIAL_BASELINE_EVENT_KEY) } = {}) {
+  if (mode !== "live") return;
+  const riskStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 120 });
+  const baseTokens = riskStates.map(({ mint }) => store.token(mint)).filter((token) => token?.source === "pumpportal")
+    .map((token) => normalizePersistedLiveToken(token, { mode }));
+  const outcomeStates = baseTokens.map(({ mint }) => store.enrichmentState(mint)).filter(Boolean);
+  const currentTokens = attachRiskIdentityEvidence(baseTokens, {
+    mode,
+    riskStates,
+    outcomeStates,
+    tokenEvidenceRows: baseTokens
+  }).tokens;
+  const intelligenceEvents = [];
+  const materialAlerts = [];
+  for (const current of currentTokens) {
+    const existingEvents = store.eventsForMint(current.mint, 500);
+    const previous = priorRiskToken(current, existingEvents);
+    const previousRiskEvents = existingEvents.filter((event) => event.kind === "risk-evidence");
+    const factorEvents = [
+      {
+        name: "concentration", factor: current.riskIdentity?.factors?.concentration,
+        field: "top10Percentage", unit: "%", at: ["providerUpdatedAt", "fetchedAt"], evidenceClass: "provider-observed", source: "geckoterminal",
+        limitation: "Provider-reported top-10 share; custody exclusions are unpublished and the factor is uncalibrated."
+      },
+      {
+        name: "developer-holding", factor: current.riskIdentity?.factors?.developer,
+        field: "holdingPercentage", unit: "%", at: ["fetchedAt"], evidenceClass: "provider-observed", source: "geckoterminal",
+        limitation: "Provider-reported holding; developer identity is not independently verified and the factor is uncalibrated."
+      },
+      {
+        name: "pool-reserve", factor: current.riskIdentity?.factors?.liquidity,
+        field: "liquidityUsd", unit: " USD", at: ["observedAt"], evidenceClass: "provider-observed", source: "geckoterminal",
+        limitation: "Provider-observed pool reserve; this is not locked-liquidity or launch-time evidence."
+      },
+      {
+        name: "identity-reuse", factor: current.riskIdentity?.factors?.identity,
+        field: "exactDuplicateCount", unit: " other mints", at: ["calculatedAt"], evidenceClass: "locally-derived", source: "locally-derived",
+        limitation: "Exact declared-identifier reuse does not establish common control, fraud, maliciousness, or safety."
+      },
+      {
+        name: "creator-history", factor: current.riskIdentity?.factors?.creatorHistory,
+        field: "observedLaunchCount", unit: " observed launches", at: ["calculatedAt"], evidenceClass: "locally-derived", source: "locally-derived",
+        limitation: "Fixed prospective cohort count; not complete or all-time creator history."
+      }
+    ];
+    if (!seedOnly) materialAlerts.push(...detectMaterialAlerts({ current, previous: previousRiskEvents.length ? previous : null }));
+    for (const candidate of factorEvents) {
+      const value = candidate.factor?.[candidate.field];
+      const occurredAt = candidate.at.map((key) => candidate.factor?.[key]).find((item) => Number.isFinite(Date.parse(item)));
+      if (candidate.factor?.evidenceClass !== candidate.evidenceClass || typeof value !== "number" || !Number.isFinite(value) || !occurredAt) continue;
+      const previousEvent = previousRiskEvents.find((event) => event.payload?.factor === candidate.name);
+      if (previousEvent?.payload?.value === value) continue;
+      const normalizedAt = new Date(Date.parse(occurredAt)).toISOString();
+      intelligenceEvents.push({
+        kind: "risk-evidence",
+        mint: current.mint,
+        eventKey: `risk-evidence-v1:${candidate.name}:${current.mint}:${value}:${normalizedAt}`,
+        evidenceClass: candidate.evidenceClass,
+        occurredAt: normalizedAt,
+        payload: { mint: current.mint, factor: candidate.name, value, unit: candidate.unit, source: candidate.source, limitation: candidate.limitation }
+      });
+    }
+  }
+  if (seedOnly) {
+    const initializedAt = new Date().toISOString();
+    intelligenceEvents.push({
+      kind: "material-baseline",
+      mint: "system",
+      eventKey: MATERIAL_BASELINE_EVENT_KEY,
+      evidenceClass: "locally-derived",
+      occurredAt: initializedAt,
+      payload: {
+        mint: "system",
+        factor: "baseline",
+        value: "initialized",
+        unit: null,
+        source: "locally-derived",
+        limitation: "Existing retained factor state was seeded without manufacturing historical material-change alerts."
+      }
+    });
+  }
+  const committed = store.commitIntelligenceBatch({
+    events: intelligenceEvents,
+    alerts: materialAlerts,
+    queueTelegram: telegramAlertStatus().status === "configured"
   });
-  if (!response.ok) throw new Error(`Telegram send failed with HTTP ${response.status}`);
+  broadcastMaterialAlerts(committed.alerts);
+  return committed;
 }
 
 function upsert(token) {
   const previous = store.token(token.mint);
-  store.upsertToken(token); store.addEvent(previous ? "update" : "mint", token);
+  const candidates = mode === "live" ? detectMaterialAlerts({
+    current: normalizePersistedLiveToken(token, { mode }),
+    previous: previous ? normalizePersistedLiveToken(previous, { mode }) : null,
+    currentScore: radarScore(token),
+    previousScore: radarScore(previous)
+  }) : [];
+  const committed = store.upsertTokenWithAlerts(token, {
+    eventKind: previous ? "update" : "mint",
+    alerts: candidates,
+    queueTelegram: telegramAlertStatus().status === "configured"
+  });
   outcomeIngestor?.enqueue(token);
+  const priorRiskState = riskIdentityIngestor ? store.riskIdentityState(token.mint) : null;
   riskIdentityIngestor?.enqueue(token);
-  alertFor(token, previous); send(previous ? "token-update" : "new-token", token);
+  if (!priorRiskState && riskIdentityIngestor && store.riskIdentityState(token.mint)) {
+    try { evaluateRiskMateriality(); }
+    catch (error) { runtimeTelemetry.error("alerts.risk_admission_evaluation_failed", error, { mint: token.mint }); }
+  }
+  broadcastMaterialAlerts(committed.alerts);
+  send(previous ? "token-update" : "new-token", token);
 }
 
 function addCallout(callout) {
@@ -242,8 +447,75 @@ function snapshot() {
   const feed = feedObservation();
   const source = mode === "live" ? "pumpportal" : null;
   const countSince = (iso) => source ? store.countSinceBySource(iso, source) : store.countSince(iso);
+  const measuredBrief = (period) => {
+    const durationMs = period === "daily" ? 86_400_000 : 7 * 86_400_000;
+    const cutoff = new Date(generatedAt);
+    const todayUtc = Date.UTC(cutoff.getUTCFullYear(), cutoff.getUTCMonth(), cutoff.getUTCDate());
+    const periodEndMs = period === "daily" ? todayUtc
+      : todayUtc - ((cutoff.getUTCDay() + 6) % 7) * 86_400_000;
+    const periodEnd = new Date(periodEndMs).toISOString();
+    const periodStart = new Date(periodEndMs - durationMs).toISOString();
+    const existing = store.briefRun(period);
+    if (existing?.periodStart === periodStart && existing.periodEnd === periodEnd) return existing.model;
+    const activity = store.periodActivity({
+      start: periodStart,
+      end: periodEnd,
+      source: mode === "live" ? "pumpportal" : "demo"
+    });
+    const priorActivity = store.periodActivity({
+      start: new Date(periodEndMs - 2 * durationMs).toISOString(),
+      end: periodStart,
+      source: mode === "live" ? "pumpportal" : "demo"
+    });
+    const model = buildMeasuredBrief({
+      period,
+      now: generatedAt,
+      windowStart: periodStart,
+      windowEnd: periodEnd,
+      activity,
+      priorActivity,
+      outcomes: cohortOutcomes
+    });
+    return store.saveBriefRun({
+      briefKey: model.briefId,
+      kind: period,
+      periodStart,
+      periodEnd,
+      timezone: "UTC",
+      methodVersion: model.methodVersion,
+      provider: GECKOTERMINAL_PROVIDER.id,
+      dataCutoff: generatedAt,
+      model
+    }).run.model;
+  };
+  const actionIntelligence = {
+    schemaVersion: 1,
+    generatedAt,
+    watchlists: {
+      persistence: "browser-local",
+      maximumMints: 50,
+      sharedServerWatchlist: false,
+      reason: "No account or authentication boundary exists; preferences stay in the operator's browser."
+    },
+    alerts: {
+      schemaVersion: 1,
+      supportedKinds: [
+        "score-rise", "score-drop", "risk-concentration", "risk-developer-holding",
+        "risk-identity-reuse", "risk-creator-history", "migration-observed"
+      ],
+      deduplicatedPersistently: true,
+      persistence: "atomic-event-alert-outbox-with-durable-baseline",
+      publicDeliveryMetadata: "aggregate-only",
+      scoreChangeThreshold: 15,
+      riskFactorsAreUncalibrated: true,
+      telegram: telegramHealth()
+    },
+    timelines: { endpoint: "/api/coins/{mint}/timeline", defaultEntries: 50, maximumEntries: 200, cursorPagination: true, rawProviderPayloadsIncluded: false },
+    compare: { endpoint: "/api/compare?mints={mint},{mint}", minimumMints: 2, maximumMints: 4 },
+    briefs: { daily: measuredBrief("daily"), weekly: measuredBrief("weekly") }
+  };
   return {
-    version: appVersion, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage, telemetry: runtimeTelemetry.snapshot(),
+    version: appVersion, generatedAt, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage, telemetry: runtimeTelemetry.snapshot(),
     feedStatus, feedHealth: feed.state, feed, calloutStatus, lastEventAt, lastMintAt,
     liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
     demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
@@ -362,8 +634,77 @@ function snapshot() {
       summary: riskCohortView.summary,
       disclaimer: "Provider and feed observations can be incomplete, delayed, or wrong. Exact declared-identifier or registrable-domain reuse does not establish duplicate content, common control, maliciousness, safety, or a probability of harm."
     },
-    narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40)
+    actionIntelligence,
+    narratives, callouts: callouts.slice(0, 30), alerts: store.alerts(40).map(publicAlert)
   };
+}
+
+function coinDossier(mint, currentSnapshot) {
+  const storedToken = store.token(mint);
+  if (!storedToken) return null;
+  let token = currentSnapshot.tokens.find((candidate) => candidate.mint === mint) || null;
+  if (!token) {
+    const baseToken = normalizePersistedLiveToken(storedToken, { mode });
+    const riskStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+    const riskTokens = riskStates.map(({ mint: riskMint }) => store.token(riskMint))
+      .filter((candidate) => candidate?.source === "pumpportal")
+      .map((candidate) => normalizePersistedLiveToken(candidate, { mode }));
+    const outcomeStates = store.enrichmentStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
+    token = attachRiskIdentityEvidence([baseToken], {
+      mode,
+      riskStates,
+      outcomeStates,
+      tokenEvidenceRows: riskTokens,
+      generatedAt: currentSnapshot.generatedAt
+    }).tokens[0];
+  }
+  const enrichment = store.enrichmentState(mint);
+  const [entry] = createTop100([token], {
+    mode,
+    outcomesByMint: enrichment ? new Map([[mint, enrichment]]) : null
+  });
+  if (!entry) return null;
+  return {
+    schemaVersion: 1,
+    generatedAt: currentSnapshot.generatedAt,
+    token: entry.token,
+    radar: {
+      score: entry.score,
+      orderingBasis: entry.orderingBasis,
+      reasons: entry.reasons,
+      freshness: entry.freshness,
+      riskConfidence: entry.riskConfidence
+    },
+    outcome: entry.outcome,
+    timeline: `/api/coins/${mint}/timeline`,
+    scope: "bounded observations retained by this deployment; not a complete market or on-chain dossier",
+    disclaimer: "Observational research only; missing evidence stays unavailable and nothing here is financial advice."
+  };
+}
+
+function comparisonEntry(dossier) {
+  return {
+    token: dossier.token,
+    score: dossier.radar.score,
+    orderingBasis: dossier.radar.orderingBasis,
+    reasons: dossier.radar.reasons,
+    freshness: dossier.radar.freshness,
+    riskConfidence: dossier.radar.riskConfidence,
+    outcome: dossier.outcome
+  };
+}
+
+function scheduleBriefBoundary() {
+  if (briefBoundaryTimer !== null) return;
+  const now = new Date();
+  const nextBoundary = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 5);
+  briefBoundaryTimer = setTimeout(() => {
+    briefBoundaryTimer = null;
+    try { snapshot(); }
+    catch (error) { runtimeTelemetry.error("briefs.generation_failed", error); }
+    scheduleBriefBoundary();
+  }, Math.max(1_000, nextBoundary - Date.now()));
+  briefBoundaryTimer.unref?.();
 }
 
 if (mode === "live" && (process.env.OUTCOME_ENRICHMENT !== "false" || process.env.RISK_IDENTITY_ENRICHMENT !== "false")) {
@@ -397,6 +738,7 @@ if (mode === "live" && process.env.OUTCOME_ENRICHMENT !== "false") {
 }
 
 if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
+  evaluateRiskMateriality();
   riskIdentityIngestor = new RiskIdentityIngestor({
     store,
     client: geckoTerminalClient,
@@ -405,6 +747,10 @@ if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
       if (telemetry.error) runtimeTelemetry.error("risk_identity.worker_failed", telemetry.error, details);
       else if (["degraded", "rate-limited", "invalid-response"].includes(status)) runtimeTelemetry.warn("risk_identity.status", details);
       else if (["available", "unavailable"].includes(status)) runtimeTelemetry.info("risk_identity.status", details);
+      if (status === "available" && telemetry.mint) {
+        try { evaluateRiskMateriality(); }
+        catch (error) { runtimeTelemetry.error("alerts.risk_evaluation_failed", error, details); }
+      }
     }
   });
   const cohortTokens = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 120 })
@@ -418,6 +764,10 @@ if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
       limit: 120
     })) riskIdentityIngestor.enqueue(token);
   }, 60_000).unref();
+  setInterval(() => {
+    try { evaluateRiskMateriality(); }
+    catch (error) { runtimeTelemetry.error("alerts.risk_recovery_evaluation_failed", error); }
+  }, 300_000).unref();
 }
 
 if (process.env.BARK_API_KEY) {
@@ -493,6 +843,14 @@ if (mode === "demo") {
   ingestor.connect();
 }
 
+if (telegramAlertStatus().status === "configured") {
+  scheduleTelegramDelivery(1_000);
+  setInterval(() => scheduleTelegramDelivery(), 30_000).unref();
+}
+
+snapshot();
+scheduleBriefBoundary();
+
 const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml" };
 const server = http.createServer(async (req, res) => {
   const requestId = randomUUID();
@@ -503,6 +861,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.pathname === "/api/health") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
       const feed = feedObservation();
       const status = healthStatus(feed);
       return json(res, status === "healthy" ? 200 : 503, {
@@ -517,10 +876,99 @@ const server = http.createServer(async (req, res) => {
       outcomes: outcomeIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
       outcomeCoverage: store.outcomeCoverage({ provider: GECKOTERMINAL_PROVIDER.id }),
       riskIntelligence: riskIdentityIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
-      riskIdentityCoverage: store.riskIdentityCoverage({ provider: GECKOTERMINAL_PROVIDER.id })
+      riskIdentityCoverage: store.riskIdentityCoverage({ provider: GECKOTERMINAL_PROVIDER.id }),
+      actionIntelligence: {
+        schemaVersion: 1,
+        watchlistPersistence: "browser-local",
+        alertDedupe: "persistent",
+        materialPersistence: "atomic-with-durable-baseline",
+        telegram: telegramHealth()
+      }
     });
     }
-    if (url.pathname === "/api/snapshot") return json(res, 200, snapshot());
+    if (url.pathname === "/api/snapshot") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      return json(res, 200, snapshot());
+    }
+    if (url.pathname.startsWith("/api/coins/") && url.pathname.endsWith("/timeline")) {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      if ([...url.searchParams.keys()].some((key) => !["limit", "before"].includes(key))
+        || url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("before").length > 1) {
+        throw new HttpError(400, "Timeline supports only one limit and one before cursor");
+      }
+      const limitText = url.searchParams.get("limit");
+      const limit = limitText === null ? 50 : Number(limitText);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || String(limit) !== limitText) {
+        throw new HttpError(400, "Timeline limit must be an integer between 1 and 200");
+      }
+      const before = url.searchParams.get("before");
+      const encodedMint = url.pathname.slice("/api/coins/".length, -"/timeline".length).replace(/\/$/, "");
+      let mint;
+      try { mint = decodeURIComponent(encodedMint); } catch { throw new HttpError(400, "Mint path is invalid"); }
+      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
+      const storedToken = store.token(mint);
+      if (!storedToken) return json(res, 404, { ok: false, error: "Coin was not observed by this deployment", requestId });
+      const currentSnapshot = snapshot();
+      const token = currentSnapshot.tokens.find((candidate) => candidate.mint === mint) || normalizePersistedLiveToken(storedToken, { mode });
+      const enrichment = store.enrichmentState(mint);
+      let outcome = null;
+      try {
+        if (enrichment?.evidence?.outcome) outcome = { mint, ...validateProviderObservedOutcome(enrichment.evidence.outcome, { requireProspectiveSelection: true }) };
+      } catch {}
+      try {
+        return json(res, 200, buildCoinTimeline({
+          mint,
+          token,
+          events: store.eventsForMint(mint, 500),
+          alerts: store.alertsForMint(mint, 200),
+          callouts: store.calloutsForMint(mint, 200),
+          outcome,
+          generatedAt: currentSnapshot.generatedAt,
+          limit,
+          before
+        }));
+      } catch (error) {
+        if (error instanceof TypeError || error instanceof RangeError) throw new HttpError(400, error.message);
+        throw error;
+      }
+    }
+    if (url.pathname.startsWith("/api/coins/")) {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      const encodedMint = url.pathname.slice("/api/coins/".length);
+      if (!encodedMint || encodedMint.includes("/")) throw new HttpError(404, "Coin endpoint not found");
+      let mint;
+      try { mint = decodeURIComponent(encodedMint); } catch { throw new HttpError(400, "Mint path is invalid"); }
+      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
+      const currentSnapshot = snapshot();
+      const dossier = coinDossier(mint, currentSnapshot);
+      if (!dossier) return json(res, 404, { ok: false, error: "Coin was not observed inside the public live-evidence contract", requestId });
+      return json(res, 200, dossier);
+    }
+    if (url.pathname === "/api/compare") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      if ([...url.searchParams.keys()].some((key) => key !== "mints") || url.searchParams.getAll("mints").length !== 1) {
+        throw new HttpError(400, "Compare requires one mints query parameter");
+      }
+      const mints = String(url.searchParams.get("mints") || "").split(",").map((value) => value.trim()).filter(Boolean);
+      if (mints.length < 2 || mints.length > 4 || mints.some((mint) => !publicMintPattern.test(mint)) || new Set(mints).size !== mints.length) {
+        throw new HttpError(400, "Compare requires 2 to 4 unique Solana base58 mints");
+      }
+      const currentSnapshot = snapshot();
+      const knownTokens = new Set(currentSnapshot.tokens.map((token) => token.mint));
+      const knownEntries = new Set(currentSnapshot.leaderboard.top100.map((entry) => entry.token?.mint));
+      for (const mint of mints) {
+        const dossier = coinDossier(mint, currentSnapshot);
+        if (!dossier) continue;
+        if (!knownTokens.has(mint)) currentSnapshot.tokens.push(dossier.token);
+        if (!knownEntries.has(mint)) currentSnapshot.leaderboard.top100.push(comparisonEntry(dossier));
+      }
+      return json(res, 200, buildCoinComparison({ mints, snapshot: currentSnapshot }));
+    }
+    if (url.pathname === "/api/briefs/daily" || url.pathname === "/api/briefs/weekly") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      const period = url.pathname.endsWith("/weekly") ? "weekly" : "daily";
+      return json(res, 200, snapshot().actionIntelligence.briefs[period]);
+    }
     if (url.pathname === "/api/agent/chat") {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
       const rate = checkAgentRate(req.socket.remoteAddress || "unknown");
@@ -545,13 +993,22 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (url.pathname === "/api/stream") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-content-type-options": "nosniff", connection: "keep-alive" });
       res.write(`event: ready\ndata: ${JSON.stringify({ mode, feedStatus })}\n\n`); clients.add(res);
       req.on("close", () => clients.delete(res)); return;
     }
-    if (req.method === "POST" && url.pathname === "/api/export/daily") { await exportDaily(vaultPath, snapshot()); return json(res, 200, { ok: true }); }
-    if (req.method === "POST" && url.pathname.startsWith("/api/export/coin/")) {
-      const mint = decodeURIComponent(url.pathname.split("/").pop());
+    if (url.pathname === "/api/export/daily" || url.pathname === "/api/export/weekly") {
+      if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
+      const period = url.pathname.endsWith("weekly") ? "weekly" : "daily";
+      await exportMeasuredBrief(vaultPath, snapshot().actionIntelligence.briefs[period]);
+      return json(res, 200, { ok: true, period });
+    }
+    if (url.pathname.startsWith("/api/export/coin/")) {
+      if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
+      let mint;
+      try { mint = decodeURIComponent(url.pathname.split("/").pop()); } catch { throw new HttpError(400, "Mint path is invalid"); }
+      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
       const token = snapshot().tokens.find((candidate) => candidate.mint === mint);
       if (!token) return json(res, 404, { error: "Token not found" });
       await exportCoin(vaultPath, token); return json(res, 200, { ok: true });

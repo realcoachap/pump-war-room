@@ -4,35 +4,37 @@ mint: "u8EJAQj1XykLYxK6QpmggiouHoD7HWhbje3kGupump"
 symbol: "NAPE"
 created: "2026-08-08T19:55:12.800Z"
 updated: "2026-08-08T19:59:26.951Z"
-status: "graduated"
+status: "migration-observed"
 narrative: "AI agents"
 momentum_score: 80
-risk_score: 39
+risk_score: null
+risk_evidence: "synthetic"
 market_cap_usd: 61359
-bonding_progress: 100
+bonding_progress: null
+virtual_sol_reserve: null
 ---
 
 # Neural Ape (NAPE)
 
-> Read-only research note. Scores are heuristics, not investment advice.
+> Synthetic read-only example, not investment advice, a safety claim, or live provider evidence.
 
 ## Snapshot
 
 - **Contract:** `u8EJAQj1XykLYxK6QpmggiouHoD7HWhbje3kGupump`
 - **Creator:** `mDz4nj2HXeBnCzY2hLvofJ1Q5h3Dg5X95LgBn2pump`
-- **Status:** graduated
+- **Status:** migration-observed (synthetic example; finalization unverified)
 - **Narrative:** [[AI agents]]
 - **Market cap:** $61,359
 - **5m volume:** $26,736
-- **Bonding curve:** 100%
+- **Virtual SOL reserve:** unknown (not curve progress or migration proof)
 - **Pump.fun:** https://pump.fun/coin/u8EJAQj1XykLYxK6QpmggiouHoD7HWhbje3kGupump
 - **DEX Screener:** https://dexscreener.com/solana/u8EJAQj1XykLYxK6QpmggiouHoD7HWhbje3kGupump
 
 ## Signal explanation
 
-**Momentum 80/100:** 5m volume acceleration, buyer breadth, near graduation.
+**Momentum 80/100 (synthetic):** demonstration-only numeric inputs.
 
-**Risk 39/100:** elevated dev holdings, holder concentration.
+**Risk probability withheld (synthetic evidence):** no calibrated or provider-observed risk probability is available.
 
 ## Research timeline
 

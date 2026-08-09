@@ -3,12 +3,55 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 
-const version = "0.7.2";
+const version = "0.8.0";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
   missingReasons: {}, hitRatePct: null, medianReturnPct: null, maximumDrawdownPct: null
 }]));
+
+function measuredBrief(period) {
+  const duration = period === "weekly" ? 7 * 86_400_000 : 86_400_000;
+  const end = "2026-08-08T00:00:00.000Z";
+  const start = new Date(Date.parse(end) - duration).toISOString();
+  const priorStart = new Date(Date.parse(start) - duration).toISOString();
+  const windows = Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
+    status: "insufficient-evidence", eligibleCount: 0, evidenceCount: 0, missingCount: 0,
+    coverageRatio: null, hitRatePct: null, medianReturnPct: null, maximumDrawdownPct: null
+  }]));
+  const activity = {
+    launchesObserved: 0, migrationObservations: 0, materialAlerts: 0, materialByKind: {},
+    factorEventsByEvidenceClass: {}, telegramDelivery: {}, deduplicatedSuppressed: null,
+    thirdPartyCallouts: 0, cohortAdmissions: { outcome: 0, risk: 0 },
+    cohortDrops: { outcome: null, risk: null, reason: "unavailable" }
+  };
+  return {
+    schemaVersion: 1, methodVersion: "measured-closed-brief-v1",
+    briefId: `measured-closed-brief-v1:${period}:${start}:${end}:UTC`, period,
+    generatedAt: "2026-08-08T12:00:00.000Z", windowStart: start, windowEnd: end, timezone: "UTC",
+    feedCoverage: "unmeasured", source: "pumpportal observations plus GeckoTerminal completed-candle outcomes",
+    universe: "closed-period deployment-local activity", activity,
+    outcomes: { minimumEvidence: 3, minimumCoverageRatio: 0.5, windows },
+    priorPeriod: {
+      windowStart: priorStart, windowEnd: start, activity,
+      outcomes: { minimumEvidence: 3, minimumCoverageRatio: 0.5, windows },
+      comparisonRule: "both denominators visible"
+    },
+    rawProviderPayloadsIncluded: false, disclaimer: "Observational research only"
+  };
+}
+
+function actionHealth() {
+  return {
+    schemaVersion: 1, watchlistPersistence: "browser-local", alertDedupe: "persistent",
+    materialPersistence: "atomic-with-durable-baseline",
+    telegram: {
+      status: "not-configured", tokenConfigured: false, chatConfigured: false,
+      delivery: "restart-safe-bounded-at-least-once-material-alerts-only", paidBroadcastsRequired: false,
+      outbox: { total: 0, statusCounts: {} }
+    }
+  };
+}
 
 const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
@@ -82,6 +125,7 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
       telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
+      actionIntelligence: actionHealth(),
       outcomes: {
         source: "geckoterminal", status: "observing", queueDepth: 2,
         lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 30,
@@ -142,6 +186,25 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         summary: { windows: outcomeWindows() },
         cohorts: { narrative: { cohorts: [] }, lifecycle: { cohorts: [] } }
       },
+      actionIntelligence: {
+        schemaVersion: 1,
+        watchlists: { persistence: "browser-local", maximumMints: 50, sharedServerWatchlist: false, reason: "No account boundary" },
+        alerts: {
+          schemaVersion: 1,
+          supportedKinds: ["score-rise", "score-drop", "risk-concentration", "risk-developer-holding", "risk-identity-reuse", "risk-creator-history", "migration-observed"],
+          deduplicatedPersistently: true,
+          persistence: "atomic-event-alert-outbox-with-durable-baseline", publicDeliveryMetadata: "aggregate-only",
+          scoreChangeThreshold: 15, riskFactorsAreUncalibrated: true,
+          telegram: {
+            status: "not-configured", tokenConfigured: false, chatConfigured: false,
+            delivery: "restart-safe-bounded-at-least-once-material-alerts-only", paidBroadcastsRequired: false,
+            outbox: { total: 0, statusCounts: {} }
+          }
+        },
+        timelines: { endpoint: "/api/coins/{mint}/timeline", defaultEntries: 50, maximumEntries: 200, cursorPagination: true, rawProviderPayloadsIncluded: false },
+        compare: { endpoint: "/api/compare?mints={mint},{mint}", minimumMints: 2, maximumMints: 4 },
+        briefs: { daily: measuredBrief("daily"), weekly: measuredBrief("weekly") }
+      },
       riskIntelligence: {
         schemaVersion: 1,
         engine: { schemaVersion: 1, source: "geckoterminal", status: "available", queueDepth: 0 },
@@ -162,11 +225,32 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         summary: { totalTracked: 120 }
       }
     }),
-    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section>`,
-    "/app.js": "function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO",
-    "/styles.css": ".outcome-source,footer{font-size:10px}.risk-intelligence-source{}",
-    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control</p>",
-    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes</p>"
+    [`/api/coins/${cohortMint(0)}`]: JSON.stringify({
+      schemaVersion: 1, generatedAt: "2026-08-08T12:00:00.000Z", token: { mint: cohortMint(0), symbol: "T1" },
+      radar: { score: null, orderingBasis: "recency", reasons: [], freshness: { state: "fresh" }, riskConfidence: "unavailable" },
+      outcome: { windows: {} }, timeline: `/api/coins/${cohortMint(0)}/timeline`, scope: "bounded", disclaimer: "observational"
+    }),
+    [`/api/coins/${cohortMint(0)}/timeline?limit=2`]: JSON.stringify({
+      schemaVersion: 1, mint: cohortMint(0), generatedAt: "2026-08-08T12:00:00.000Z", limit: 2,
+      entries: [], nextBefore: null, historyAvailableSince: "2026-08-08T11:45:00.000Z",
+      scope: "bounded", rawProviderPayloadsIncluded: false
+    }),
+    [`/api/compare?mints=${encodeURIComponent(`${cohortMint(0)},${cohortMint(1)}`)}`]: JSON.stringify({
+      schemaVersion: 1, generatedAt: "2026-08-08T12:00:00.000Z", requestedMints: [cohortMint(0), cohortMint(1)],
+      missingMints: [], coins: [
+        { mint: cohortMint(0), riskEvidence: "unavailable", outcomes: {} },
+        { mint: cohortMint(1), riskEvidence: "unavailable", outcomes: {} }
+      ],
+      rankingBoundary: "uncalibrated risk factors do not affect radar rank", disclaimer: "observational"
+    }),
+    "/api/briefs/daily": JSON.stringify(measuredBrief("daily")),
+    "/api/briefs/weekly": JSON.stringify(measuredBrief("weekly")),
+    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section>`,
+    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} fetch('/api/compare?mints='); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO",
+    "/preferences.js": "export const WATCHLIST_LIMIT = 50; export const PRESET_LIMIT = 12; export function normalizePreferences() {}",
+    "/styles.css": ".outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}",
+    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p>",
+    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p>"
   };
   for (const [pathname, override] of Object.entries(overrides)) {
     bodies[pathname] = typeof override === "function" ? override(bodies[pathname]) : override;
@@ -201,8 +285,14 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   const baseUrl = await fixture(t);
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
   assert.equal(result.ok, true);
-  assert.deepEqual(result.http, { health: 200, snapshot: 200, html: 200, appJs: 200, styles: 200, terms: 200, privacy: 200 });
-  assert.deepEqual(result.markers, { version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true, parserRevision: true, legalNotices: true });
+  assert.deepEqual(result.http, {
+    health: 200, snapshot: 200, html: 200, appJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
+    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200
+  });
+  assert.deepEqual(result.markers, {
+    version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
+    actionableIntelligence: true, parserRevision: true, legalNotices: true
+  });
 });
 
 test("fails when the current parser revision marker is absent", async (t) => {
@@ -368,6 +458,7 @@ test("fails when the live outcome provider has no successful refresh", async (t)
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
       telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
+      actionIntelligence: actionHealth(),
       outcomes: { source: "geckoterminal", status: "degraded", queueDepth: 2, lastSuccessAt: null, counters: { attempts: 2, successes: 0, consecutiveFailures: 2 } }
     })
   });
@@ -387,6 +478,7 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
     storage: { mountPointVerified: true },
     feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
     telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
+    actionIntelligence: actionHealth(),
     outcomes: {
       source: "geckoterminal", status: "idle", queueDepth: 0,
       lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 3_600,

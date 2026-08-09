@@ -23,12 +23,21 @@ import { Store, STORE_SCHEMA_VERSION } from "./store.js";
 
 const LEGACY_SCHEMA_VERSION = 501;
 const OUTCOME_SCHEMA_VERSION = 600;
+const RISK_SCHEMA_VERSION = 700;
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
-  events: Object.freeze(["id", "kind", "mint", "payload", "created_at"]),
-  alerts: Object.freeze(["id", "level", "title", "message", "mint", "created_at"]),
+  events: Object.freeze(["id", "kind", "mint", "payload", "event_key", "evidence_class", "occurred_at", "created_at"]),
+  alerts: Object.freeze([
+    "id", "level", "title", "message", "mint", "kind", "evidence_class", "evidence_at", "dedupe_key",
+    "telegram_status", "telegram_attempted_at", "telegram_message_id", "telegram_attempt_count",
+    "telegram_next_attempt_at", "telegram_last_error_code", "created_at"
+  ]),
   callouts: Object.freeze(["external_id", "mint", "payload", "created_at"]),
+  brief_runs: Object.freeze([
+    "brief_key", "kind", "period_start", "period_end", "timezone", "method_version", "provider",
+    "data_cutoff", "model", "created_at"
+  ]),
   outcome_enrichment: Object.freeze([
     "mint", "provider", "pool", "token_side", "dex", "source_url", "evidence", "status", "missing_reason", "error_code",
     "attempt_count", "last_attempt_at", "next_attempt_at", "last_success_at", "updated_at"
@@ -41,9 +50,21 @@ export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
 
 const REQUIRED_COLUMN_TYPES = Object.freeze({
   tokens: Object.freeze({ mint: "TEXT", payload: "TEXT", created_at: "TEXT", updated_at: "TEXT" }),
-  events: Object.freeze({ id: "INTEGER", kind: "TEXT", mint: "TEXT", payload: "TEXT", created_at: "TEXT" }),
-  alerts: Object.freeze({ id: "INTEGER", level: "TEXT", title: "TEXT", message: "TEXT", mint: "TEXT", created_at: "TEXT" }),
+  events: Object.freeze({
+    id: "INTEGER", kind: "TEXT", mint: "TEXT", payload: "TEXT", event_key: "TEXT",
+    evidence_class: "TEXT", occurred_at: "TEXT", created_at: "TEXT"
+  }),
+  alerts: Object.freeze({
+    id: "INTEGER", level: "TEXT", title: "TEXT", message: "TEXT", mint: "TEXT", kind: "TEXT",
+    evidence_class: "TEXT", evidence_at: "TEXT", dedupe_key: "TEXT", telegram_status: "TEXT",
+    telegram_attempted_at: "TEXT", telegram_message_id: "INTEGER", telegram_attempt_count: "INTEGER",
+    telegram_next_attempt_at: "TEXT", telegram_last_error_code: "TEXT", created_at: "TEXT"
+  }),
   callouts: Object.freeze({ external_id: "TEXT", mint: "TEXT", payload: "TEXT", created_at: "TEXT" }),
+  brief_runs: Object.freeze({
+    brief_key: "TEXT", kind: "TEXT", period_start: "TEXT", period_end: "TEXT", timezone: "TEXT",
+    method_version: "TEXT", provider: "TEXT", data_cutoff: "TEXT", model: "TEXT", created_at: "TEXT"
+  }),
   outcome_enrichment: Object.freeze({
     mint: "TEXT", provider: "TEXT", pool: "TEXT", token_side: "TEXT", dex: "TEXT", source_url: "TEXT",
     evidence: "TEXT", status: "TEXT", missing_reason: "TEXT", error_code: "TEXT", attempt_count: "INTEGER",
@@ -60,15 +81,20 @@ const REQUIRED_PRIMARY_KEYS = Object.freeze({
   events: Object.freeze(["id"]),
   alerts: Object.freeze(["id"]),
   callouts: Object.freeze(["external_id"]),
+  brief_runs: Object.freeze(["brief_key"]),
   outcome_enrichment: Object.freeze(["mint"]),
   risk_identity_enrichment: Object.freeze(["mint"])
 });
 
 const REQUIRED_NOT_NULL = Object.freeze({
   tokens: Object.freeze(["payload", "created_at", "updated_at"]),
-  events: Object.freeze(["kind", "payload", "created_at"]),
-  alerts: Object.freeze(["level", "title", "message", "created_at"]),
+  events: Object.freeze(["kind", "payload", "evidence_class", "created_at"]),
+  alerts: Object.freeze(["level", "title", "message", "kind", "evidence_class", "telegram_attempt_count", "created_at"]),
   callouts: Object.freeze(["mint", "payload", "created_at"]),
+  brief_runs: Object.freeze([
+    "brief_key", "kind", "period_start", "period_end", "timezone", "method_version", "provider",
+    "data_cutoff", "model", "created_at"
+  ]),
   outcome_enrichment: Object.freeze(["mint", "evidence", "status", "attempt_count", "updated_at"]),
   risk_identity_enrichment: Object.freeze(["mint", "provider", "evidence", "status", "attempt_count", "updated_at"])
 });
@@ -76,9 +102,39 @@ const REQUIRED_NOT_NULL = Object.freeze({
 const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
   Object.freeze({
     type: "index",
+    name: "alerts_dedupe_key",
+    tableName: "alerts",
+    sql: "CREATE UNIQUE INDEX alerts_dedupe_key ON alerts(dedupe_key) WHERE dedupe_key IS NOT NULL"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "alerts_mint_created",
+    tableName: "alerts",
+    sql: "CREATE INDEX alerts_mint_created ON alerts(mint, created_at DESC)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "brief_runs_kind_period_end",
+    tableName: "brief_runs",
+    sql: "CREATE INDEX brief_runs_kind_period_end ON brief_runs(kind, period_end DESC)"
+  }),
+  Object.freeze({
+    type: "index",
     name: "callouts_mint_created",
     tableName: "callouts",
     sql: "CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC)"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "events_event_key",
+    tableName: "events",
+    sql: "CREATE UNIQUE INDEX events_event_key ON events(event_key) WHERE event_key IS NOT NULL"
+  }),
+  Object.freeze({
+    type: "index",
+    name: "events_mint_created",
+    tableName: "events",
+    sql: "CREATE INDEX events_mint_created ON events(mint, created_at DESC)"
   }),
   Object.freeze({
     type: "index",
@@ -108,7 +164,23 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     type: "table",
     name: "alerts",
     tableName: "alerts",
-    sql: "CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL)"
+    sql: `CREATE TABLE alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT,
+      kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
+      dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
+      telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
+      created_at TEXT NOT NULL
+    )`
+  }),
+  Object.freeze({
+    type: "table",
+    name: "brief_runs",
+    tableName: "brief_runs",
+    sql: `CREATE TABLE brief_runs (
+      brief_key TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL,
+      timezone TEXT NOT NULL, method_version TEXT NOT NULL, provider TEXT NOT NULL, data_cutoff TEXT NOT NULL,
+      model TEXT NOT NULL CHECK(json_valid(model) AND json_type(model) = 'object'), created_at TEXT NOT NULL
+    )`
   }),
   Object.freeze({
     type: "table",
@@ -120,7 +192,10 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     type: "table",
     name: "events",
     tableName: "events",
-    sql: "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL)"
+    sql: `CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL,
+      event_key TEXT, evidence_class TEXT NOT NULL DEFAULT 'unavailable', occurred_at TEXT, created_at TEXT NOT NULL
+    )`
   }),
   Object.freeze({
     type: "table",
@@ -155,10 +230,29 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
   })
 ]);
 
+const RISK_DATABASE_SCHEMA = Object.freeze({
+  tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
+  events: Object.freeze(["id", "kind", "mint", "payload", "created_at"]),
+  alerts: Object.freeze(["id", "level", "title", "message", "mint", "created_at"]),
+  callouts: Object.freeze(["external_id", "mint", "payload", "created_at"]),
+  outcome_enrichment: REQUIRED_DATABASE_SCHEMA.outcome_enrichment,
+  risk_identity_enrichment: REQUIRED_DATABASE_SCHEMA.risk_identity_enrichment
+});
+const RISK_SCHEMA_OBJECTS = Object.freeze([
+  Object.freeze({ type: "index", name: "callouts_mint_created", tableName: "callouts", sql: "CREATE INDEX callouts_mint_created ON callouts(mint, created_at DESC)" }),
+  Object.freeze({ type: "index", name: "outcome_enrichment_provider_due", tableName: "outcome_enrichment", sql: "CREATE INDEX outcome_enrichment_provider_due ON outcome_enrichment(provider, next_attempt_at, mint)" }),
+  Object.freeze({ type: "index", name: "outcome_enrichment_provider_status_updated", tableName: "outcome_enrichment", sql: "CREATE INDEX outcome_enrichment_provider_status_updated ON outcome_enrichment(provider, status, updated_at DESC, mint)" }),
+  Object.freeze({ type: "index", name: "risk_identity_provider_due", tableName: "risk_identity_enrichment", sql: "CREATE INDEX risk_identity_provider_due ON risk_identity_enrichment(provider, next_attempt_at, mint)" }),
+  Object.freeze({ type: "index", name: "risk_identity_provider_status_updated", tableName: "risk_identity_enrichment", sql: "CREATE INDEX risk_identity_provider_status_updated ON risk_identity_enrichment(provider, status, updated_at DESC, mint)" }),
+  Object.freeze({ type: "table", name: "alerts", tableName: "alerts", sql: "CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL)" }),
+  Object.freeze({ type: "table", name: "callouts", tableName: "callouts", sql: "CREATE TABLE callouts (external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL)" }),
+  Object.freeze({ type: "table", name: "events", tableName: "events", sql: "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL)" }),
+  ...EXPECTED_SCHEMA_OBJECTS.filter(({ type, tableName }) => type === "table" && ["outcome_enrichment", "risk_identity_enrichment", "tokens"].includes(tableName))
+]);
 const OUTCOME_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
-  Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => table !== "risk_identity_enrichment")
+  Object.entries(RISK_DATABASE_SCHEMA).filter(([table]) => table !== "risk_identity_enrichment")
 ));
-const OUTCOME_SCHEMA_OBJECTS = Object.freeze(EXPECTED_SCHEMA_OBJECTS.filter(({ tableName }) => tableName !== "risk_identity_enrichment"));
+const OUTCOME_SCHEMA_OBJECTS = Object.freeze(RISK_SCHEMA_OBJECTS.filter(({ tableName }) => tableName !== "risk_identity_enrichment"));
 const LEGACY_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
   Object.entries(OUTCOME_DATABASE_SCHEMA).filter(([table]) => table !== "outcome_enrichment")
 ));
@@ -250,8 +344,15 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const userVersion = Number(database.prepare("PRAGMA user_version").get().user_version);
   const legacy = allowLegacy && userVersion === LEGACY_SCHEMA_VERSION;
   const outcomeOnly = allowLegacy && userVersion === OUTCOME_SCHEMA_VERSION;
-  const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA : outcomeOnly ? OUTCOME_DATABASE_SCHEMA : REQUIRED_DATABASE_SCHEMA;
-  const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS : outcomeOnly ? OUTCOME_SCHEMA_OBJECTS : EXPECTED_SCHEMA_OBJECTS;
+  const riskOnly = allowLegacy && userVersion === RISK_SCHEMA_VERSION;
+  const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA
+    : outcomeOnly ? OUTCOME_DATABASE_SCHEMA
+      : riskOnly ? RISK_DATABASE_SCHEMA
+        : REQUIRED_DATABASE_SCHEMA;
+  const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS
+    : outcomeOnly ? OUTCOME_SCHEMA_OBJECTS
+      : riskOnly ? RISK_SCHEMA_OBJECTS
+        : EXPECTED_SCHEMA_OBJECTS;
   const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(({ name }) => name);
   const rowCounts = {};
   for (const [table, requiredColumns] of Object.entries(requiredSchema)) {
@@ -274,7 +375,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     if (JSON.stringify(primaryKey) !== JSON.stringify(REQUIRED_PRIMARY_KEYS[table])) {
       fail(`Database table ${table} has an incompatible primary key`);
     }
-    const nullableColumns = REQUIRED_NOT_NULL[table].filter((required) => {
+    const nullableColumns = REQUIRED_NOT_NULL[table].filter((required) => requiredColumns.includes(required)).filter((required) => {
       const column = tableInfo.find(({ name }) => name === required);
       return !column?.notnull;
     });
@@ -296,13 +397,14 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   if (JSON.stringify(normalizedSchema) !== JSON.stringify(normalizedExpectedSchema)) {
     fail("Database schema objects do not exactly match the supported Pump War Room schema");
   }
-  if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION].includes(userVersion))) {
+  if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION].includes(userVersion))) {
     fail(`Database schema version ${userVersion} does not match required version ${STORE_SCHEMA_VERSION}`);
   }
   const jsonColumns = {
     tokens: "payload", events: "payload", callouts: "payload",
     ...(legacy ? {} : { outcome_enrichment: "evidence" }),
-    ...(legacy || outcomeOnly ? {} : { risk_identity_enrichment: "evidence" })
+    ...(legacy || outcomeOnly ? {} : { risk_identity_enrichment: "evidence" }),
+    ...(legacy || outcomeOnly || riskOnly ? {} : { brief_runs: "model" })
   };
   const invalidJsonPayloads = Object.fromEntries(Object.entries(jsonColumns).map(([table, column]) => [
     table,
@@ -360,10 +462,14 @@ function verifyApplicationWrites(databasePath) {
     database.prepare(`INSERT INTO tokens (mint,payload,created_at,updated_at)
       VALUES (?,?,?,?) ON CONFLICT(mint) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`)
       .run(mint, payload, createdAt, createdAt);
-    database.prepare("INSERT INTO events (kind,mint,payload,created_at) VALUES (?,?,?,?)")
-      .run("restore-verification", mint, payload, createdAt);
-    database.prepare("INSERT INTO alerts (level,title,message,mint,created_at) VALUES (?,?,?,?,?)")
-      .run("verification", "Restore probe", "Disposable write check", mint, createdAt);
+    database.prepare(`INSERT INTO events
+      (kind,mint,payload,event_key,evidence_class,occurred_at,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run("restore-verification", mint, payload, `restore-event-${suffix}`, "unavailable", createdAt, createdAt);
+    database.prepare(`INSERT INTO alerts
+      (level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run("verification", "Restore probe", "Disposable write check", mint, "restore-verification", "unavailable",
+        createdAt, `restore-alert-${suffix}`, "pending", createdAt);
     database.prepare(`INSERT INTO callouts (external_id,mint,payload,created_at)
       VALUES (?,?,?,?) ON CONFLICT(external_id) DO UPDATE SET payload=excluded.payload`)
       .run(externalId, mint, payload, createdAt);
@@ -376,6 +482,12 @@ function verifyApplicationWrites(databasePath) {
       (mint,provider,evidence,status,missing_reason,error_code,attempt_count,last_attempt_at,next_attempt_at,last_success_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
       .run(mint, "restore-probe", JSON.stringify({ source: "restore-verification" }), "available", null, null, 1, createdAt, null, createdAt, createdAt);
+    database.prepare(`INSERT INTO brief_runs
+      (brief_key,kind,period_start,period_end,timezone,method_version,provider,data_cutoff,model,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(`restore-brief-${suffix}`, "daily", "1999-12-31T00:00:00.000Z", createdAt, "UTC",
+        "restore-verification-v1", "deployment-local", createdAt,
+        JSON.stringify({ source: "restore-verification", feedCoverage: "unmeasured" }), createdAt);
     const inserted = Number(database.prepare("SELECT count(*) AS count FROM tokens WHERE mint=?").get(mint).count);
     if (inserted !== 1) fail("Database application write probe could not read its disposable token row");
     database.exec("ROLLBACK");
@@ -442,7 +554,7 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
     chmodSync(restoredPath, 0o600);
     let restored = inspectDatabaseFile(restoredPath, { allowLegacy: true });
     assertSameRestore(artifact, restored);
-    const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION].includes(restored.userVersion)
+    const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION].includes(restored.userVersion)
       ? restored.userVersion
       : null;
     if (migratedFromSchemaVersion !== null) {

@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
 
-export const STORE_SCHEMA_VERSION = 700;
+export const STORE_SCHEMA_VERSION = 800;
 
 const MAX_ENRICHMENT_QUERY = 200;
 const MAX_EVIDENCE_BYTES = 64 * 1_024;
@@ -480,6 +480,42 @@ function parseTokenRows(rows) {
   });
 }
 
+function validateBriefModel(value, depth = 0) {
+  if (depth > 10) throw new RangeError("brief model nesting is too deep");
+  if (value === null || typeof value === "boolean" || typeof value === "string"
+    || (typeof value === "number" && Number.isFinite(value))) return;
+  if (Array.isArray(value)) {
+    if (value.length > 500) throw new RangeError("brief model arrays are too large");
+    for (const child of value) validateBriefModel(child, depth + 1);
+    return;
+  }
+  if (!value || typeof value !== "object" || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    throw new TypeError("brief model must contain only JSON-compatible values");
+  }
+  const keys = Object.keys(value);
+  if (keys.length > 100) throw new RangeError("brief model objects have too many keys");
+  for (const key of keys) {
+    if (SENSITIVE_KEY.test(key) || FORBIDDEN_BULK_KEY.test(key)) throw new TypeError(`brief model key is not allowed: ${key}`);
+    validateBriefModel(value[key], depth + 1);
+  }
+}
+
+function rowBriefRun(row) {
+  if (!row) return null;
+  return {
+    briefKey: row.brief_key,
+    kind: row.kind,
+    periodStart: row.period_start,
+    periodEnd: row.period_end,
+    timezone: row.timezone,
+    methodVersion: row.method_version,
+    provider: row.provider,
+    dataCutoff: row.data_cutoff,
+    model: JSON.parse(row.model),
+    createdAt: row.created_at
+  };
+}
+
 export class Store {
   constructor(dbPath) {
     mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -497,15 +533,25 @@ export class Store {
         mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL,
+        event_key TEXT, evidence_class TEXT NOT NULL DEFAULT 'unavailable', occurred_at TEXT, created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT, created_at TEXT NOT NULL
+        id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT,
+        kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
+        dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
+        telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
+        created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS callouts (
         external_id TEXT PRIMARY KEY, mint TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS callouts_mint_created ON callouts(mint, created_at DESC);
+      CREATE TABLE IF NOT EXISTS brief_runs (
+        brief_key TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL,
+        timezone TEXT NOT NULL, method_version TEXT NOT NULL, provider TEXT NOT NULL, data_cutoff TEXT NOT NULL,
+        model TEXT NOT NULL CHECK(json_valid(model) AND json_type(model) = 'object'), created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS outcome_enrichment (
         mint TEXT PRIMARY KEY NOT NULL, provider TEXT, pool TEXT, token_side TEXT, dex TEXT, source_url TEXT,
         evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence) = 'object'),
@@ -529,6 +575,63 @@ export class Store {
         ON risk_identity_enrichment(provider, status, updated_at DESC, mint);
       CREATE INDEX IF NOT EXISTS risk_identity_provider_due
         ON risk_identity_enrichment(provider, next_attempt_at, mint);
+      `);
+      const alertColumns = new Set(this.db.prepare("PRAGMA table_info(alerts)").all().map(({ name }) => name));
+      for (const [name, definition] of [
+        ["kind", "TEXT NOT NULL DEFAULT 'legacy'"],
+        ["evidence_class", "TEXT NOT NULL DEFAULT 'unavailable'"],
+        ["evidence_at", "TEXT"],
+        ["dedupe_key", "TEXT"],
+        ["telegram_status", "TEXT"],
+        ["telegram_attempted_at", "TEXT"],
+        ["telegram_message_id", "INTEGER"],
+        ["telegram_attempt_count", "INTEGER NOT NULL DEFAULT 0"],
+        ["telegram_next_attempt_at", "TEXT"],
+        ["telegram_last_error_code", "TEXT"]
+      ]) {
+        if (!alertColumns.has(name)) this.db.exec(`ALTER TABLE alerts ADD COLUMN ${name} ${definition}`);
+      }
+      const eventColumns = new Set(this.db.prepare("PRAGMA table_info(events)").all().map(({ name }) => name));
+      for (const [name, definition] of [
+        ["event_key", "TEXT"],
+        ["evidence_class", "TEXT NOT NULL DEFAULT 'unavailable'"],
+        ["occurred_at", "TEXT"]
+      ]) {
+        if (!eventColumns.has(name)) this.db.exec(`ALTER TABLE events ADD COLUMN ${name} ${definition}`);
+      }
+      if (existingVersion > 0 && existingVersion < STORE_SCHEMA_VERSION) {
+        this.db.exec(`
+        ALTER TABLE events RENAME TO events_schema_legacy;
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, mint TEXT, payload TEXT NOT NULL,
+          event_key TEXT, evidence_class TEXT NOT NULL DEFAULT 'unavailable', occurred_at TEXT, created_at TEXT NOT NULL
+        );
+        INSERT INTO events (id,kind,mint,payload,event_key,evidence_class,occurred_at,created_at)
+          SELECT id,kind,mint,payload,event_key,evidence_class,occurred_at,created_at FROM events_schema_legacy;
+        DROP TABLE events_schema_legacy;
+        ALTER TABLE alerts RENAME TO alerts_schema_legacy;
+        CREATE TABLE alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, mint TEXT,
+          kind TEXT NOT NULL DEFAULT 'legacy', evidence_class TEXT NOT NULL DEFAULT 'unavailable', evidence_at TEXT,
+          dedupe_key TEXT, telegram_status TEXT, telegram_attempted_at TEXT, telegram_message_id INTEGER,
+          telegram_attempt_count INTEGER NOT NULL DEFAULT 0, telegram_next_attempt_at TEXT, telegram_last_error_code TEXT,
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO alerts
+          (id,level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,telegram_attempted_at,
+           telegram_message_id,telegram_attempt_count,telegram_next_attempt_at,telegram_last_error_code,created_at)
+          SELECT id,level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,telegram_attempted_at,
+                 telegram_message_id,telegram_attempt_count,telegram_next_attempt_at,telegram_last_error_code,created_at
+          FROM alerts_schema_legacy;
+        DROP TABLE alerts_schema_legacy;
+        `);
+      }
+      this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS alerts_dedupe_key ON alerts(dedupe_key) WHERE dedupe_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS alerts_mint_created ON alerts(mint, created_at DESC);
+      CREATE INDEX IF NOT EXISTS events_mint_created ON events(mint, created_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS events_event_key ON events(event_key) WHERE event_key IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS brief_runs_kind_period_end ON brief_runs(kind, period_end DESC);
       PRAGMA user_version = ${STORE_SCHEMA_VERSION};
       COMMIT;`);
       restrictDatabasePermissions(dbPath);
@@ -541,9 +644,41 @@ export class Store {
       VALUES (?,?,?,?) ON CONFLICT(mint) DO UPDATE SET
         payload=json_set(excluded.payload,'$.createdAt',tokens.created_at), updated_at=excluded.updated_at`);
     this.eventStmt = this.db.prepare("INSERT INTO events (kind,mint,payload,created_at) VALUES (?,?,?,?)");
-    this.alertStmt = this.db.prepare("INSERT INTO alerts (level,title,message,mint,created_at) VALUES (?,?,?,?,?)");
+    this.intelligenceEventStmt = this.db.prepare(`INSERT OR IGNORE INTO events
+      (kind,mint,payload,event_key,evidence_class,occurred_at,created_at) VALUES (?,?,?,?,?,?,?)`);
+    this.intelligenceEventExistsStmt = this.db.prepare("SELECT 1 AS present FROM events WHERE event_key=? LIMIT 1");
+    this.alertStmt = this.db.prepare(`INSERT OR IGNORE INTO alerts
+      (level,title,message,mint,kind,evidence_class,evidence_at,dedupe_key,telegram_status,telegram_attempted_at,telegram_message_id,
+       telegram_attempt_count,telegram_next_attempt_at,telegram_last_error_code,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    this.alertDeliveryQueueStmt = this.db.prepare(`UPDATE alerts SET telegram_status='pending',telegram_next_attempt_at=?,telegram_last_error_code=NULL
+      WHERE id=? AND telegram_status IS NULL`);
+    this.alertDeliveryAttemptStmt = this.db.prepare(`UPDATE alerts SET telegram_status=?,telegram_attempted_at=?,telegram_message_id=?,
+      telegram_attempt_count=telegram_attempt_count+1,telegram_next_attempt_at=?,telegram_last_error_code=? WHERE id=?`);
+    this.alertDeliveryDueStmt = this.db.prepare(`SELECT id,level,title,message,mint,kind,evidence_class AS evidenceClass,
+      evidence_at AS evidenceAt,dedupe_key AS dedupeKey,telegram_status AS telegramStatus,
+      telegram_attempted_at AS telegramAttemptedAt,telegram_message_id AS telegramMessageId,
+      telegram_attempt_count AS telegramAttemptCount,telegram_next_attempt_at AS telegramNextAttemptAt,
+      telegram_last_error_code AS telegramLastErrorCode,created_at AS createdAt
+      FROM alerts WHERE telegram_status IN ('pending','retrying') AND telegram_next_attempt_at<=?
+      ORDER BY telegram_next_attempt_at ASC,id ASC LIMIT ?`);
+    this.eventListStmt = this.db.prepare(`SELECT kind,mint,payload,event_key AS eventKey,evidence_class AS evidenceClass,
+      occurred_at AS occurredAt,created_at AS createdAt FROM events
+      WHERE mint=? ORDER BY id DESC LIMIT ?`);
+    this.alertMintListStmt = this.db.prepare(`SELECT id,level,title,message,mint,kind,evidence_class AS evidenceClass,
+      evidence_at AS evidenceAt,dedupe_key AS dedupeKey,telegram_status AS telegramStatus,
+      telegram_attempted_at AS telegramAttemptedAt,telegram_message_id AS telegramMessageId,
+      telegram_attempt_count AS telegramAttemptCount,telegram_next_attempt_at AS telegramNextAttemptAt,
+      telegram_last_error_code AS telegramLastErrorCode,created_at AS createdAt
+      FROM alerts WHERE mint=? ORDER BY id DESC LIMIT ?`);
     this.calloutStmt = this.db.prepare(`INSERT INTO callouts (external_id,mint,payload,created_at)
       VALUES (?,?,?,?) ON CONFLICT(external_id) DO UPDATE SET payload=excluded.payload`);
+    this.calloutMintListStmt = this.db.prepare(`SELECT payload FROM callouts WHERE mint=? ORDER BY created_at DESC LIMIT ?`);
+    this.briefInsertStmt = this.db.prepare(`INSERT OR IGNORE INTO brief_runs
+      (brief_key,kind,period_start,period_end,timezone,method_version,provider,data_cutoff,model,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`);
+    this.briefByKeyStmt = this.db.prepare("SELECT * FROM brief_runs WHERE brief_key=?");
+    this.briefLatestStmt = this.db.prepare("SELECT * FROM brief_runs WHERE kind=? ORDER BY period_end DESC LIMIT 1");
     this.enrichmentSelectStmt = this.db.prepare("SELECT * FROM outcome_enrichment WHERE mint=?");
     this.enrichmentInsertStmt = this.db.prepare(`INSERT INTO outcome_enrichment
       (mint,provider,pool,token_side,dex,source_url,evidence,status,missing_reason,error_code,attempt_count,last_attempt_at,next_attempt_at,last_success_at,updated_at)
@@ -632,10 +767,151 @@ export class Store {
   addEvent(kind, payload) {
     this.eventStmt.run(kind, payload.mint || null, JSON.stringify(payload), new Date().toISOString());
   }
-  addAlert(alert) {
-    const createdAt = alert.createdAt || new Date().toISOString();
-    this.alertStmt.run(alert.level, alert.title, alert.message, alert.mint || null, createdAt);
-    return { ...alert, createdAt };
+  upsertTokenWithAlerts(token, { eventKind, alerts = [], queueTelegram = false } = {}) {
+    if (!token || typeof token !== "object" || Array.isArray(token) || typeof token.mint !== "string") {
+      throw new TypeError("token must be an object with a mint");
+    }
+    const normalizedEventKind = text(eventKind, "event kind", { max: 64, code: true }).toLowerCase();
+    if (!Array.isArray(alerts) || alerts.length > 20) throw new RangeError("alerts must be an array of at most 20 entries");
+    if (typeof queueTelegram !== "boolean") throw new TypeError("queueTelegram must be boolean");
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      this.upsertToken(token);
+      this.addEvent(normalizedEventKind, token);
+      const savedAlerts = alerts.flatMap((candidate) => {
+        const saved = this.addAlert(candidate, { queueTelegram });
+        return saved ? [saved] : [];
+      });
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return { token: this.token(token.mint), alerts: savedAlerts };
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  addIntelligenceEvent({ kind, mint, eventKey, evidenceClass, occurredAt, payload } = {}) {
+    const normalizedKind = text(kind, "intelligence event kind", { max: 64, code: true }).toLowerCase();
+    const normalizedMint = text(mint, "intelligence event mint", { max: 128 });
+    const normalizedEventKey = text(eventKey, "intelligence event key", { max: 320 });
+    const normalizedEvidenceClass = text(evidenceClass, "intelligence event evidence class", { max: 40, code: true }).toLowerCase();
+    if (!["provider-observed", "feed-observed-processed", "locally-derived", "unavailable", "synthetic"].includes(normalizedEvidenceClass)) {
+      throw new TypeError("intelligence event evidence class is invalid");
+    }
+    const normalizedOccurredAt = timestamp(occurredAt, "intelligence event occurredAt");
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new TypeError("intelligence event payload must be an object");
+    const allowedKeys = new Set(["mint", "factor", "value", "unit", "source", "limitation"]);
+    for (const key of Object.keys(payload)) if (!allowedKeys.has(key)) throw new TypeError(`intelligence event payload key is not allowed: ${key}`);
+    if (payload.mint !== normalizedMint) throw new TypeError("intelligence event payload mint must match");
+    const normalizedPayload = {
+      mint: normalizedMint,
+      factor: text(payload.factor, "intelligence event factor", { max: 64, code: true }).toLowerCase(),
+      value: payload.value == null ? null : typeof payload.value === "number" && Number.isFinite(payload.value) ? payload.value
+        : text(payload.value, "intelligence event value", { max: 120 }),
+      unit: text(payload.unit, "intelligence event unit", { max: 32, optional: true }),
+      source: text(payload.source, "intelligence event source", { max: 64, code: true }).toLowerCase(),
+      limitation: text(payload.limitation, "intelligence event limitation", { max: 320 })
+    };
+    if (sensitiveText(JSON.stringify(normalizedPayload))) throw new TypeError("intelligence event payload must not contain credentials or secrets");
+    const createdAt = new Date().toISOString();
+    const result = this.intelligenceEventStmt.run(normalizedKind, normalizedMint, JSON.stringify(normalizedPayload), normalizedEventKey,
+      normalizedEvidenceClass, normalizedOccurredAt, createdAt);
+    return { written: result.changes === 1, eventKey: normalizedEventKey, occurredAt: normalizedOccurredAt };
+  }
+  hasIntelligenceEvent(eventKey) {
+    const normalizedEventKey = text(eventKey, "intelligence event key", { max: 320 });
+    return Boolean(this.intelligenceEventExistsStmt.get(normalizedEventKey));
+  }
+  commitIntelligenceBatch({ events = [], alerts = [], queueTelegram = false } = {}) {
+    if (!Array.isArray(events) || events.length > 1_000) throw new RangeError("events must be an array of at most 1000 entries");
+    if (!Array.isArray(alerts) || alerts.length > 1_000) throw new RangeError("alerts must be an array of at most 1000 entries");
+    if (typeof queueTelegram !== "boolean") throw new TypeError("queueTelegram must be boolean");
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const writtenEvents = events.reduce((count, event) => count + (this.addIntelligenceEvent(event).written ? 1 : 0), 0);
+      const savedAlerts = alerts.flatMap((candidate) => {
+        const saved = this.addAlert(candidate, { queueTelegram });
+        return saved ? [saved] : [];
+      });
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return { writtenEvents, alerts: savedAlerts };
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  addAlert(alert, { queueTelegram = false } = {}) {
+    if (!alert || typeof alert !== "object" || Array.isArray(alert)) throw new TypeError("alert must be an object");
+    const level = text(alert.level, "alert.level", { max: 24, code: true });
+    const title = text(alert.title, "alert.title", { max: 96 });
+    const message = text(alert.message, "alert.message", { max: 640 });
+    const alertMint = text(alert.mint, "alert.mint", { max: 128, optional: true });
+    const kind = text(alert.kind ?? "legacy", "alert.kind", { max: 64, code: true }).toLowerCase();
+    const evidenceClass = text(alert.evidenceClass ?? "unavailable", "alert.evidenceClass", { max: 40, code: true }).toLowerCase();
+    if (!["provider-observed", "feed-observed-processed", "locally-derived", "unavailable", "synthetic"].includes(evidenceClass)) {
+      throw new TypeError("alert.evidenceClass is invalid");
+    }
+    const createdAt = timestamp(alert.createdAt || new Date().toISOString(), "alert.createdAt");
+    const evidenceAt = alert.evidenceAt == null ? null : timestamp(alert.evidenceAt, "alert.evidenceAt");
+    const dedupeKey = text(alert.dedupeKey, "alert.dedupeKey", { max: 320, optional: true });
+    if (typeof queueTelegram !== "boolean") throw new TypeError("queueTelegram must be boolean");
+    const telegramStatus = queueTelegram ? "pending" : null;
+    const telegramNextAttemptAt = queueTelegram ? createdAt : null;
+    const result = this.alertStmt.run(level, title, message, alertMint, kind, evidenceClass, evidenceAt, dedupeKey,
+      telegramStatus, null, null, 0, telegramNextAttemptAt, null, createdAt);
+    if (result.changes === 0) return null;
+    return {
+      id: Number(result.lastInsertRowid), level, title, message, mint: alertMint, kind,
+      evidenceClass, evidenceAt, dedupeKey, telegramStatus,
+      telegramAttemptedAt: null, telegramMessageId: null, telegramAttemptCount: 0,
+      telegramNextAttemptAt, telegramLastErrorCode: null, createdAt
+    };
+  }
+  queueAlertTelegramDelivery(id, { nextAttemptAt = new Date().toISOString() } = {}) {
+    const normalizedId = boundedInteger(id, "alert id", { min: 1 });
+    const normalizedNextAttemptAt = timestamp(nextAttemptAt, "Telegram nextAttemptAt");
+    const result = this.alertDeliveryQueueStmt.run(normalizedNextAttemptAt, normalizedId);
+    if (result.changes !== 1) throw new RangeError("alert id does not exist or is already queued");
+    return { id: normalizedId, status: "pending", nextAttemptAt: normalizedNextAttemptAt };
+  }
+  recordAlertTelegramAttempt(id, status, {
+    attemptedAt = new Date().toISOString(), messageId = null, nextAttemptAt = null, errorCode = null
+  } = {}) {
+    const normalizedId = boundedInteger(id, "alert id", { min: 1 });
+    const normalizedStatus = text(status, "Telegram delivery status", { max: 24, code: true }).toLowerCase();
+    if (!["sent", "retrying", "dead-letter"].includes(normalizedStatus)) throw new TypeError("Telegram delivery status is invalid");
+    const normalizedAttemptedAt = timestamp(attemptedAt, "Telegram attemptedAt");
+    const normalizedMessageId = messageId == null ? null : boundedInteger(messageId, "Telegram message id", { min: 1 });
+    if (normalizedStatus === "sent" && normalizedMessageId === null) throw new TypeError("sent Telegram delivery requires a message id");
+    const normalizedNextAttemptAt = nextAttemptAt == null ? null : timestamp(nextAttemptAt, "Telegram nextAttemptAt");
+    const normalizedErrorCode = text(errorCode, "Telegram error code", { max: 64, optional: true, code: true })?.toLowerCase() ?? null;
+    if (normalizedStatus === "retrying" && (normalizedNextAttemptAt === null || normalizedErrorCode === null)) {
+      throw new TypeError("retrying Telegram delivery requires nextAttemptAt and errorCode");
+    }
+    if (normalizedStatus === "dead-letter" && normalizedErrorCode === null) throw new TypeError("dead-letter Telegram delivery requires errorCode");
+    if (normalizedStatus === "sent" && (normalizedNextAttemptAt !== null || normalizedErrorCode !== null)) {
+      throw new TypeError("sent Telegram delivery must not retain retry evidence");
+    }
+    const result = this.alertDeliveryAttemptStmt.run(normalizedStatus, normalizedAttemptedAt, normalizedMessageId,
+      normalizedNextAttemptAt, normalizedErrorCode, normalizedId);
+    if (result.changes !== 1) throw new RangeError("alert id does not exist");
+    return { id: normalizedId, status: normalizedStatus, attemptedAt: normalizedAttemptedAt,
+      messageId: normalizedMessageId, nextAttemptAt: normalizedNextAttemptAt, errorCode: normalizedErrorCode };
+  }
+  dueTelegramAlerts({ now = new Date().toISOString(), limit = 20 } = {}) {
+    const normalizedNow = timestamp(now, "Telegram queue now");
+    const normalizedLimit = boundedInteger(limit, "Telegram queue limit", { min: 1, max: 100 });
+    return this.alertDeliveryDueStmt.all(normalizedNow, normalizedLimit);
+  }
+  telegramDeliveryCoverage() {
+    const rows = this.db.prepare(`SELECT coalesce(telegram_status,'not-queued') AS status,count(*) AS count
+      FROM alerts GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`).all();
+    return { total: rows.reduce((total, row) => total + Number(row.count), 0), statusCounts: Object.fromEntries(rows.map((row) => [row.status, Number(row.count)])) };
   }
   upsertCallout(callout) {
     this.calloutStmt.run(callout.externalId, callout.mint, JSON.stringify(callout), callout.createdAt);
@@ -798,7 +1074,12 @@ export class Store {
       transactionStarted = true;
       const removedOutcomes = this.db.prepare("DELETE FROM outcome_enrichment WHERE provider=?").run(normalizedProvider).changes;
       const removedRiskIdentity = this.db.prepare("DELETE FROM risk_identity_enrichment WHERE provider=?").run(normalizedProvider).changes;
-      const removed = removedOutcomes + removedRiskIdentity;
+      const removedEvents = this.db.prepare(`DELETE FROM events WHERE ?='geckoterminal' AND kind='risk-evidence'
+        AND json_valid(payload) AND (json_extract(payload,'$.source')='geckoterminal'
+          OR json_extract(payload,'$.factor') IN ('identity-reuse','creator-history'))`).run(normalizedProvider).changes;
+      const removedAlerts = this.db.prepare("DELETE FROM alerts WHERE ?='geckoterminal' AND kind LIKE 'risk-%'").run(normalizedProvider).changes;
+      const removedBriefs = this.db.prepare("DELETE FROM brief_runs WHERE provider=?").run(normalizedProvider).changes;
+      const removed = removedOutcomes + removedRiskIdentity + removedEvents + removedAlerts + removedBriefs;
       this.db.exec("COMMIT");
       transactionStarted = false;
       this.db.exec("VACUUM");
@@ -819,6 +1100,9 @@ export class Store {
         removed,
         removedOutcomes,
         removedRiskIdentity,
+        removedEvents,
+        removedAlerts,
+        removedBriefs,
         exclusiveAccessVerified: true,
         secureDelete: true,
         vacuumed: true,
@@ -844,10 +1128,112 @@ export class Store {
     try { return JSON.parse(row.payload); } catch { return null; }
   }
   alerts(limit = 30) {
-    return this.db.prepare("SELECT level,title,message,mint,created_at AS createdAt FROM alerts ORDER BY id DESC LIMIT ?").all(limit);
+    const normalizedLimit = boundedInteger(limit, "alert limit", { min: 1, max: 200 });
+    return this.db.prepare(`SELECT id,level,title,message,mint,kind,evidence_class AS evidenceClass,
+      evidence_at AS evidenceAt,dedupe_key AS dedupeKey,telegram_status AS telegramStatus,
+      telegram_attempted_at AS telegramAttemptedAt,telegram_message_id AS telegramMessageId,
+      telegram_attempt_count AS telegramAttemptCount,telegram_next_attempt_at AS telegramNextAttemptAt,
+      telegram_last_error_code AS telegramLastErrorCode,created_at AS createdAt
+      FROM alerts ORDER BY id DESC LIMIT ?`).all(normalizedLimit);
+  }
+  alertsForMint(mint, limit = 80) {
+    const normalizedMint = text(mint, "mint", { max: 128 });
+    const normalizedLimit = boundedInteger(limit, "alert limit", { min: 1, max: 200 });
+    return this.alertMintListStmt.all(normalizedMint, normalizedLimit);
+  }
+  eventsForMint(mint, limit = 120) {
+    const normalizedMint = text(mint, "mint", { max: 128 });
+    const normalizedLimit = boundedInteger(limit, "event limit", { min: 1, max: 500 });
+    return this.eventListStmt.all(normalizedMint, normalizedLimit).flatMap((row) => {
+      try {
+        const payload = JSON.parse(row.payload);
+        return payload && typeof payload === "object" && !Array.isArray(payload) ? [{ ...row, payload }] : [];
+      } catch { return []; }
+    });
   }
   callouts(limit = 50) {
-    return parsePayloadRows(this.db.prepare("SELECT payload FROM callouts ORDER BY created_at DESC LIMIT ?").all(limit));
+    const normalizedLimit = boundedInteger(limit, "callout limit", { min: 1, max: 500 });
+    return parsePayloadRows(this.db.prepare("SELECT payload FROM callouts ORDER BY created_at DESC LIMIT ?").all(normalizedLimit));
+  }
+  calloutsForMint(mint, limit = 80) {
+    const normalizedMint = text(mint, "mint", { max: 128 });
+    const normalizedLimit = boundedInteger(limit, "callout limit", { min: 1, max: 200 });
+    return parsePayloadRows(this.calloutMintListStmt.all(normalizedMint, normalizedLimit));
+  }
+  saveBriefRun({ briefKey, kind, periodStart, periodEnd, timezone = "UTC", methodVersion, provider, dataCutoff, model } = {}) {
+    const normalizedKey = text(briefKey, "brief key", { max: 320 });
+    const normalizedKind = text(kind, "brief kind", { max: 16, code: true }).toLowerCase();
+    if (!["daily", "weekly"].includes(normalizedKind)) throw new TypeError("brief kind must be daily or weekly");
+    const normalizedStart = timestamp(periodStart, "brief periodStart");
+    const normalizedEnd = timestamp(periodEnd, "brief periodEnd");
+    const normalizedCutoff = timestamp(dataCutoff, "brief dataCutoff");
+    if (normalizedStart >= normalizedEnd) throw new RangeError("brief periodStart must be before periodEnd");
+    if (normalizedCutoff < normalizedEnd) throw new RangeError("brief dataCutoff must not precede periodEnd");
+    if (timezone !== "UTC") throw new TypeError("brief timezone must be UTC");
+    const normalizedMethod = text(methodVersion, "brief methodVersion", { max: 64, code: true });
+    if (normalizedMethod !== "measured-closed-brief-v1") throw new TypeError("brief methodVersion is unsupported");
+    const normalizedProvider = text(provider, "brief provider", { max: 64, code: true }).toLowerCase();
+    validateBriefModel(model);
+    const encoded = JSON.stringify(model);
+    if (Buffer.byteLength(encoded) > 256 * 1_024) throw new RangeError("brief model is too large");
+    if (model?.briefId !== normalizedKey || model?.methodVersion !== normalizedMethod || model?.period !== normalizedKind
+      || model?.windowStart !== normalizedStart || model?.windowEnd !== normalizedEnd || model?.generatedAt !== normalizedCutoff) {
+      throw new TypeError("brief model metadata does not match its persisted envelope");
+    }
+    const createdAt = new Date().toISOString();
+    const result = this.briefInsertStmt.run(normalizedKey, normalizedKind, normalizedStart, normalizedEnd, "UTC",
+      normalizedMethod, normalizedProvider, normalizedCutoff, encoded, createdAt);
+    return { written: result.changes === 1, run: rowBriefRun(this.briefByKeyStmt.get(normalizedKey)) };
+  }
+  briefRun(kind) {
+    const normalizedKind = text(kind, "brief kind", { max: 16, code: true }).toLowerCase();
+    if (!["daily", "weekly"].includes(normalizedKind)) throw new TypeError("brief kind must be daily or weekly");
+    return rowBriefRun(this.briefLatestStmt.get(normalizedKind));
+  }
+  periodActivity({ start, end, source = "pumpportal" } = {}) {
+    const normalizedStart = timestamp(start, "period start");
+    const normalizedEnd = timestamp(end, "period end");
+    if (normalizedStart >= normalizedEnd) throw new RangeError("period start must be before end");
+    const normalizedSource = text(source, "source", { max: 64, code: true });
+    const bindings = [normalizedStart, normalizedEnd, normalizedSource];
+    const launchesObserved = Number(this.db.prepare(`SELECT count(*) AS count FROM tokens
+      WHERE created_at>=? AND created_at<? AND json_valid(payload) AND json_extract(payload,'$.source')=?`).get(...bindings).count);
+    const migrationObservations = Number(this.db.prepare(`SELECT count(DISTINCT mint) AS count FROM events
+      WHERE created_at>=? AND created_at<? AND json_valid(payload) AND json_extract(payload,'$.source')=?
+        AND json_extract(payload,'$.status')='migration-observed'`).get(...bindings).count);
+    const materialAlerts = Number(this.db.prepare(`SELECT count(*) AS count FROM alerts
+      WHERE created_at>=? AND created_at<? AND mint IN (
+        SELECT mint FROM tokens WHERE json_valid(payload) AND json_extract(payload,'$.source')=?)`).get(...bindings).count);
+    const thirdPartyCallouts = Number(this.db.prepare(`SELECT count(*) AS count FROM callouts
+      WHERE created_at>=? AND created_at<?`).get(normalizedStart, normalizedEnd).count);
+    const materialByKind = Object.fromEntries(this.db.prepare(`SELECT kind,count(*) AS count FROM alerts
+      WHERE created_at>=? AND created_at<? GROUP BY kind ORDER BY kind`).all(normalizedStart, normalizedEnd)
+      .map(({ kind, count }) => [kind, Number(count)]));
+    const factorEventsByEvidenceClass = Object.fromEntries(this.db.prepare(`SELECT evidence_class,count(*) AS count FROM events
+      WHERE created_at>=? AND created_at<? AND kind='risk-evidence' GROUP BY evidence_class ORDER BY evidence_class`)
+      .all(normalizedStart, normalizedEnd).map(({ evidence_class: evidenceClass, count }) => [evidenceClass, Number(count)]));
+    const telegramDelivery = Object.fromEntries(this.db.prepare(`SELECT coalesce(telegram_status,'not-queued') AS status,count(*) AS count
+      FROM alerts WHERE created_at>=? AND created_at<? GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`)
+      .all(normalizedStart, normalizedEnd).map(({ status, count }) => [status, Number(count)]));
+    const outcomeCohortAdmissions = Number(this.db.prepare(`SELECT count(*) AS count FROM outcome_enrichment
+      JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?`).get(normalizedStart, normalizedEnd).count);
+    const riskCohortAdmissions = Number(this.db.prepare(`SELECT count(*) AS count FROM risk_identity_enrichment
+      JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?`).get(normalizedStart, normalizedEnd).count);
+    return {
+      start: normalizedStart,
+      end: normalizedEnd,
+      source: normalizedSource,
+      launchesObserved,
+      migrationObservations,
+      materialAlerts,
+      materialByKind,
+      factorEventsByEvidenceClass,
+      telegramDelivery,
+      deduplicatedSuppressed: null,
+      thirdPartyCallouts,
+      cohortAdmissions: { outcome: outcomeCohortAdmissions, risk: riskCohortAdmissions },
+      cohortDrops: { outcome: null, risk: null, reason: "Historical cohort removals are not tracked; null means unavailable, not zero." }
+    };
   }
   countBySource(source) {
     if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");

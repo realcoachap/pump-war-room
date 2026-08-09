@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { coinMarkdown } from "../src/vault.js";
+import { coinMarkdown, measuredBriefMarkdown } from "../src/vault.js";
 
 test("coin export includes frontmatter, links, and disclaimer", () => {
   const markdown = coinMarkdown({ mint: "ABCpump", name: "Agent Cat", symbol: "ACAT", createdAt: "2026-08-08T00:00:00Z", status: "bonding", narrative: "AI agents", momentum: 82, risk: 21, marketCap: 42000, volume5m: 9000, bondingProgress: 70, uniqueBuyers: 20, buyRatio: .7, devHoldingPct: 3, top10Pct: 25 });
@@ -26,4 +26,24 @@ test("coin export preserves attached public risk evidence", () => {
     riskIdentity: { overallEvidence: "provider-observed" }
   });
   assert.match(markdown, /risk_evidence: "provider-observed"/);
+});
+
+test("measured brief export preserves closed-period denominators and suppression", () => {
+  const window = {
+    status: "insufficient-evidence", eligibleCount: 2, evidenceCount: 1, coverageRatio: 0.5,
+    hitRatePct: null, medianReturnPct: null, maximumDrawdownPct: null
+  };
+  const markdown = measuredBriefMarkdown({
+    period: "daily", methodVersion: "measured-closed-brief-v1",
+    windowStart: "2026-08-08T00:00:00.000Z", windowEnd: "2026-08-09T00:00:00.000Z",
+    generatedAt: "2026-08-09T00:05:00.000Z", source: "pumpportal observations plus GeckoTerminal completed-candle outcomes",
+    activity: { launchesObserved: 4, migrationObservations: 1, materialAlerts: 2, telegramDelivery: { sent: 1 } },
+    outcomes: { windows: { "1h": window } },
+    priorPeriod: { activity: { launchesObserved: 3, migrationObservations: 0, materialAlerts: 1 }, outcomes: { windows: { "1h": { ...window, eligibleCount: 3 } } } }
+  });
+  assert.match(markdown, /\[2026-08-08T00:00:00\.000Z, 2026-08-09T00:00:00\.000Z\)/);
+  assert.match(markdown, /Evidence: \*\*1\/2\*\* \(prior: 1\/3\)/);
+  assert.match(markdown, /suppressed for insufficient evidence/);
+  assert.match(markdown, /feed coverage: \*\*unmeasured\*\*/i);
+  assert.doesNotMatch(markdown, /finalized migration/i);
 });

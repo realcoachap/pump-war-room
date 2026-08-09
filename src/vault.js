@@ -85,3 +85,69 @@ export async function exportDaily(vaultPath, snapshot, now = new Date()) {
   await writeFile(pathName, body, "utf8");
   return pathName;
 }
+
+function countOrUnavailable(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString("en-US") : "unavailable";
+}
+
+function metricOrUnavailable(value, suffix = "") {
+  return finite(value) ? `${value}${suffix}` : "unavailable (suppressed for insufficient evidence)";
+}
+
+export function measuredBriefMarkdown(brief) {
+  if (!brief || typeof brief !== "object" || !["daily", "weekly"].includes(brief.period)
+    || brief.methodVersion !== "measured-closed-brief-v1") {
+    throw new TypeError("a frozen measured daily or weekly brief is required");
+  }
+  const oneHour = brief.outcomes?.windows?.["1h"] || {};
+  const priorOneHour = brief.priorPeriod?.outcomes?.windows?.["1h"] || {};
+  const title = brief.period === "weekly" ? "Weekly" : "Daily";
+  const delivery = brief.activity?.telegramDelivery || {};
+  const body = `---
+type: pump-measured-${brief.period}-brief
+method_version: ${yaml(brief.methodVersion)}
+period_start: ${yaml(brief.windowStart)}
+period_end: ${yaml(brief.windowEnd)}
+timezone: UTC
+data_cutoff: ${yaml(brief.generatedAt)}
+feed_coverage: unmeasured
+---
+
+# Pump War Room ${title} Brief — ${brief.windowStart.slice(0, 10)}
+
+> Frozen closed-period observational measurement for \`[${brief.windowStart}, ${brief.windowEnd})\`. Not financial advice, a market-wide survey, or a completeness claim.
+
+## Activity observed by this deployment
+
+- Launches: **${countOrUnavailable(brief.activity?.launchesObserved)}** (prior: ${countOrUnavailable(brief.priorPeriod?.activity?.launchesObserved)})
+- Processed-feed migration observations: **${countOrUnavailable(brief.activity?.migrationObservations)}** (finalization unverified; prior: ${countOrUnavailable(brief.priorPeriod?.activity?.migrationObservations)})
+- Material events: **${countOrUnavailable(brief.activity?.materialAlerts)}** (prior: ${countOrUnavailable(brief.priorPeriod?.activity?.materialAlerts)})
+- Telegram outbox: sent ${countOrUnavailable(delivery.sent ?? 0)}, pending ${countOrUnavailable((delivery.pending ?? 0) + (delivery.retrying ?? 0))}, dead-letter ${countOrUnavailable(delivery["dead-letter"] ?? 0)}
+- Deduplicated-but-suppressed event count: **unavailable** (not historically retained)
+- Feed coverage: **unmeasured**; no uptime or period-completeness rate is claimed
+
+## 1h fixed-cohort outcomes
+
+- Evidence: **${countOrUnavailable(oneHour.evidenceCount)}/${countOrUnavailable(oneHour.eligibleCount)}** (prior: ${countOrUnavailable(priorOneHour.evidenceCount)}/${countOrUnavailable(priorOneHour.eligibleCount)})
+- Coverage: **${metricOrUnavailable(oneHour.coverageRatio, " ratio")}**
+- Hit rate: **${metricOrUnavailable(oneHour.hitRatePct, "%")}**
+- Median return: **${metricOrUnavailable(oneHour.medianReturnPct, "%")}**
+- Maximum observed-close drawdown: **${metricOrUnavailable(oneHour.maximumDrawdownPct, "%")}**
+
+## Evidence contract
+
+- Source: ${brief.source}
+- GeckoTerminal / CoinGecko completed-candle evidence is public-beta and attributed; raw provider payloads and prices are not retained.
+- Browser watchlists do not control operator Telegram delivery.
+- Missing evidence remains unavailable and is never interpreted as performance.
+`;
+  return body;
+}
+
+export async function exportMeasuredBrief(vaultPath, brief) {
+  const directory = path.join(vaultPath, brief.period === "weekly" ? "Weekly Briefs" : "Daily Briefs");
+  await mkdir(directory, { recursive: true });
+  const pathName = path.join(directory, `${brief.windowStart.slice(0, 10)} Pump ${brief.period === "weekly" ? "Weekly" : "Daily"} Brief.md`);
+  await writeFile(pathName, measuredBriefMarkdown(brief), "utf8");
+  return pathName;
+}
