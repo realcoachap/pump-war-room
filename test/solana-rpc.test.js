@@ -45,6 +45,7 @@ const FEE_RECIPIENT = "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV";
 const PUMP_ONLY_FEE_RECIPIENT = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
 const SWAP_ONLY_FEE_RECIPIENT = "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU";
 const RESERVED_FEE_RECIPIENT = "GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS";
+const BUYBACK_FEE_RECIPIENT = "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD";
 const PUMP_GLOBAL = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf";
 const PUMP_BONDING_CURVE = "3KbZjpZ3okKkZjb46JDyix1GH1rKFqxb459cS67dpDhk";
 const PUMP_ASSOCIATED_BONDING = "FWRW3ixTg7GvK5zE7eqC4wiMwCb4ZntnHnMyZByWSVpP";
@@ -54,6 +55,7 @@ const PUMP_EVENT_AUTHORITY = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
 const PUMP_GLOBAL_VOLUME = "Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y";
 const PUMP_USER_VOLUME = "3EDC9QyxQ1edwGPimrBSGKBK2PXR3ewRxCxPXC2hyVi5";
 const PUMP_FEE_CONFIG = "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt";
+const PUMP_BONDING_V2 = "SndBXYGbK3iCATNdnTnZLuFimJCttV8nqtzNLK7ZyCs";
 const SWAP_POOL = "2MNus2KCpxwXnp19iyXNpWSFtBD2UGjQBAL8AbtywfT9";
 const SWAP_GLOBAL_CONFIG = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 const SWAP_USER_QUOTE = "DzBVNFnwkcA4MnjVx1DwjdjWuwqbFbLqdk1PjoeqaVYi";
@@ -69,6 +71,9 @@ const SWAP_CREATOR_ATA = "AnkjATkxYnNjjE2xNECwfFbS8dCfcX3GgrVMAWaFQmiq";
 const SWAP_GLOBAL_VOLUME = "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw";
 const SWAP_USER_VOLUME = "HJPZuGB3AUXJPqFJt7b2Y9quuzgPjiid7bF8sHkugqz3";
 const SWAP_FEE_CONFIG = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
+const SWAP_POOL_V2 = "DF9p16NDwPiMS47EgNV5oLkgHwEZCiYdPw4P9HAM85LH";
+const SWAP_USER_VOLUME_ATA = "Gm6gNQsbDUgwLvAhL1b9NWxRDWQMpigKeCNDqEWuoxp3";
+const SWAP_BUYBACK_ATA = "H7hMRrjP6a8Xwu1VyC4Aw8d9MafJC8K4eAT1FA2uFJvy";
 
 function response(body, { status = 200, headers = {} } = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
@@ -94,7 +99,7 @@ test("RPC client requests only bounded finalized exact-mint evidence", async () 
   assert.deepEqual(requests[0].body.params, [MINT, { commitment: "finalized", limit: 3 }]);
   assert.deepEqual(requests[1].body.params, [SIGNATURE, { commitment: "finalized", encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }]);
   assert.equal(JSON.stringify(requests).includes(ACTOR), false);
-  assert.equal(SOLANA_ACTOR_PARSER_REVISION, "official-pump-account-bound-v3");
+  assert.equal(SOLANA_ACTOR_PARSER_REVISION, "official-pump-current-fee-layout-v4");
   assert.equal(SOLANA_MAINNET_RPC.parserRevision, SOLANA_ACTOR_PARSER_REVISION);
 });
 
@@ -116,7 +121,7 @@ test("RPC client restricts the endpoint and canonical Solana encodings", async (
   assert.throws(() => limited.signaturesForAddress(MINT, { limit: 33 }), /between 1 and 32/);
 });
 
-function pumpAccounts(side = "buy", userToken = USER_TOKEN) {
+function pumpAccounts(side = "buy", userToken = USER_TOKEN, cashback = false) {
   const shared = [
     PUMP_GLOBAL,
     FEE_RECIPIENT,
@@ -128,12 +133,13 @@ function pumpAccounts(side = "buy", userToken = USER_TOKEN) {
     SYSTEM_PROGRAM
   ];
   return side === "sell"
-    ? [...shared, PUMP_CREATOR_VAULT, TOKEN_PROGRAM, PUMP_EVENT_AUTHORITY, PUMP_PROGRAM, PUMP_FEE_CONFIG, FEE_PROGRAM]
+    ? [...shared, PUMP_CREATOR_VAULT, TOKEN_PROGRAM, PUMP_EVENT_AUTHORITY, PUMP_PROGRAM, PUMP_FEE_CONFIG, FEE_PROGRAM,
+      ...(cashback ? [PUMP_USER_VOLUME] : []), PUMP_BONDING_V2, BUYBACK_FEE_RECIPIENT]
     : [...shared, TOKEN_PROGRAM, PUMP_CREATOR_VAULT, PUMP_EVENT_AUTHORITY, PUMP_PROGRAM,
-      PUMP_GLOBAL_VOLUME, PUMP_USER_VOLUME, PUMP_FEE_CONFIG, FEE_PROGRAM];
+      PUMP_GLOBAL_VOLUME, PUMP_USER_VOLUME, PUMP_FEE_CONFIG, FEE_PROGRAM, PUMP_BONDING_V2, BUYBACK_FEE_RECIPIENT];
 }
 
-function swapAccounts(side = "buy", userToken = USER_TOKEN) {
+function swapAccounts(side = "buy", userToken = USER_TOKEN, cashback = false, withPoolV2 = true) {
   const shared = [
     SWAP_POOL,
     ACTOR,
@@ -155,20 +161,29 @@ function swapAccounts(side = "buy", userToken = USER_TOKEN) {
     SWAP_CREATOR_ATA,
     SWAP_CREATOR_AUTHORITY
   ];
+  const remaining = [
+    ...(cashback ? side === "sell" ? [SWAP_USER_VOLUME_ATA, SWAP_USER_VOLUME] : [SWAP_USER_VOLUME_ATA] : []),
+    ...(withPoolV2 ? [SWAP_POOL_V2] : []), BUYBACK_FEE_RECIPIENT, SWAP_BUYBACK_ATA
+  ];
   return side === "sell"
-    ? [...shared, SWAP_FEE_CONFIG, FEE_PROGRAM]
-    : [...shared, SWAP_GLOBAL_VOLUME, SWAP_USER_VOLUME, SWAP_FEE_CONFIG, FEE_PROGRAM];
+    ? [...shared, SWAP_FEE_CONFIG, FEE_PROGRAM, ...remaining]
+    : [...shared, SWAP_GLOBAL_VOLUME, SWAP_USER_VOLUME, SWAP_FEE_CONFIG, FEE_PROGRAM, ...remaining];
 }
 
-function writableIndices(program, side) {
-  if (program.startsWith("swap")) return side === "sell"
-    ? [0, 1, 5, 6, 7, 8, 10, 17]
-    : [0, 1, 5, 6, 7, 8, 10, 17, 20];
-  return side === "sell" ? [1, 3, 4, 5, 6, 8] : [1, 3, 4, 5, 6, 9, 13];
+function writableIndices(program, side, accounts) {
+  const writable = new Set(program.startsWith("swap")
+    ? side === "sell" ? [0, 1, 5, 6, 7, 8, 10, 17] : [0, 1, 5, 6, 7, 8, 10, 17, 20]
+    : side === "sell" ? [1, 3, 4, 5, 6, 8] : [1, 3, 4, 5, 6, 9, 13]);
+  accounts.forEach((address, index) => {
+    if (program.startsWith("swap")
+      ? [SWAP_USER_VOLUME_ATA, SWAP_USER_VOLUME, SWAP_BUYBACK_ATA].includes(address)
+      : address === BUYBACK_FEE_RECIPIENT || (side === "sell" && index === 14 && address === PUMP_USER_VOLUME)) writable.add(index);
+  });
+  return [...writable];
 }
 
 function messageAccountKeys(accounts, program, side) {
-  const writable = new Set(writableIndices(program, side));
+  const writable = new Set(writableIndices(program, side, accounts));
   const actorIndex = program.startsWith("swap") ? 1 : 6;
   const roles = new Map();
   accounts.forEach((pubkey, index) => {
@@ -213,13 +228,16 @@ function transaction({
   slot = 9,
   side = "buy",
   program = "pump",
+  cashback = false,
+  withPoolV2 = true,
+  userToken = USER_TOKEN,
   instructionAmount = actorDelta < 0n ? -actorDelta : actorDelta
 } = {}) {
   const isSwap = program.startsWith("swap");
-  const accounts = isSwap ? swapAccounts(side) : pumpAccounts(side);
+  const accounts = isSwap ? swapAccounts(side, userToken, cashback, withPoolV2) : pumpAccounts(side, userToken, cashback);
   const accountKeys = messageAccountKeys(accounts, program, side);
   const addresses = accountKeys.map(({ pubkey }) => pubkey);
-  const userToken = accounts[5];
+  const designatedUserToken = accounts[5];
   const poolToken = isSwap ? accounts[7] : accounts[4];
   const poolOwner = isSwap ? accounts[0] : accounts[3];
   const balance = (owner, tokenAccount, amount) => ({
@@ -249,8 +267,8 @@ function transaction({
     },
     meta: {
       err: null,
-      preTokenBalances: [balance(ACTOR, userToken, 100_000_000n), balance(poolOwner, poolToken, 900_000_000n)],
-      postTokenBalances: [balance(ACTOR, userToken, 100_000_000n + actorDelta), balance(poolOwner, poolToken, 900_000_000n + otherDelta)]
+      preTokenBalances: [balance(ACTOR, designatedUserToken, 100_000_000n), balance(poolOwner, poolToken, 900_000_000n)],
+      postTokenBalances: [balance(ACTOR, designatedUserToken, 100_000_000n + actorDelta), balance(poolOwner, poolToken, 900_000_000n + otherDelta)]
     }
   };
 }
@@ -335,6 +353,58 @@ test("accepts the exact official PumpSwap buy and sell account contracts", () =>
   assert.deepEqual(sell.observations[0].instructionBasis, [{ programId: PUMP_SWAP_PROGRAM, instruction: "sell" }]);
 });
 
+test("accepts documented current fee layouts and binds every appended account", () => {
+  assert.equal(extract(transaction({ side: "sell", actorDelta: -25_000_000n, otherDelta: 25_000_000n, cashback: true })).status, "observed");
+  assert.equal(extract(transaction({ program: "swap", cashback: true })).status, "observed");
+  assert.equal(extract(transaction({ side: "sell", program: "swap", actorDelta: -25_000_000n, otherDelta: 25_000_000n, cashback: true })).status, "observed");
+  assert.equal(extract(transaction({ program: "swap", withPoolV2: false })).status, "observed");
+  assert.equal(extract(transaction({ side: "sell", program: "swap", actorDelta: -25_000_000n, otherDelta: 25_000_000n, withPoolV2: false })).status, "observed");
+
+  for (const mutate of [
+    (tx) => { const accounts = tx.transaction.message.instructions[0].accounts; accounts[accounts.length - 1] = ABSENT_ACCOUNT; },
+    (tx) => { const accounts = tx.transaction.message.instructions[0].accounts; accounts[accounts.length - 2] = ABSENT_ACCOUNT; },
+    (tx) => { tx.transaction.message.instructions[0].accounts[16] = ABSENT_ACCOUNT; }
+  ]) {
+    const tx = transaction();
+    addMessageAccount(tx, ABSENT_ACCOUNT, true);
+    mutate(tx);
+    assert.equal(extract(tx).reason, "official-pump-instruction-invalid");
+  }
+
+  const wrongSwapPoolV2 = transaction({ program: "swap" });
+  addMessageAccount(wrongSwapPoolV2, ABSENT_ACCOUNT);
+  wrongSwapPoolV2.transaction.message.instructions[0].accounts[23] = ABSENT_ACCOUNT;
+  assert.equal(extract(wrongSwapPoolV2).reason, "official-pump-instruction-invalid");
+});
+
+test("accepts audited 24-byte and current 25-byte standard-buy encodings", () => {
+  for (const program of ["pump", "swap"]) {
+    const current = transaction({ program });
+    assert.equal(extract(current).status, "observed");
+    const compatible = transaction({ program });
+    compatible.transaction.message.instructions[0].data = encodeBase58([
+      ...discriminator("buy", program), ...u64(250_000_000n), ...u64(1n)
+    ]);
+    assert.equal(extract(compatible).status, "observed");
+    const oversized = transaction({ program });
+    oversized.transaction.message.instructions[0].data = encodeBase58([
+      ...discriminator("buy", program), ...u64(250_000_000n), ...u64(1n), 0, 0
+    ]);
+    assert.equal(extract(oversized).reason, "official-pump-instruction-invalid");
+  }
+});
+
+test("accepts instruction-designated actor-owned token accounts and composite privilege elevation", () => {
+  for (const program of ["pump", "swap"]) {
+    const alternateTokenAccount = transaction({ program, userToken: SECOND_USER_TOKEN });
+    assert.equal(extract(alternateTokenAccount).status, "observed");
+
+    const composite = transaction({ program });
+    setMessageWritable(composite, program === "pump" ? PUMP_EVENT_AUTHORITY : SWAP_GLOBAL_CONFIG, true);
+    assert.equal(extract(composite).status, "observed");
+  }
+});
+
 test("uses exact program-specific legacy fee-recipient allowlists", () => {
   const pumpOnly = transaction();
   setPumpFeeRecipient(pumpOnly, PUMP_ONLY_FEE_RECIPIENT);
@@ -409,7 +479,7 @@ test("fails closed when success or exact-mint balance fields are missing or malf
   assert.equal(extract(unrelatedMalformed).status, "observed");
 });
 
-test("accepts canonical headerless jsonParsed account metadata and rejects malformed or spoofed roles", () => {
+test("accepts canonical headerless metadata, required roles, and transaction-wide privilege elevation", () => {
   const headerless = transaction();
   delete headerless.transaction.message.header;
   for (const entry of headerless.transaction.message.accountKeys) entry.source = "transaction";
@@ -431,11 +501,11 @@ test("accepts canonical headerless jsonParsed account metadata and rejects malfo
   const extraSigner = structuredClone(headerless);
   extraSigner.transaction.message.accountKeys[1].signer = true;
   extraSigner.transaction.signatures.push(OTHER_SIGNATURE);
-  assert.equal(extract(extraSigner).reason, "official-pump-instruction-invalid");
+  assert.equal(extract(extraSigner).status, "observed");
 
   const writableSpoof = structuredClone(headerless);
   writableSpoof.transaction.message.accountKeys.find(({ pubkey }) => pubkey === PUMP_EVENT_AUTHORITY).writable = true;
-  assert.equal(extract(writableSpoof).reason, "official-pump-instruction-invalid");
+  assert.equal(extract(writableSpoof).status, "observed");
 
   const staticAfterLookup = structuredClone(headerless);
   staticAfterLookup.transaction.message.accountKeys.at(-2).source = "lookupTable";
@@ -505,15 +575,11 @@ test("requires exact official instruction account counts, fixed programs, and in
 
   const wrongTokenAccount = transaction();
   wrongTokenAccount.transaction.message.instructions[0].accounts[5] = SECOND_USER_TOKEN;
-  assert.equal(extract(wrongTokenAccount).reason, "official-pump-instruction-invalid");
+  assert.equal(extract(wrongTokenAccount).reason, "mixed-or-ambiguous-signer-token-activity");
 
   const readonlyUserToken = transaction();
   setMessageWritable(readonlyUserToken, USER_TOKEN, false);
   assert.equal(extract(readonlyUserToken).reason, "official-pump-instruction-invalid");
-
-  const writableEventAuthority = transaction();
-  setMessageWritable(writableEventAuthority, PUMP_EVENT_AUTHORITY, true);
-  assert.equal(extract(writableEventAuthority).reason, "official-pump-instruction-invalid");
 
   const repeatedWritablePlaceholder = transaction();
   repeatedWritablePlaceholder.transaction.message.instructions[0].accounts[1] = PUMP_BONDING_CURVE;
@@ -546,10 +612,6 @@ test("requires exact official instruction account counts, fixed programs, and in
   wrongSwapEventPda.transaction.message.instructions[0].accounts[15] = ABSENT_ACCOUNT;
   assert.equal(extract(wrongSwapEventPda).reason, "official-pump-instruction-invalid");
 
-  const writableSwapGlobal = transaction({ program: "swap" });
-  setMessageWritable(writableSwapGlobal, SWAP_GLOBAL_CONFIG, true);
-  assert.equal(extract(writableSwapGlobal).reason, "official-pump-instruction-invalid");
-
   const wrongSwapGlobalPda = transaction({ program: "swap" });
   addMessageAccount(wrongSwapGlobalPda, ABSENT_ACCOUNT);
   wrongSwapGlobalPda.transaction.message.instructions[0].accounts[2] = ABSENT_ACCOUNT;
@@ -580,7 +642,7 @@ test("rejects mixed sides, invalid alternate designated accounts, and extra sign
     accounts: pumpAccounts("buy", SECOND_USER_TOKEN),
     data: instructionData("buy", "pump", 1n)
   });
-  assert.equal(extract(multipleAccounts).reason, "official-pump-instruction-invalid");
+  assert.equal(extract(multipleAccounts).reason, "mixed-or-ambiguous-official-pump-activity");
 
   const extraSignerActivity = transaction();
   const secondIndex = extraSignerActivity.transaction.message.accountKeys.findIndex(({ pubkey }) => pubkey === SECOND_USER_TOKEN);

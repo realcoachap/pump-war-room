@@ -40,54 +40,66 @@ const PUMP_SWAP_LEGACY_FEE_RECIPIENTS = new Set([
   "JCRGumoE9Qi5BBgULTgdgTLjSgkCMSbF62ZZfGs84JeU",
   ...RESERVED_FEE_RECIPIENTS
 ]);
+const BUYBACK_FEE_RECIPIENTS = new Set([
+  "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+  "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+  "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+  "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+  "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+  "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+  "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+  "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"
+]);
 const PUMP_FEE_CONFIG_SEED = Buffer.from([1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170, 81, 137, 203, 151, 245, 210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176]);
 const PUMP_SWAP_FEE_CONFIG_SEED = Buffer.from([12, 20, 222, 252, 130, 94, 198, 118, 148, 37, 8, 24, 187, 101, 64, 101, 244, 41, 141, 49, 86, 213, 113, 180, 212, 248, 9, 12, 24, 233, 168, 99]);
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_VALUES = new Map([...BASE58_ALPHABET].map((character, index) => [character, index]));
-export const SOLANA_ACTOR_PARSER_REVISION = "official-pump-account-bound-v3";
+export const SOLANA_ACTOR_PARSER_REVISION = "official-pump-current-fee-layout-v4";
 const instructionKey = (value) => Buffer.from(value).toString("hex");
-const pumpBondingContract = (side, name, accountCount, accepted = true) => Object.freeze({
+const pumpBondingContract = (side, name, accepted = true) => Object.freeze({
   side,
   name,
   accepted,
-  accountCount,
-  dataLength: side === "sell" ? 24 : 25,
+  baseAccountCount: side === "sell" ? 14 : 16,
+  accountCounts: Object.freeze(side === "sell" ? [16, 17] : [18]),
+  dataLengths: Object.freeze(side === "sell" ? [24] : [24, 25]),
   trackVolume: side !== "sell",
   tokenAmountOffset: accepted ? 8 : null,
   mintIndex: 2,
   actorIndex: 6,
   userTokenIndex: 5,
   writableIndices: Object.freeze(side === "sell" ? [1, 3, 4, 5, 6, 8] : [1, 3, 4, 5, 6, 9, 13]),
-  fixedAccounts: Object.freeze(accountCount === 16
-    ? [[7, SYSTEM_PROGRAM], [11, PUMP_BONDING_PROGRAM], [15, PUMP_FEE_PROGRAM]]
-    : [[7, SYSTEM_PROGRAM], [11, PUMP_BONDING_PROGRAM], [13, PUMP_FEE_PROGRAM]])
+  fixedAccounts: Object.freeze(side === "sell"
+    ? [[7, SYSTEM_PROGRAM], [11, PUMP_BONDING_PROGRAM], [13, PUMP_FEE_PROGRAM]]
+    : [[7, SYSTEM_PROGRAM], [11, PUMP_BONDING_PROGRAM], [15, PUMP_FEE_PROGRAM]])
 });
-const pumpSwapContract = (side, name, accountCount, accepted = true) => Object.freeze({
+const pumpSwapContract = (side, name, accepted = true) => Object.freeze({
   side,
   name,
   accepted,
-  accountCount,
-  dataLength: side === "sell" ? 24 : 25,
+  baseAccountCount: side === "sell" ? 21 : 23,
+  accountCounts: Object.freeze(side === "sell" ? [23, 24, 25, 26] : [25, 26, 27]),
+  dataLengths: Object.freeze(side === "sell" ? [24] : [24, 25]),
   trackVolume: side !== "sell",
   tokenAmountOffset: accepted ? 8 : null,
   mintIndex: 3,
   actorIndex: 1,
   userTokenIndex: 5,
   writableIndices: Object.freeze(side === "sell" ? [0, 1, 5, 6, 7, 8, 10, 17] : [0, 1, 5, 6, 7, 8, 10, 17, 20]),
-  fixedAccounts: Object.freeze(accountCount === 23
-    ? [[13, SYSTEM_PROGRAM], [14, ASSOCIATED_TOKEN_PROGRAM], [16, PUMP_SWAP_PROGRAM], [22, PUMP_FEE_PROGRAM]]
-    : [[13, SYSTEM_PROGRAM], [14, ASSOCIATED_TOKEN_PROGRAM], [16, PUMP_SWAP_PROGRAM], [20, PUMP_FEE_PROGRAM]])
+  fixedAccounts: Object.freeze(side === "sell"
+    ? [[13, SYSTEM_PROGRAM], [14, ASSOCIATED_TOKEN_PROGRAM], [16, PUMP_SWAP_PROGRAM], [20, PUMP_FEE_PROGRAM]]
+    : [[13, SYSTEM_PROGRAM], [14, ASSOCIATED_TOKEN_PROGRAM], [16, PUMP_SWAP_PROGRAM], [22, PUMP_FEE_PROGRAM]])
 });
 const PUMP_INSTRUCTIONS = Object.freeze({
   [PUMP_BONDING_PROGRAM]: Object.freeze({
-    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: pumpBondingContract("buy", "buy", 16),
-    [instructionKey([56, 252, 116, 8, 158, 223, 205, 95])]: pumpBondingContract("buy", "buy_exact_sol_in", 16, false),
-    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: pumpBondingContract("sell", "sell", 14)
+    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: pumpBondingContract("buy", "buy"),
+    [instructionKey([56, 252, 116, 8, 158, 223, 205, 95])]: pumpBondingContract("buy", "buy_exact_sol_in", false),
+    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: pumpBondingContract("sell", "sell")
   }),
   [PUMP_SWAP_PROGRAM]: Object.freeze({
-    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: pumpSwapContract("buy", "buy", 23),
-    [instructionKey([198, 46, 21, 82, 180, 217, 232, 112])]: pumpSwapContract("buy", "buy_exact_quote_in", 23, false),
-    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: pumpSwapContract("sell", "sell", 21)
+    [instructionKey([102, 6, 61, 18, 1, 218, 235, 234])]: pumpSwapContract("buy", "buy"),
+    [instructionKey([198, 46, 21, 82, 180, 217, 232, 112])]: pumpSwapContract("buy", "buy_exact_quote_in", false),
+    [instructionKey([51, 230, 133, 164, 1, 127, 131, 173])]: pumpSwapContract("sell", "sell")
   })
 });
 const UNSUPPORTED_TRADE_INSTRUCTIONS = Object.freeze({
@@ -436,10 +448,13 @@ function instructionAccount(value, keys) {
   return keys.find((entry) => entry.address === normalized) || null;
 }
 
-function hasExactAccountRoles(accounts, contract) {
-  const writable = new Set(contract.writableIndices);
-  return accounts.every((account, index) => account.signer === (index === contract.actorIndex)
-    && account.writable === writable.has(index));
+function hasRequiredAccountPrivileges(accounts, actorIndex, writableIndices) {
+  // jsonParsed account privileges are the transaction-wide union. Composite
+  // transactions can therefore elevate an otherwise readonly instruction
+  // account; only privileges required by the official instruction are safe to
+  // prove from this response shape.
+  return accounts[actorIndex]?.signer === true
+    && writableIndices.every((index) => accounts[index]?.writable === true);
 }
 
 function hasOnlyAllowedDuplicateAccounts(accounts, programId) {
@@ -460,17 +475,33 @@ function matchesAddress(account, expected) {
 function validatePumpBondingAccounts(accounts, contract) {
   const mint = accounts[contract.mintIndex].address;
   const actor = accounts[contract.actorIndex].address;
+  const remaining = accounts.slice(contract.baseAccountCount);
   const tokenProgramIndex = contract.side === "sell" ? 9 : 8;
   const tokenProgram = accounts[tokenProgramIndex].address;
-  if (!TOKEN_PROGRAMS.has(tokenProgram) || !PUMP_LEGACY_FEE_RECIPIENTS.has(accounts[1].address)) return false;
+  const bondingCurveV2 = findProgramAddress([Buffer.from("bonding-curve-v2"), addressSeed(mint)], PUMP_BONDING_PROGRAM);
+  const buybackFeeRecipient = remaining.at(-1);
+  if (!contract.accountCounts.includes(accounts.length)
+    || !TOKEN_PROGRAMS.has(tokenProgram) || !PUMP_LEGACY_FEE_RECIPIENTS.has(accounts[1].address)
+    || !BUYBACK_FEE_RECIPIENTS.has(buybackFeeRecipient?.address)) return false;
+  const writableIndices = [...contract.writableIndices, accounts.length - 1];
+  if (contract.side === "sell") {
+    const hasCashback = remaining.length === 3;
+    if (remaining.length !== 2 && !hasCashback) return false;
+    if (hasCashback) {
+      const userVolume = findProgramAddress([Buffer.from("user_volume_accumulator"), addressSeed(actor)], PUMP_BONDING_PROGRAM);
+      if (!matchesAddress(remaining[0], userVolume)) return false;
+      writableIndices.push(contract.baseAccountCount);
+    }
+    if (!matchesAddress(remaining.at(-2), bondingCurveV2)) return false;
+  } else if (remaining.length !== 2 || !matchesAddress(remaining[0], bondingCurveV2)) return false;
+  if (!hasRequiredAccountPrivileges(accounts, contract.actorIndex, writableIndices)) return false;
   const bondingCurve = findProgramAddress([Buffer.from("bonding-curve"), addressSeed(mint)], PUMP_BONDING_PROGRAM);
   const expected = [
     [0, findProgramAddress([Buffer.from("global")], PUMP_BONDING_PROGRAM)],
     [3, bondingCurve],
     [4, associatedTokenAddress(bondingCurve, tokenProgram, mint)],
-    [5, associatedTokenAddress(actor, tokenProgram, mint)],
     [10, findProgramAddress([Buffer.from("__event_authority")], PUMP_BONDING_PROGRAM)],
-    [contract.accountCount - 2, findProgramAddress([Buffer.from("fee_config"), PUMP_FEE_CONFIG_SEED], PUMP_FEE_PROGRAM)]
+    [contract.baseAccountCount - 2, findProgramAddress([Buffer.from("fee_config"), PUMP_FEE_CONFIG_SEED], PUMP_FEE_PROGRAM)]
   ];
   if (contract.side !== "sell") {
     expected.push(
@@ -490,18 +521,45 @@ function validatePumpSwapAccounts(accounts, contract) {
   const quoteMint = accounts[4].address;
   const baseTokenProgram = accounts[11].address;
   const quoteTokenProgram = accounts[12].address;
-  if (!TOKEN_PROGRAMS.has(baseTokenProgram) || !TOKEN_PROGRAMS.has(quoteTokenProgram)
-    || !PUMP_SWAP_LEGACY_FEE_RECIPIENTS.has(accounts[9].address)) return false;
+  const remaining = accounts.slice(contract.baseAccountCount);
+  const optional = remaining.slice(0, -2);
+  const buybackFeeRecipient = remaining.at(-2);
+  const buybackFeeRecipientAta = remaining.at(-1);
+  if (!contract.accountCounts.includes(accounts.length)
+    || !TOKEN_PROGRAMS.has(baseTokenProgram) || !TOKEN_PROGRAMS.has(quoteTokenProgram)
+    || !PUMP_SWAP_LEGACY_FEE_RECIPIENTS.has(accounts[9].address)
+    || !BUYBACK_FEE_RECIPIENTS.has(buybackFeeRecipient?.address)
+    || !matchesAddress(buybackFeeRecipientAta,
+      associatedTokenAddress(buybackFeeRecipient?.address, quoteTokenProgram, quoteMint))) return false;
+  const userVolume = findProgramAddress([Buffer.from("user_volume_accumulator"), addressSeed(actor)], PUMP_SWAP_PROGRAM);
+  const userVolumeQuoteAta = associatedTokenAddress(userVolume, quoteTokenProgram, quoteMint);
+  const poolV2 = findProgramAddress([Buffer.from("pool-v2"), addressSeed(baseMint)], PUMP_SWAP_PROGRAM);
+  const writableIndices = [...contract.writableIndices, accounts.length - 1];
+  if (contract.side === "sell") {
+    if (optional.length === 1) {
+      if (!matchesAddress(optional[0], poolV2)) return false;
+    } else if (optional.length === 2 || optional.length === 3) {
+      if (!matchesAddress(optional[0], userVolumeQuoteAta) || !matchesAddress(optional[1], userVolume)
+        || (optional.length === 3 && !matchesAddress(optional[2], poolV2))) return false;
+      writableIndices.push(contract.baseAccountCount, contract.baseAccountCount + 1);
+    } else if (optional.length !== 0) return false;
+  } else if (optional.length === 1) {
+    if (matchesAddress(optional[0], userVolumeQuoteAta)) writableIndices.push(contract.baseAccountCount);
+    else if (!matchesAddress(optional[0], poolV2)) return false;
+  } else if (optional.length === 2) {
+    if (!matchesAddress(optional[0], userVolumeQuoteAta) || !matchesAddress(optional[1], poolV2)) return false;
+    writableIndices.push(contract.baseAccountCount);
+  } else if (optional.length !== 0) return false;
+  if (!hasRequiredAccountPrivileges(accounts, contract.actorIndex, writableIndices)) return false;
   const expected = [
     [2, findProgramAddress([Buffer.from("global_config")], PUMP_SWAP_PROGRAM)],
-    [5, associatedTokenAddress(actor, baseTokenProgram, baseMint)],
     [6, associatedTokenAddress(actor, quoteTokenProgram, quoteMint)],
     [7, associatedTokenAddress(pool, baseTokenProgram, baseMint)],
     [8, associatedTokenAddress(pool, quoteTokenProgram, quoteMint)],
     [10, associatedTokenAddress(accounts[9].address, quoteTokenProgram, quoteMint)],
     [15, findProgramAddress([Buffer.from("__event_authority")], PUMP_SWAP_PROGRAM)],
     [17, associatedTokenAddress(accounts[18].address, quoteTokenProgram, quoteMint)],
-    [contract.accountCount - 2, findProgramAddress([Buffer.from("fee_config"), PUMP_SWAP_FEE_CONFIG_SEED], PUMP_FEE_PROGRAM)]
+    [contract.baseAccountCount - 2, findProgramAddress([Buffer.from("fee_config"), PUMP_SWAP_FEE_CONFIG_SEED], PUMP_FEE_PROGRAM)]
   ];
   if (contract.side !== "sell") {
     expected.push(
@@ -515,7 +573,7 @@ function validatePumpSwapAccounts(accounts, contract) {
 }
 
 function validateInstructionAccountContract(accounts, contract, programId) {
-  if (!hasExactAccountRoles(accounts, contract) || !hasOnlyAllowedDuplicateAccounts(accounts, programId)) return false;
+  if (!hasOnlyAllowedDuplicateAccounts(accounts, programId)) return false;
   return programId === PUMP_BONDING_PROGRAM
     ? validatePumpBondingAccounts(accounts, contract)
     : validatePumpSwapAccounts(accounts, contract);
@@ -561,13 +619,14 @@ function pumpInstructionEvidence(transaction, mint, keys, signers) {
       if (UNSUPPORTED_TRADE_INSTRUCTIONS[programId]?.has(discriminator)) unsupportedTrade = true;
       continue;
     }
-    if (data.length !== contract.dataLength || (contract.trackVolume && data.at(-1) > 1)) {
+    if (!contract.dataLengths.includes(data.length)
+      || (contract.trackVolume && data.length === 25 && data.at(-1) > 1)) {
       return { valid: false, matches: [] };
     }
-    if (!Array.isArray(instruction.accounts) || instruction.accounts.length !== contract.accountCount) return { valid: false, matches: [] };
+    if (!Array.isArray(instruction.accounts) || !contract.accountCounts.includes(instruction.accounts.length)) return { valid: false, matches: [] };
     const accounts = instruction.accounts.map((entry) => instructionAccount(entry, keys));
     if (accounts.some((entry) => !entry)) return { valid: false, matches: [] };
-    if (contract.fixedAccounts.some(([index, expected]) => accounts[index]?.address !== expected || accounts[index]?.writable)) {
+    if (contract.fixedAccounts.some(([index, expected]) => accounts[index]?.address !== expected)) {
       return { valid: false, matches: [] };
     }
     if (!validateInstructionAccountContract(accounts, contract, programId)) return { valid: false, matches: [] };

@@ -50,6 +50,11 @@ function publicErrorCode(error) {
   return /^[a-z][a-z0-9-]{0,63}$/.test(code) ? code : "actor-acquisition-failed";
 }
 
+function publicRejectionCode(result) {
+  const code = typeof result?.reason === "string" ? result.reason : result?.status;
+  return typeof code === "string" && /^[a-z][a-z0-9-]{0,63}$/.test(code) ? code : "actor-evidence-unavailable";
+}
+
 export class EarlyActorIngestor {
   constructor({ store, client, now = () => Date.now(), onStatus, extract = extractFinalizedActorInputs } = {}) {
     if (!store || typeof store.actorPrivacySecret !== "function" || typeof store.prepareActorMethodRevision !== "function") {
@@ -82,6 +87,7 @@ export class EarlyActorIngestor {
       transactionsRequested: 0,
       transactionsUnavailable: 0,
       transactionsRejected: 0,
+      transactionRejectionReasons: {},
       observationsAccepted: 0,
       observationsDeduplicated: 0,
       failures: 0
@@ -180,7 +186,10 @@ export class EarlyActorIngestor {
         pendingAttemptCount, terminalCount, terminalFailureCount, statusCounts
       },
       correlationGate,
-      counters: { ...this.counters }
+      counters: {
+        ...this.counters,
+        transactionRejectionReasons: { ...this.counters.transactionRejectionReasons }
+      }
     };
   }
 
@@ -195,6 +204,8 @@ export class EarlyActorIngestor {
     let candidates = [];
     let observed = 0;
     let rejected = 0;
+    let invalidEvidence = 0;
+    let validatedObservations = 0;
     let acquisitionError = null;
     try {
       const signatures = await this.client.signaturesForAddress(state.mint, { limit: ACTOR_SIGNATURE_LIMIT });
@@ -214,9 +225,14 @@ export class EarlyActorIngestor {
         const extracted = this.extract({ mint: state.mint, signatureInfo: signature, transaction, observedAt: attemptedAt });
         if (extracted.status !== "observed") {
           rejected++;
+          if (extracted.status === "rejected") invalidEvidence++;
           this.counters.transactionsRejected++;
+          const rejectionCode = publicRejectionCode(extracted);
+          this.counters.transactionRejectionReasons[rejectionCode]
+            = (this.counters.transactionRejectionReasons[rejectionCode] || 0) + 1;
           continue;
         }
+        validatedObservations += extracted.observations.length;
         for (const input of extracted.observations) {
           const normalized = normalizeEarlyActorTrade(input, {
             installationSecret: this.secret,
@@ -243,6 +259,12 @@ export class EarlyActorIngestor {
             this.counters.observationsDeduplicated++;
           }
         }
+      }
+      if (candidates.length > 0 && validatedObservations === 0 && invalidEvidence > 0) {
+        acquisitionError = new SolanaRpcError(
+          "invalid-transaction-evidence",
+          "Bounded finalized transactions failed the current official Pump evidence contract"
+        );
       }
     } catch (error) {
       acquisitionError = error;

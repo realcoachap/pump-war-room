@@ -4,7 +4,7 @@ import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.9.1";
+const version = "0.9.2";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -194,7 +194,10 @@ function actorEngine() {
       pendingAttemptCount: 1, terminalCount: 0, terminalFailureCount: 0, statusCounts: { observing: 1 }
     },
     correlationGate: actorDownstreamGate(),
-    counters: { admissions: 1, attempts: 1, observationsAccepted: 1, observationsDeduplicated: 0, failures: 0 }
+    counters: {
+      admissions: 1, attempts: 1, transactionsRejected: 0, transactionRejectionReasons: {},
+      observationsAccepted: 1, observationsDeduplicated: 0, failures: 0
+    }
   };
 }
 
@@ -588,6 +591,20 @@ test("fails when every admitted actor mint is terminal with zero evidence", asyn
     runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
     (error) => error instanceof SmokeCheckError && error.check === "health"
       && /exhausted every admitted mint with zero actor evidence/.test(error.message)
+  );
+});
+
+test("fails when early-actor rejection-reason telemetry does not reconcile", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => {
+      health.earlyActors.counters.transactionsRejected = 2;
+      health.earlyActors.counters.transactionRejectionReasons = { "official-pump-instruction-invalid": 1 };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /rejection-reason telemetry did not reconcile/.test(error.message)
   );
 });
 

@@ -172,7 +172,8 @@ function persistedActorStatus(
     counters: {
       admissions: 0, duplicates: 0, cohortFull: 0, replayTooOld: 0, attempts: 0,
       signaturesReturned: 0, transactionsRequested: 0, transactionsUnavailable: 0,
-      transactionsRejected: 0, observationsAccepted: 0, observationsDeduplicated: 0, failures: 0
+      transactionsRejected: 0, transactionRejectionReasons: {},
+      observationsAccepted: 0, observationsDeduplicated: 0, failures: 0
     }
   };
 }

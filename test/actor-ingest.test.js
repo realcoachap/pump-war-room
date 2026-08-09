@@ -124,6 +124,35 @@ test("bounded acquisition persists minimized deduped evidence and explicit missi
   assert.equal(JSON.stringify(state.store.actorSummaries()).includes("actorAddress"), false);
 });
 
+test("publishes bounded transaction rejection reasons instead of masking parser incompatibility", async (t) => {
+  const state = await fixture();
+  t.after(state.close);
+  const signatureInfo = {
+    signature: signature(31), slot: 131, err: null,
+    blockTime: Math.floor((Date.parse(LAUNCH) + 30_000) / 1_000), confirmationStatus: "finalized"
+  };
+  const client = {
+    signaturesForAddress: async () => [signatureInfo],
+    transaction: async () => ({ marker: true })
+  };
+  const ingestor = new EarlyActorIngestor({
+    store: state.store,
+    client,
+    now: () => NOW,
+    extract: () => ({ status: "rejected", reason: "official-pump-instruction-invalid", observations: [] })
+  });
+  ingestor.start();
+  ingestor.admit({ mint: MINT, source: "pumpportal", createdAt: LAUNCH });
+  assert.equal(await ingestor.drainDue(), true);
+  const counters = ingestor.getStatus().counters;
+  assert.equal(counters.transactionsRejected, 1);
+  assert.deepEqual(counters.transactionRejectionReasons, { "official-pump-instruction-invalid": 1 });
+  assert.equal(state.store.actorState(MINT).status, "invalid-response");
+  assert.equal(ingestor.getStatus().cohort.failureRatio, 1);
+  counters.transactionRejectionReasons.tampered = 99;
+  assert.deepEqual(ingestor.getStatus().counters.transactionRejectionReasons, { "official-pump-instruction-invalid": 1 });
+});
+
 test("deduplicates the same finalized actor observation across bounded acquisition attempts", async (t) => {
   const state = await fixture();
   t.after(state.close);

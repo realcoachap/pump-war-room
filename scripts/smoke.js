@@ -266,6 +266,16 @@ function validateActorEngine(engine, path, check, expectedMode) {
     && Object.values(engine.cohort.statusCounts).reduce((total, count) => total + count, 0) === engine.cohort.admittedCount,
   check, `${path} cohort coverage was invalid`);
   validateActorDownstreamGate(engine.correlationGate, `${path}.correlationGate`, check);
+  const rejectionReasons = engine.counters?.transactionRejectionReasons;
+  requireValue(Number.isSafeInteger(engine.counters?.transactionsRejected)
+    && engine.counters.transactionsRejected >= 0
+    && rejectionReasons && typeof rejectionReasons === "object" && !Array.isArray(rejectionReasons)
+    && Object.keys(rejectionReasons).length <= 32
+    && Object.entries(rejectionReasons).every(([reason, count]) => /^[a-z][a-z0-9-]{0,63}$/.test(reason)
+      && Number.isSafeInteger(count) && count > 0)
+    && Object.values(rejectionReasons).reduce((total, count) => total + count, 0)
+      === engine.counters.transactionsRejected,
+  check, `${path} bounded transaction rejection-reason telemetry did not reconcile`);
   const expectedCoverage = engine.cohort.admittedCount
     ? engine.cohort.evidenceMintCount / engine.cohort.admittedCount : null;
   requireValue(engine.correlationGate.eligibleMintCount === engine.cohort.eligibleMintCount
