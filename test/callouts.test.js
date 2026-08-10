@@ -58,3 +58,80 @@ test("contains optional Bark construction failures and schedules a bounded recon
   ingestor.close();
   assert.equal(timers[0].cleared, true);
 });
+
+function fakeSocketHarness() {
+  const sockets = [];
+  const timers = [];
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+      this.closeCalls = 0;
+      sockets.push(this);
+    }
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+    emit(type, event = {}) {
+      for (const listener of this.listeners.get(type) || []) listener(event);
+    }
+    send() {}
+    close() { this.closeCalls++; }
+  }
+  return {
+    sockets,
+    timers,
+    WebSocketImpl: FakeWebSocket,
+    setTimeoutFn(callback, delay) {
+      const timer = { callback, delay, cleared: false, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeoutFn(timer) { timer.cleared = true; }
+  };
+}
+
+test("reconnects after a Bark socket error without waiting for a close event", () => {
+  const statuses = [];
+  const harness = fakeSocketHarness();
+  const ingestor = new BarkCalloutIngestor({
+    apiKey: "configured",
+    ...harness,
+    onStatus: (status, metadata) => statuses.push({ status, metadata })
+  });
+
+  ingestor.connect();
+  const failedSocket = harness.sockets[0];
+  failedSocket.emit("open");
+  failedSocket.emit("error", { error: new Error("upgrade returned non-101") });
+
+  assert.equal(failedSocket.closeCalls, 1);
+  assert.equal(harness.timers.length, 1);
+  assert.equal(harness.timers[0].delay, 1_000);
+  assert.deepEqual(statuses.map(({ status }) => status), ["connecting", "live", "degraded", "reconnecting"]);
+  assert.equal(statuses[2].metadata.reason, "socket-error");
+
+  harness.timers[0].callback();
+  assert.equal(harness.sockets.length, 2, "the bounded retry must construct a replacement socket");
+
+  failedSocket.emit("error", { error: new Error("stale error") });
+  failedSocket.emit("close");
+  assert.equal(harness.timers.length, 1, "stale events must not schedule a duplicate retry");
+  ingestor.close();
+});
+
+test("shutdown cancels a pending Bark socket-error retry", () => {
+  const harness = fakeSocketHarness();
+  const ingestor = new BarkCalloutIngestor({ apiKey: "configured", ...harness });
+
+  ingestor.connect();
+  harness.sockets[0].emit("error", { error: new Error("upgrade returned non-101") });
+  assert.equal(harness.timers.length, 1);
+
+  ingestor.close();
+  assert.equal(harness.timers[0].cleared, true);
+  harness.timers[0].callback();
+  assert.equal(harness.sockets.length, 1, "a cancelled retry must not reconnect after shutdown");
+});

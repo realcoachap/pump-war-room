@@ -78,6 +78,9 @@ export class BarkCalloutIngestor {
     socket.addEventListener("error", (event) => {
       if (this.closed || socket !== this.ws) return;
       this.onStatus?.("degraded", { reason: "socket-error", error: event?.error || new Error("Bark websocket error") });
+      this.ws = null;
+      try { socket.close(); } catch {}
+      this._scheduleReconnect("socket-error");
     });
     socket.addEventListener("close", () => {
       if (this.closed || socket !== this.ws) return;

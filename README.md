@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.9.4**
+Current release: **v0.9.5**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, and reports bounded anonymous early-actor observations without presenting an uncalibrated probability or trade signal.
 
@@ -119,6 +119,8 @@ v0.9.3 repairs restart-safe outcome refreshes when a current GeckoTerminal candl
 
 v0.9.4 hardens public delivery without changing intelligence, provider, cohort, ranking, alert, connector, execution, promotion, wallet, or retention scope. Live mode now rejects every filesystem-writing vault export before snapshot or path lookup, and the live UI does not present those local operator controls. Browser snapshot fetches use one abortable scheduler with a 15-second post-completion cooldown, a bounded trailing refresh, a 10-second fetch deadline, and one EventSource lifecycle instead of downloading a full snapshot for every event; if EventSource construction fails, the periodic snapshot fallback remains active. Large JSON responses use standards-compatible gzip when accepted; the current production-shaped snapshot compresses by more than 95%. Live health and snapshot responses explicitly disclose that readiness covers verified feed freshness plus mounted storage—not release eligibility, calibration, backup, or recovery—while demo mode identifies its simulated feed basis and does not claim mount verification.
 
+v0.9.5 repairs the optional Bark callout connector when its WebSocket emits an error without a matching close event. The connector invalidates and closes only the current failed socket, schedules one bounded exponential-backoff reconnect, ignores stale follow-up events, and still cancels pending retries during shutdown. The patch adds no provider, callout-data, ranking, alert, execution, promotion, wallet, retention, or dependency scope.
+
 v1.0.0 remains gated until at least 30 days of trustworthy live data after the repaired and hardened path, calibrated outcomes, monitoring, verified backups, and documented recovery. Deployment age alone does not satisfy that gate.
 
 The default public mainnet RPC is keyless, rate-limited, and explicitly not production-grade. Acquisition is therefore best-effort, partial, and unmeasured; rate limits, gaps, missing transactions, and invalid responses remain visible. The worker never backfills launches from before it became active. PumpPortal's metered token-trade stream stays disabled because it requires a funded linked wallet and spend, and its response-frame fields are not documented in the official material reviewed for this release. The worker pins the reviewed `https://api.mainnet.solana.com` origin; changing providers requires a separately reviewed code change rather than an arbitrary environment URL. Set `EARLY_ACTOR_ENRICHMENT=false` to disable the worker without affecting the rest of the War Room.
@@ -189,7 +191,7 @@ Vault exports are filesystem-writing operator actions, not public live API capab
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.4 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.5 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.
