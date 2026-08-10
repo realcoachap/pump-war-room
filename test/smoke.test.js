@@ -496,7 +496,7 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     }),
     "/api/briefs/daily": JSON.stringify(measuredBrief("daily")),
     "/api/briefs/weekly": JSON.stringify(measuredBrief("weekly")),
-    "POST /api/export/coin/%ZZ": JSON.stringify({
+    "POST /api/export/coin/not-a-solana-mint": JSON.stringify({
       ok: false,
       code: "vault-export-disabled",
       error: "Vault export is disabled in live mode",
@@ -535,7 +535,7 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       : { "content-length": String(payload.length) };
     const status = Number.isInteger(statusOverride)
       ? statusOverride
-      : requestKey === "POST /api/export/coin/%ZZ" ? 403 : 200;
+      : requestKey === "POST /api/export/coin/not-a-solana-mint" ? 403 : 200;
     res.writeHead(status, {
       "content-type": contentType,
       "x-content-type-options": "nosniff",
@@ -586,7 +586,7 @@ test("fails release smoke when the public edge omits snapshot gzip evidence", as
 
 test("fails release smoke when the live export route lacks the typed disabled response", async (t) => {
   const baseUrl = await fixture(t, {
-    "POST /api/export/coin/%ZZ": JSON.stringify({ ok: false, code: "unexpected", mode: "live" })
+    "POST /api/export/coin/not-a-solana-mint": JSON.stringify({ ok: false, code: "unexpected", mode: "live" })
   });
   await assert.rejects(
     runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
@@ -594,11 +594,11 @@ test("fails release smoke when the live export route lacks the typed disabled re
   );
 });
 
-test("fails release smoke when the malformed live export route bypasses the guard", async (t) => {
-  const baseUrl = await fixture(t, {}, { "POST /api/export/coin/%ZZ": { status: 400 } });
+test("fails release smoke when the invalid live export route bypasses the guard", async (t) => {
+  const baseUrl = await fixture(t, {}, { "POST /api/export/coin/not-a-solana-mint": { status: 400 } });
   await assert.rejects(
     runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
-    (error) => error instanceof SmokeCheckError && error.check === "/api/export/coin/%ZZ"
+    (error) => error instanceof SmokeCheckError && error.check === "/api/export/coin/not-a-solana-mint"
       && /expected HTTP 403, received 400/.test(error.message)
   );
 });

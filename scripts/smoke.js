@@ -434,7 +434,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   if (expectedMode === "live") {
     requireValue(snapshot.publicDelivery?.vaultExports === "disabled", "snapshot",
       "live vault export boundary was not declared disabled before guard verification");
-    vaultExportGuardResult = await request(normalizedBaseUrl, "/api/export/coin/%ZZ", {
+    vaultExportGuardResult = await request(normalizedBaseUrl, "/api/export/coin/not-a-solana-mint", {
       timeoutMs,
       fetchImpl,
       method: "POST",

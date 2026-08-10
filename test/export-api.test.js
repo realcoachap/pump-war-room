@@ -123,7 +123,7 @@ test("live export routes fail closed before creating or overwriting vault files"
     "/api/export/daily",
     "/api/export/weekly",
     `/api/export/coin/${liveMint}`,
-    "/api/export/coin/%ZZ"
+    "/api/export/coin/not-a-solana-mint"
   ];
 
   for (const route of routes) assertLiveDisabled(await postJson(baseUrl, route));
