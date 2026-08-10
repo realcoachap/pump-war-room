@@ -10,7 +10,7 @@ import { PumpPortalIngestor } from "./ingest.js";
 import { BarkCalloutIngestor } from "./callouts.js";
 import { exportCoin, exportMeasuredBrief } from "./vault.js";
 import { analyzeSnapshot } from "./analyst.js";
-import { createRateLimiter, HttpError, readJsonBody } from "./http.js";
+import { createRateLimiter, encodeJsonResponse, HttpError, readJsonBody } from "./http.js";
 import { createTop100 } from "./ranking.js";
 import { createRuntimeTelemetry, FEED_STALE_AFTER_MS, observeFeed, observeStorage } from "./observability.js";
 import { GECKOTERMINAL_PROVIDER, GeckoTerminalClient } from "./geckoterminal.js";
@@ -42,6 +42,23 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appVersion = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
 const port = Number(process.env.PORT || 4173);
 const mode = process.env.PUMP_MODE === "live" ? "live" : "demo";
+const readinessScope = Object.freeze({
+  schemaVersion: 1,
+  statusBasis: mode === "live"
+    ? "verified-feed-freshness-and-mounted-storage"
+    : "simulated-feed-state",
+  mountEvidenceRequired: mode === "live",
+  releaseEligibility: "separate-smoke-data-calibration-backup-and-recovery-gates",
+  cohortCoverageIncluded: false,
+  calibrationIncluded: false,
+  backupRecoveryIncluded: false
+});
+const publicDelivery = Object.freeze({
+  schemaVersion: 1,
+  snapshotEncoding: "gzip-when-accepted",
+  browserRefresh: "coalesced-with-15-second-post-completion-cooldown",
+  vaultExports: mode === "live" ? "disabled" : "local-demo-only"
+});
 const dbPath = path.resolve(root, process.env.DB_PATH || "data/pump-war-room.db");
 const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
 const startedAt = new Date().toISOString();
@@ -683,7 +700,8 @@ function snapshot() {
     disclaimer: "Bounded finalized observations are partial, can miss transactions, and describe activity only. They do not establish identity, coordination, automation, intent, skill, safety, or a trade signal."
   };
   return {
-    version: appVersion, generatedAt, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage, telemetry: runtimeTelemetry.snapshot(),
+    version: appVersion, generatedAt, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage,
+    telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery,
     feedStatus, feedHealth: feed.state, feed, calloutStatus, lastEventAt, lastMintAt,
     liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
     demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
@@ -1057,7 +1075,8 @@ const server = http.createServer(async (req, res) => {
       const status = healthStatus(feed);
       return json(res, status === "healthy" ? 200 : 503, {
       ok: status === "healthy", status, version: appVersion, mode, requestId,
-      service: runtimeTelemetry.service(), storage, feed, telemetry: runtimeTelemetry.snapshot(), feedStatus, feedHealth: feed.state, calloutStatus,
+      service: runtimeTelemetry.service(), storage, feed, telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery,
+      feedStatus, feedHealth: feed.state, calloutStatus,
       lastEventAt, lastMintAt,
       indexed: mode === "live" ? store.countBySource("pumpportal").tokens : store.count(),
       liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
@@ -1194,18 +1213,21 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/export/daily" || url.pathname === "/api/export/weekly") {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
+      if (mode === "live") return liveVaultExportDisabled(res, requestId);
       const period = url.pathname.endsWith("weekly") ? "weekly" : "daily";
       await exportMeasuredBrief(vaultPath, snapshot().actionIntelligence.briefs[period]);
-      return json(res, 200, { ok: true, period });
+      return json(res, 200, { ok: true, period, mode, scope: "local-demo-operator-vault", requestId });
     }
     if (url.pathname.startsWith("/api/export/coin/")) {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
+      if (mode === "live") return liveVaultExportDisabled(res, requestId);
       let mint;
       try { mint = decodeURIComponent(url.pathname.split("/").pop()); } catch { throw new HttpError(400, "Mint path is invalid"); }
       if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
       const token = snapshot().tokens.find((candidate) => candidate.mint === mint);
       if (!token) return json(res, 404, { error: "Token not found" });
-      await exportCoin(vaultPath, token); return json(res, 200, { ok: true });
+      await exportCoin(vaultPath, token);
+      return json(res, 200, { ok: true, resource: "coin", mode, scope: "local-demo-operator-vault", requestId });
     }
     let target = url.pathname === "/" ? "/index.html" : url.pathname;
     target = path.normalize(target).replace(/^(\.\.(\/|\\|$))+/, "");
@@ -1230,9 +1252,26 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+function liveVaultExportDisabled(res, requestId) {
+  return json(res, 403, {
+    ok: false,
+    code: "vault-export-disabled",
+    error: "Vault export is disabled in live mode",
+    mode: "live",
+    requestId
+  });
+}
+
 function json(res, status, value, headers = {}) {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...headers });
-  res.end(JSON.stringify(value));
+  const encoded = encodeJsonResponse(value, { acceptEncoding: res.req?.headers?.["accept-encoding"] });
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    ...headers,
+    ...encoded.headers
+  });
+  res.end(encoded.body);
 }
 server.headersTimeout = 5_000;
 server.requestTimeout = 10_000;

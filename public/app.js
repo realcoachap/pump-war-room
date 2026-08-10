@@ -8,13 +8,16 @@ import {
   readPreferences,
   writePreferences
 } from "./preferences.js";
+import {
+  createSnapshotLiveUpdates,
+  createSnapshotRefreshScheduler
+} from "./snapshot-refresh.js";
 
 void PREFERENCE_KEY;
 
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, publicDelivery: { vaultExports: "disabled" }, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
-let refreshInFlight = false;
 let caesarRequestPending = false;
 let deepLinkOpened = false;
 let compareRequestSequence = 0;
@@ -926,6 +929,8 @@ async function askCaesar(question) {
 
 function render() {
   $("#app-version").textContent = `v${state.version || "—"}`;
+  const exportDaily = $("#export-daily");
+  if (exportDaily) exportDaily.hidden = !vaultExportsEnabled();
   renderFeedObservability();
   renderStats();
   renderLeaderboard();
@@ -939,11 +944,13 @@ function render() {
   renderAlerts();
 }
 
-async function refresh() {
-  if (refreshInFlight) return;
-  refreshInFlight = true;
+function vaultExportsEnabled() {
+  return state.mode === "demo" && state.publicDelivery?.vaultExports === "local-demo-only";
+}
+
+async function refresh({ signal } = {}) {
   try {
-    const response = await fetch("/api/snapshot", { cache: "no-store" });
+    const response = await fetch("/api/snapshot", { cache: "no-store", signal });
     if (!response.ok) throw new Error(`Snapshot returned ${response.status}`);
     const snapshot = await response.json();
     state = {
@@ -968,11 +975,10 @@ async function refresh() {
       void openCoin(deepLinkMint);
     }
   } catch (error) {
+    if (error?.name === "AbortError") return;
     snapshotFailed = true;
     renderFeedObservability();
     console.warn("Snapshot refresh failed", error);
-  } finally {
-    refreshInFlight = false;
   }
 }
 
@@ -1016,7 +1022,7 @@ function openToken(mint, dossier = null) {
     <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>RISK COMPOSITE</label><strong class="risk-unverified">WITHHELD</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>ACTIVITY EVIDENCE</label><strong>SEE BELOW</strong><small>never rank input</small></div></div>
     <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${riskIdentityDetail(token)}${earlyActorDetail(dossier?.earlyActor || state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.summary, state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.acquisition)}${outcomeDetail(leaderboardEntry)}
     <div class="coin-timeline"><span class="kicker">DISCRETE RETAINED TIMELINE // NO INTERPOLATION</span><div id="coin-timeline"><div class="action-empty">Loading typed observations…</div></div></div>
-    <div class="detail-actions"><button class="primary" id="watch-coin" aria-pressed="${watched(token.mint)}">${watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER"}</button><button id="export-coin">EXPORT TO OBSIDIAN</button><a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
+    <div class="detail-actions"><button class="primary" id="watch-coin" aria-pressed="${watched(token.mint)}">${watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER"}</button>${vaultExportsEnabled() ? '<button id="export-coin">EXPORT TO OBSIDIAN</button>' : ""}<a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
   $("#token-dialog").showModal();
   void renderCoinTimeline(token.mint);
   $("#watch-coin").onclick = () => {
@@ -1024,7 +1030,8 @@ function openToken(mint, dossier = null) {
     $("#watch-coin").textContent = watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER";
     $("#watch-coin").setAttribute("aria-pressed", String(watched(token.mint)));
   };
-  $("#export-coin").onclick = async () => {
+  const exportCoinButton = $("#export-coin");
+  if (exportCoinButton) exportCoinButton.onclick = async () => {
     try {
       const response = await fetch(`/api/export/coin/${encodeURIComponent(token.mint)}`, { method: "POST" });
       const result = await response.json();
@@ -1042,6 +1049,7 @@ function toast(message) {
 
 $(".dialog-close").onclick = () => $("#token-dialog").close();
 $("#export-daily").onclick = async () => {
+  if (!vaultExportsEnabled()) { toast("Vault exports are disabled on the public live service"); return; }
   try {
     const response = await fetch("/api/export/daily", { method: "POST" });
     const result = await response.json();
@@ -1148,9 +1156,22 @@ function tickClock() {
 tickClock();
 setInterval(tickClock, 1000);
 applyFilterState(filtersFromUrl());
-await refresh();
-const stream = new EventSource("/api/stream");
-stream.onopen = () => { dashboardStreamState = "open"; renderFeedObservability(); };
-for (const event of ["new-token", "token-update", "callout", "alert", "material-change", "status"]) stream.addEventListener(event, () => refresh());
-stream.onerror = () => { dashboardStreamState = "reconnecting"; renderFeedObservability(); };
-setInterval(refresh, 15_000);
+
+const snapshotRefreshScheduler = createSnapshotRefreshScheduler({ refresh });
+const snapshotLiveUpdates = createSnapshotLiveUpdates({
+  scheduler: snapshotRefreshScheduler,
+  onState: (streamState) => {
+    dashboardStreamState = streamState;
+    renderFeedObservability();
+  }
+});
+
+addEventListener("pagehide", () => snapshotLiveUpdates.stop());
+addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  snapshotLiveUpdates.start();
+  snapshotRefreshScheduler.request({ immediate: true });
+});
+
+snapshotLiveUpdates.start();
+snapshotRefreshScheduler.request({ immediate: true });

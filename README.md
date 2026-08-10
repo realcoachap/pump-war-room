@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.9.3**
+Current release: **v0.9.4**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, and reports bounded anonymous early-actor observations without presenting an uncalibrated probability or trade signal.
 
@@ -12,7 +12,7 @@ This repository is configured for Railway with a health check and Railway-provid
 2. Keep `PUMP_MODE=demo` for the safe visual demo, or set `PUMP_MODE=live` to capture every new launch and migration observed on the public PumpPortal feed.
 3. Generate a public domain in the service's **Networking** settings.
 
-Optional variables are documented in `.env.example`. Railway's local filesystem is ephemeral; attach a volume at `/app/data` and set `DB_PATH=/app/data/pump-war-room.db` if you want SQLite history to survive redeploys. Attach another volume and set `VAULT_PATH` if you want server-side Obsidian exports to persist.
+Optional variables are documented in `.env.example`. Railway's local filesystem is ephemeral; attach a volume at `/app/data` and set `DB_PATH=/app/data/pump-war-room.db` if you want SQLite history to survive redeploys. `VAULT_PATH` is only for a local demo/operator process; public live mode deliberately disables every filesystem-writing vault export.
 
 ## Database backup and restore verification
 
@@ -117,7 +117,9 @@ v0.9.2 repairs the prospective actor source contract after Pump's documented Apr
 
 v0.9.3 repairs restart-safe outcome refreshes when a current GeckoTerminal candle response no longer contains the originally retained baseline minute. The merge keeps the first observed durable baseline, preserves every first-observed outcome window, and recomputes the record status from the merged baseline and windows for the zero, partial, and complete cases. This prevents a valid sparse provider revision from entering an endless degraded retry loop while continuing to withhold missing returns and provider values. The patch changes no provider, cohort, ranking, alert, connector, execution, promotion, wallet, or retention scope.
 
-v1.0.0 remains gated until at least 30 days of trustworthy live data after this data-path repair, calibrated outcomes, monitoring, verified backups, and documented recovery. Deployment age alone does not satisfy that gate.
+v0.9.4 hardens public delivery without changing intelligence, provider, cohort, ranking, alert, connector, execution, promotion, wallet, or retention scope. Live mode now rejects every filesystem-writing vault export before snapshot or path lookup, and the live UI does not present those local operator controls. Browser snapshot fetches use one abortable scheduler with a 15-second post-completion cooldown, a bounded trailing refresh, a 10-second fetch deadline, and one EventSource lifecycle instead of downloading a full snapshot for every event; if EventSource construction fails, the periodic snapshot fallback remains active. Large JSON responses use standards-compatible gzip when accepted; the current production-shaped snapshot compresses by more than 95%. Live health and snapshot responses explicitly disclose that readiness covers verified feed freshness plus mounted storage—not release eligibility, calibration, backup, or recovery—while demo mode identifies its simulated feed basis and does not claim mount verification.
+
+v1.0.0 remains gated until at least 30 days of trustworthy live data after the repaired and hardened path, calibrated outcomes, monitoring, verified backups, and documented recovery. Deployment age alone does not satisfy that gate.
 
 The default public mainnet RPC is keyless, rate-limited, and explicitly not production-grade. Acquisition is therefore best-effort, partial, and unmeasured; rate limits, gaps, missing transactions, and invalid responses remain visible. The worker never backfills launches from before it became active. PumpPortal's metered token-trade stream stays disabled because it requires a funded linked wallet and spend, and its response-frame fields are not documented in the official material reviewed for this release. The worker pins the reviewed `https://api.mainnet.solana.com` origin; changing providers requires a separately reviewed code change rather than an arbitrary environment URL. Set `EARLY_ACTOR_ENRICHMENT=false` to disable the worker without affecting the rest of the War Room.
 
@@ -139,7 +141,7 @@ The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permissi
 
 - Live/demo launch stream with local SQLite persistence
 - Production uptime, verified-feed staleness, source-scoped counters, structured redacted error telemetry, and runtime mount evidence
-- Railway readiness fails closed on stale/degraded feeds or missing mount evidence. Deterministic release smoke additionally enforces version/mode agreement, zero observed HTTP 5xx responses, safe response headers, complete fixed-cohort risk coverage, bounded parser-invalid acquisitions, current-parser audit evidence, at least one accepted current-parser early-actor observation, and no more than 25% failed early-actor acquisition among mints whose attempts have actually begun; untouched future admissions cannot hide attempted failures
+- Railway readiness fails closed on stale/degraded feeds or missing mount evidence and explicitly limits its status basis to feed freshness plus mounted storage. It does not claim release eligibility, calibration, backup, or recovery verification. Deterministic release smoke separately enforces version/mode agreement, zero observed HTTP 5xx responses, safe response headers, complete fixed-cohort risk coverage, bounded parser-invalid acquisitions, current-parser audit evidence, at least one accepted current-parser early-actor observation, and no more than 25% failed early-actor acquisition among mints whose attempts have actually begun; untouched future admissions cannot hide attempted failures
 - Online-consistent SQLite backups plus a non-destructive disposable restore-verification drill
 - Live-mode startup cleanup that removes legacy synthetic demo rows without touching verified live records or callouts
 - Feed telemetry that distinguishes an open socket from verified mint activity and reports stale or malformed upstream data
@@ -157,10 +159,11 @@ The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permissi
 - Optional restart-safe, rate-limited Telegram Bot API delivery with aggregate-only public health; no bot credentials or destination identifiers are persisted
 - Browser-local watchlists and saved URL filter lenses with bounded JSON portability; no anonymous server-side or cross-device account claim
 - Deep-linkable retained coin dossiers, typed cursor timelines, and explicit 2–4 mint evidence comparison
-- Frozen closed-UTC daily and weekly measured briefs with current/prior denominators, suppression gates, unmeasured feed coverage, and Markdown export under `vault/`
+- Frozen closed-UTC daily and weekly measured briefs with current/prior denominators, suppression gates, unmeasured feed coverage, and local demo/operator Markdown export under `vault/`
 - Mobile and desktop command-center UI
 - Read-only deep links from every token dossier to Pump.fun, Dex Screener, and Fomo
 - SSE browser updates and JSON health/snapshot APIs
+- Coalesced single-flight snapshot refreshes plus gzip negotiation for large JSON responses; live vault-writing routes and controls are disabled
 
 ## API
 
@@ -175,16 +178,18 @@ The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `
 - `GET /api/briefs/daily`
 - `GET /api/briefs/weekly`
 - `POST /api/agent/chat` with JSON `{ "question": "What is moving?" }`
-- `POST /api/export/daily`
-- `POST /api/export/weekly`
-- `POST /api/export/coin/:mint`
+- `POST /api/export/daily` (local demo/operator mode only)
+- `POST /api/export/weekly` (local demo/operator mode only)
+- `POST /api/export/coin/:mint` (local demo/operator mode only)
+
+Vault exports are filesystem-writing operator actions, not public live API capabilities. In `PUMP_MODE=live`, all three routes fail closed with HTTP `403` and the bounded JSON code `vault-export-disabled` before snapshot lookup or vault access. Demo-mode success responses identify their `local-demo-operator-vault` scope without returning filesystem paths. Do not expose a demo-mode service publicly merely to make these operator actions remote; this patch deliberately adds no authentication claim.
 
 ## Verify
 
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.3 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.4 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

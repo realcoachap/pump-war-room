@@ -330,20 +330,33 @@ function validateEmbeddedRiskIdentities(value, path = "snapshot") {
   }
 }
 
-async function request(baseUrl, pathname, { timeoutMs, fetchImpl }) {
+async function request(baseUrl, pathname, {
+  timeoutMs,
+  fetchImpl,
+  method = "GET",
+  expectedStatus = 200,
+  headers = {}
+}) {
   const url = new URL(pathname, `${baseUrl}/`);
   let response;
   try {
-    response = await fetchImpl(url, { headers: { accept: "application/json,text/html,text/javascript" }, signal: AbortSignal.timeout(timeoutMs) });
+    response = await fetchImpl(url, {
+      method,
+      headers: { accept: "application/json,text/html,text/javascript", ...headers },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
   } catch (error) {
     throw new SmokeCheckError(pathname, `request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   const body = await response.text();
-  requireValue(response.status === 200, pathname, `expected HTTP 200, received ${response.status}`);
+  requireValue(response.status === expectedStatus, pathname, `expected HTTP ${expectedStatus}, received ${response.status}`);
   return {
     body,
     contentType: response.headers.get("content-type") || "",
+    contentEncoding: response.headers.get("content-encoding") || "",
+    contentLength: response.headers.get("content-length") || "",
     nosniff: response.headers.get("x-content-type-options") || "",
+    vary: response.headers.get("vary") || "",
     status: response.status,
     url: url.toString()
   };
@@ -400,11 +413,12 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(["live", "demo"].includes(expectedMode), "configuration", "expectedMode must be live or demo");
 
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-  const [healthResult, snapshotResult, htmlResult, scriptResult, preferencesResult, stylesResult, termsResult, privacyResult] = await Promise.all([
-    request(normalizedBaseUrl, "/api/health", { timeoutMs, fetchImpl }),
-    request(normalizedBaseUrl, "/api/snapshot", { timeoutMs, fetchImpl }),
+  const [healthResult, snapshotResult, htmlResult, scriptResult, refreshScriptResult, preferencesResult, stylesResult, termsResult, privacyResult] = await Promise.all([
+    request(normalizedBaseUrl, "/api/health", { timeoutMs, fetchImpl, headers: { "accept-encoding": "gzip" } }),
+    request(normalizedBaseUrl, "/api/snapshot", { timeoutMs, fetchImpl, headers: { "accept-encoding": "gzip" } }),
     request(normalizedBaseUrl, "/", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/app.js", { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, "/snapshot-refresh.js", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/preferences.js", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/styles.css", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/terms.html", { timeoutMs, fetchImpl }),
@@ -416,6 +430,24 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(snapshot.version === expectedVersion, "snapshot", `version ${snapshot.version ?? "missing"} did not match ${expectedVersion}`);
   requireValue(snapshot.mode === expectedMode, "snapshot", `mode ${snapshot.mode ?? "missing"} did not match ${expectedMode}`);
   requireValue(snapshot.status === "healthy", "snapshot", `status ${snapshot.status ?? "missing"} was not healthy`);
+  let vaultExportGuardResult = null;
+  if (expectedMode === "live") {
+    requireValue(snapshot.publicDelivery?.vaultExports === "disabled", "snapshot",
+      "live vault export boundary was not declared disabled before guard verification");
+    vaultExportGuardResult = await request(normalizedBaseUrl, "/api/export/coin/%ZZ", {
+      timeoutMs,
+      fetchImpl,
+      method: "POST",
+      expectedStatus: 403
+    });
+    const vaultExportGuard = parseJson(vaultExportGuardResult, "vault export guard");
+    requireValue(vaultExportGuard?.ok === false
+      && vaultExportGuard.code === "vault-export-disabled"
+      && vaultExportGuard.mode === "live"
+      && vaultExportGuardResult.contentType.toLowerCase().includes("application/json")
+      && vaultExportGuardResult.nosniff.toLowerCase() === "nosniff",
+    "vault export guard", "live export route did not fail closed with the typed disabled response");
+  }
   if (expectedMode === "live" && (!Array.isArray(snapshot.riskIntelligence?.cohort?.observations)
     || snapshot.riskIntelligence.cohort.observations.length !== RISK_COHORT_LIMIT)) {
     throw new SmokeCheckError("snapshot", "risk identity fixed cohort did not expose 120 unique inspectable observations");
@@ -444,6 +476,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     ["snapshot", snapshotResult, "application/json"],
     ["html", htmlResult, "text/html"],
     ["app.js", scriptResult, "text/javascript"],
+    ["snapshot-refresh.js", refreshScriptResult, "text/javascript"],
     ["preferences.js", preferencesResult, "text/javascript"],
     ["styles.css", stylesResult, "text/css"],
     ["terms", termsResult, "text/html"],
@@ -457,6 +490,14 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     requireValue(result.contentType.toLowerCase().includes(expectedType), check, `content-type ${result.contentType || "missing"} did not include ${expectedType}`);
     requireValue(result.nosniff.toLowerCase() === "nosniff", check, "x-content-type-options nosniff was missing");
   }
+  const compressedLength = Number(snapshotResult.contentLength);
+  requireValue(snapshotResult.contentEncoding.toLowerCase() === "gzip", "snapshot",
+    `gzip content encoding was missing at the public edge (${snapshotResult.contentEncoding || "none"})`);
+  requireValue(snapshotResult.vary.toLowerCase().split(",").map((value) => value.trim()).includes("accept-encoding"),
+    "snapshot", `Vary: Accept-Encoding was missing at the public edge (${snapshotResult.vary || "none"})`);
+  requireValue(Number.isSafeInteger(compressedLength) && compressedLength > 0
+    && compressedLength < Buffer.byteLength(snapshotResult.body) / 2,
+  "snapshot", "public snapshot was not materially smaller over gzip transport");
 
   requireValue(dossier?.schemaVersion === 1 && dossier?.token?.mint === endpointMints[0]
     && dossier?.radar && dossier?.timeline === `/api/coins/${endpointMints[0]}/timeline`, "dossier", "strict public dossier contract was missing");
@@ -864,7 +905,30 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     }
   }
 
+  const expectedVaultExportState = expectedMode === "live" ? "disabled" : "local-demo-only";
+  const expectedReadinessBasis = expectedMode === "live"
+    ? "verified-feed-freshness-and-mounted-storage"
+    : "simulated-feed-state";
+  requireValue(snapshot.publicDelivery?.schemaVersion === 1
+    && snapshot.publicDelivery?.snapshotEncoding === "gzip-when-accepted"
+    && snapshot.publicDelivery?.browserRefresh === "coalesced-with-15-second-post-completion-cooldown"
+    && snapshot.publicDelivery?.vaultExports === expectedVaultExportState
+    && JSON.stringify(health.publicDelivery) === JSON.stringify(snapshot.publicDelivery),
+  "snapshot", "public delivery hardening contract was missing or disagreed across health and snapshot");
+  requireValue(health.readinessScope?.schemaVersion === 1
+    && health.readinessScope?.statusBasis === expectedReadinessBasis
+    && health.readinessScope?.mountEvidenceRequired === (expectedMode === "live")
+    && health.readinessScope?.releaseEligibility === "separate-smoke-data-calibration-backup-and-recovery-gates"
+    && health.readinessScope?.cohortCoverageIncluded === false
+    && health.readinessScope?.calibrationIncluded === false
+    && health.readinessScope?.backupRecoveryIncluded === false
+    && JSON.stringify(snapshot.readinessScope) === JSON.stringify(health.readinessScope),
+  "health", "readiness scope falsely implied release, calibration, backup, or recovery verification");
+
   requireValue(htmlResult.body.includes(`<meta name="application-version" content="${expectedVersion}">`), "html", "release version marker was missing");
+  requireValue(htmlResult.body.includes('data-release-marker="public-delivery-hardening-v1"')
+    && htmlResult.body.includes('id="export-daily" class="quiet-button" hidden'),
+  "html", "public delivery hardening marker or fail-closed live export control was missing");
   requireValue(htmlResult.body.includes("NO WALLET · NO EXECUTION"), "html", "read-only safety marker was missing");
   requireValue(htmlResult.body.includes('data-release-marker="provider-observed-outcome-engine"') && htmlResult.body.includes("On-chain data provided by GeckoTerminal") && htmlResult.body.includes("Powered by CoinGecko"), "html", "outcome engine attribution marker was missing");
   requireValue(htmlResult.body.includes('data-release-marker="risk-identity-evidence-v1"') && htmlResult.body.includes("NO COMPOSITE SCORE"), "html", "risk identity release marker was missing");
@@ -887,6 +951,12 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && scriptResult.body.includes("installation-scoped, non-reversible labels")
     && scriptResult.body.includes("trade signal"),
   "app.js", "anonymous early-actor evidence UI markers were missing");
+  requireValue(scriptResult.body.includes("createSnapshotRefreshScheduler")
+    && scriptResult.body.includes("vaultExportsEnabled")
+    && refreshScriptResult.body.includes("SNAPSHOT_REFRESH_COOLDOWN_MS = 15_000")
+    && refreshScriptResult.body.includes("SNAPSHOT_REFRESH_TIMEOUT_MS = 10_000")
+    && refreshScriptResult.body.includes("createSnapshotLiveUpdates"),
+  "snapshot-refresh.js", "bounded snapshot refresh or public vault-write UI gate was missing");
   requireValue(preferencesResult.body.includes("normalizePreferences") && preferencesResult.body.includes("WATCHLIST_LIMIT = 50")
     && preferencesResult.body.includes("PRESET_LIMIT = 12"), "preferences.js", "bounded browser preference contract was missing");
   requireValue(stylesResult.body.includes(".outcome-source,footer{font-size:10px}"), "styles.css", "minimum-size provider attribution style was missing");
@@ -928,13 +998,14 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       earlyActorState: health.earlyActors.status
     },
     http: {
-      health: 200, snapshot: 200, html: 200, appJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
-      dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200
+      health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
+      dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200,
+      vaultExportGuard: vaultExportGuardResult ? 403 : "not-applicable"
     },
     markers: {
       version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
       actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-      parserRevision: true, anonymousEarlyActors: true, legalNotices: true
+      parserRevision: true, anonymousEarlyActors: true, publicDeliveryHardening: true, legalNotices: true
     }
   };
 }

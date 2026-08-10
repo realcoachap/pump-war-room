@@ -173,8 +173,23 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   privateStore.addEvent("callout", privateCallout);
   privateStore.db.close();
 
-  const { body: snapshot } = await json(baseUrl, "/api/snapshot");
+  const { response: snapshotResponse, body: snapshot } = await json(baseUrl, "/api/snapshot", {
+    headers: { "accept-encoding": "gzip" }
+  });
+  assert.equal(snapshotResponse.headers.get("content-encoding"), "gzip");
+  assert.equal(snapshotResponse.headers.get("vary"), "Accept-Encoding");
+  assert.ok(Number(snapshotResponse.headers.get("content-length")) < Buffer.byteLength(JSON.stringify(snapshot)) / 4);
   assert.equal(snapshot.version, expectedVersion);
+  assert.deepEqual(snapshot.publicDelivery, {
+    schemaVersion: 1,
+    snapshotEncoding: "gzip-when-accepted",
+    browserRefresh: "coalesced-with-15-second-post-completion-cooldown",
+    vaultExports: "local-demo-only"
+  });
+  assert.equal(snapshot.readinessScope.statusBasis, "simulated-feed-state");
+  assert.equal(snapshot.readinessScope.mountEvidenceRequired, false);
+  assert.equal(snapshot.readinessScope.calibrationIncluded, false);
+  assert.equal(snapshot.readinessScope.backupRecoveryIncluded, false);
   assertNoRawIdentityKeys(snapshot, "snapshot");
   assert.doesNotMatch(JSON.stringify(snapshot), new RegExp([privateToken.creator, rawDeployer, rawCaller, rawSignature].join("|")));
   assert.equal(JSON.stringify(snapshot).includes(privacyMarker), false);
@@ -222,6 +237,8 @@ test("action intelligence API enforces strict methods, bounds, and public contra
     recommendation: snapshot.earlyActorIntelligence.downstream.recommendationImpact
   }, { ranking: "none", risk: "none", telegram: "none", recommendation: "none" });
   const { body: health } = await json(baseUrl, "/api/health");
+  assert.deepEqual(health.publicDelivery, snapshot.publicDelivery);
+  assert.deepEqual(health.readinessScope, snapshot.readinessScope);
   assert.equal(health.earlyActors.status, "simulation-disabled");
   assert.equal(health.earlyActors.cohort.admittedCount, 1);
   assert.equal(health.earlyActors.cohort.pendingAttemptCount, 1);

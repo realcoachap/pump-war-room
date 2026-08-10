@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { gzipSync } from "node:zlib";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.9.3";
+const version = "0.9.4";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -338,6 +339,21 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       status: "healthy",
       version,
       mode: "live",
+      readinessScope: {
+        schemaVersion: 1,
+        statusBasis: "verified-feed-freshness-and-mounted-storage",
+        mountEvidenceRequired: true,
+        releaseEligibility: "separate-smoke-data-calibration-backup-and-recovery-gates",
+        cohortCoverageIncluded: false,
+        calibrationIncluded: false,
+        backupRecoveryIncluded: false
+      },
+      publicDelivery: {
+        schemaVersion: 1,
+        snapshotEncoding: "gzip-when-accepted",
+        browserRefresh: "coalesced-with-15-second-post-completion-cooldown",
+        vaultExports: "disabled"
+      },
       service: { startedAt: "2026-08-08T11:59:30.000Z", uptimeSeconds: 30 },
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
@@ -385,6 +401,21 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       version,
       mode: "live",
       status: "healthy",
+      readinessScope: {
+        schemaVersion: 1,
+        statusBasis: "verified-feed-freshness-and-mounted-storage",
+        mountEvidenceRequired: true,
+        releaseEligibility: "separate-smoke-data-calibration-backup-and-recovery-gates",
+        cohortCoverageIncluded: false,
+        calibrationIncluded: false,
+        backupRecoveryIncluded: false
+      },
+      publicDelivery: {
+        schemaVersion: 1,
+        snapshotEncoding: "gzip-when-accepted",
+        browserRefresh: "coalesced-with-15-second-post-completion-cooldown",
+        vaultExports: "disabled"
+      },
       service: { uptimeSeconds: 30 },
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, freshnessBasis: "verified-feed-activity" },
@@ -465,8 +496,16 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     }),
     "/api/briefs/daily": JSON.stringify(measuredBrief("daily")),
     "/api/briefs/weekly": JSON.stringify(measuredBrief("weekly")),
-    "/": `<meta name="application-version" content="${version}">NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section>`,
-    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} fetch('/api/compare?mints='); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal",
+    "POST /api/export/coin/%ZZ": JSON.stringify({
+      ok: false,
+      code: "vault-export-disabled",
+      error: "Vault export is disabled in live mode",
+      mode: "live",
+      requestId: "00000000-0000-4000-8000-000000000001"
+    }),
+    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section></body>`,
+    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} function createSnapshotRefreshScheduler() {} function vaultExportsEnabled() {} fetch('/api/compare?mints='); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal",
+    "/snapshot-refresh.js": "export const SNAPSHOT_REFRESH_COOLDOWN_MS = 15_000; export const SNAPSHOT_REFRESH_TIMEOUT_MS = 10_000; export function createSnapshotLiveUpdates() {}",
     "/preferences.js": "export const WATCHLIST_LIMIT = 50; export const PRESET_LIMIT = 12; export function normalizePreferences() {}",
     "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}@media(max-width:650px){}",
     "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p><p>Early-actor evidence has partial and unmeasured coverage and does not establish identity or coordination and is not a trade signal.</p>",
@@ -476,7 +515,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     bodies[pathname] = typeof override === "function" ? override(bodies[pathname]) : override;
   }
   const server = http.createServer((req, res) => {
-    const value = bodies[req.url];
+    const requestKey = `${req.method} ${req.url}`;
+    const value = bodies[requestKey] ?? bodies[req.url];
     if (value === undefined) { res.writeHead(404).end(); return; }
     const contentType = req.url.startsWith("/api/")
       ? "application/json; charset=utf-8"
@@ -485,8 +525,24 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         : req.url.endsWith(".css")
           ? "text/css; charset=utf-8"
           : "text/javascript; charset=utf-8";
-    res.writeHead(200, { "content-type": contentType, "x-content-type-options": "nosniff", ...headerOverrides[req.url] });
-    res.end(value);
+    const rawHeaders = { ...headerOverrides[req.url], ...headerOverrides[requestKey] };
+    const { status: statusOverride, disableGzip = false, ...routeHeaders } = rawHeaders;
+    const shouldGzip = !disableGzip && ["/api/health", "/api/snapshot"].includes(req.url)
+      && /(?:^|,)\s*gzip\s*(?:;|,|$)/i.test(req.headers["accept-encoding"] || "");
+    const payload = shouldGzip ? gzipSync(Buffer.from(value)) : Buffer.from(value);
+    const encodingHeaders = shouldGzip
+      ? { "content-encoding": "gzip", vary: "Accept-Encoding", "content-length": String(payload.length) }
+      : { "content-length": String(payload.length) };
+    const status = Number.isInteger(statusOverride)
+      ? statusOverride
+      : requestKey === "POST /api/export/coin/%ZZ" ? 403 : 200;
+    res.writeHead(status, {
+      "content-type": contentType,
+      "x-content-type-options": "nosniff",
+      ...encodingHeaders,
+      ...routeHeaders
+    });
+    res.end(payload);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.close());
@@ -506,14 +562,45 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
   assert.equal(result.ok, true);
   assert.deepEqual(result.http, {
-    health: 200, snapshot: 200, html: 200, appJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
-    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200
+    health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
+    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200,
+    vaultExportGuard: 403
   });
   assert.deepEqual(result.markers, {
     version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
     actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-    parserRevision: true, anonymousEarlyActors: true, legalNotices: true
+    parserRevision: true, anonymousEarlyActors: true, publicDeliveryHardening: true, legalNotices: true
   });
+});
+
+test("fails release smoke when the public edge omits snapshot gzip evidence", async (t) => {
+  const baseUrl = await fixture(t, {}, {
+    "/api/snapshot": { disableGzip: true, vary: "" }
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "snapshot"
+      && /gzip content encoding was missing/.test(error.message)
+  );
+});
+
+test("fails release smoke when the live export route lacks the typed disabled response", async (t) => {
+  const baseUrl = await fixture(t, {
+    "POST /api/export/coin/%ZZ": JSON.stringify({ ok: false, code: "unexpected", mode: "live" })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "vault export guard"
+  );
+});
+
+test("fails release smoke when the malformed live export route bypasses the guard", async (t) => {
+  const baseUrl = await fixture(t, {}, { "POST /api/export/coin/%ZZ": { status: 400 } });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "/api/export/coin/%ZZ"
+      && /expected HTTP 403, received 400/.test(error.message)
+  );
 });
 
 test("fails release smoke when the live actor worker is explicitly disabled", async (t) => {
@@ -991,6 +1078,21 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
     status: "healthy",
     version,
     mode: "live",
+    readinessScope: {
+      schemaVersion: 1,
+      statusBasis: "verified-feed-freshness-and-mounted-storage",
+      mountEvidenceRequired: true,
+      releaseEligibility: "separate-smoke-data-calibration-backup-and-recovery-gates",
+      cohortCoverageIncluded: false,
+      calibrationIncluded: false,
+      backupRecoveryIncluded: false
+    },
+    publicDelivery: {
+      schemaVersion: 1,
+      snapshotEncoding: "gzip-when-accepted",
+      browserRefresh: "coalesced-with-15-second-post-completion-cooldown",
+      vaultExports: "disabled"
+    },
     service: { startedAt: "2026-08-08T12:59:57.000Z", uptimeSeconds: 3 },
     storage: { mountPointVerified: true },
     feed: { state: "live", isStale: false, staleAfterSeconds: 90 },

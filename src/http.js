@@ -1,9 +1,43 @@
+import { gzipSync } from "node:zlib";
+
 export class HttpError extends Error {
   constructor(status, message) {
     super(message);
     this.name = "HttpError";
     this.status = status;
   }
+}
+
+function acceptsGzip(value) {
+  let wildcardWeight = null;
+  for (const entry of String(value || "").split(",")) {
+    const [coding, ...parameters] = entry.trim().toLowerCase().split(";").map((part) => part.trim());
+    if (coding !== "gzip" && coding !== "*") continue;
+    const quality = parameters.find((parameter) => /^q\s*=/.test(parameter));
+    const weight = quality ? Number(quality.replace(/^q\s*=\s*/, "")) : 1;
+    const acceptedWeight = Number.isFinite(weight) && weight >= 0 && weight <= 1 ? weight : 0;
+    if (coding === "gzip") return acceptedWeight > 0;
+    wildcardWeight = acceptedWeight;
+  }
+  return wildcardWeight !== null && wildcardWeight > 0;
+}
+
+export function encodeJsonResponse(value, { acceptEncoding, compressionThreshold = 1_024 } = {}) {
+  if (!Number.isSafeInteger(compressionThreshold) || compressionThreshold < 0) {
+    throw new TypeError("compressionThreshold must be a non-negative safe integer");
+  }
+  const uncompressed = Buffer.from(JSON.stringify(value));
+  const headers = { "content-length": String(uncompressed.length) };
+  if (uncompressed.length < compressionThreshold) return { body: uncompressed, headers, compressed: false };
+
+  headers.vary = "Accept-Encoding";
+  if (!acceptsGzip(acceptEncoding)) return { body: uncompressed, headers, compressed: false };
+  const body = gzipSync(uncompressed, { level: 6 });
+  return {
+    body,
+    headers: { ...headers, "content-encoding": "gzip", "content-length": String(body.length) },
+    compressed: true
+  };
 }
 
 export async function readJsonBody(req, { maxBytes = 2_048 } = {}) {
