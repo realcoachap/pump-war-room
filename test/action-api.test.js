@@ -248,8 +248,12 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   const dossier = await json(baseUrl, `/api/coins/${privateToken.mint}`);
   assert.equal(dossier.response.status, 200);
   assert.equal(dossier.body.token.mint, privateToken.mint);
-  assert.deepEqual(Object.keys(dossier.body).sort(), ["disclaimer", "earlyActor", "generatedAt", "outcome", "radar", "schemaVersion", "scope", "timeline", "token"]);
+  assert.deepEqual(Object.keys(dossier.body).sort(), ["disclaimer", "earlyActor", "generatedAt", "identity", "outcome", "radar", "schemaVersion", "scope", "timeline", "token"]);
   assert.equal(dossier.body.earlyActor, null);
+  assert.equal(dossier.body.identity.resolvedBy, "singleton-exact-mint");
+  assert.equal(dossier.body.identity.mint, privateToken.mint);
+  assert.equal(dossier.body.identity.primary.mint, privateToken.mint);
+  assert.equal(dossier.body.identity.relationships.length, 0);
   assertNoRawIdentityKeys(dossier.body, "dossier");
   assert.doesNotMatch(JSON.stringify(dossier.body), new RegExp([privateToken.creator, rawDeployer, rawCaller, rawSignature].join("|")));
   assert.equal(JSON.stringify(dossier.body).includes(privacyMarker), false);
@@ -258,6 +262,14 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   assert.equal(dossier.body.token.name, undefined);
   assert.equal(dossier.body.token.symbol, undefined);
 
+  const identity = await json(baseUrl, `/api/v1/entities/resolve?mint=${privateToken.mint}`);
+  assert.equal(identity.response.status, 200);
+  assert.equal(identity.body.resolvedBy, "singleton-exact-mint");
+  assert.equal(identity.body.entity.entityId, `mint:${privateToken.mint}`);
+  assert.equal(identity.body.primary.selectionReason, "only-exact-mint");
+  assert.match(identity.body.limitations.join(" "), /never merge mints automatically/);
+  assertNoRawIdentityKeys(identity.body, "canonical identity");
+
   const firstPage = await json(baseUrl, `/api/coins/${privateToken.mint}/timeline?limit=1`);
   assert.equal(firstPage.response.status, 200);
   assert.equal(firstPage.body.limit, 1);
@@ -265,6 +277,9 @@ test("action intelligence API enforces strict methods, bounds, and public contra
   assert.equal(firstPage.body.rawProviderPayloadsIncluded, false);
   assertNoRawIdentityKeys(firstPage.body, "timeline");
   assert.doesNotMatch(JSON.stringify(firstPage.body), new RegExp([privateToken.creator, rawDeployer, rawCaller].join("|")));
+  const defaultPage = await json(baseUrl, `/api/coins/${privateToken.mint}/timeline`);
+  assert.equal(defaultPage.response.status, 200);
+  assert.equal(defaultPage.body.limit, 50);
   if (firstPage.body.nextBefore) {
     const secondPage = await json(baseUrl, `/api/coins/${privateToken.mint}/timeline?limit=1&before=${encodeURIComponent(firstPage.body.nextBefore)}`);
     assert.equal(secondPage.response.status, 200);
@@ -293,13 +308,16 @@ test("action intelligence API enforces strict methods, bounds, and public contra
     `/api/coins/${mints[0]}/timeline?unknown=1`,
     `/api/coins/${mints[0]}/timeline?before=invalid`,
     `/api/compare?mints=${mints[0]},${mints[0]}`,
-    "/api/compare?mints=bad,also-bad"
+    "/api/compare?mints=bad,also-bad",
+    "/api/v1/entities/resolve",
+    "/api/v1/entities/resolve?mint=bad",
+    `/api/v1/entities/resolve?mint=${mints[0]}&extra=1`
   ]) {
     assert.equal((await fetch(`${baseUrl}${pathname}`)).status, 400, pathname);
   }
   for (const pathname of [
     "/api/health", "/api/snapshot", `/api/coins/${mints[0]}`, `/api/coins/${mints[0]}/timeline`,
-    `/api/compare?mints=${mints.join(",")}`, "/api/briefs/daily"
+    `/api/compare?mints=${mints.join(",")}`, `/api/v1/entities/resolve?mint=${mints[0]}`, "/api/briefs/daily"
   ]) {
     const response = await fetch(`${baseUrl}${pathname}`, { method: "POST" });
     assert.equal(response.status, 405, pathname);

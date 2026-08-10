@@ -30,6 +30,13 @@ import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 const createdAt = "2026-08-08T12:00:00.000Z";
 const actorMint = "So11111111111111111111111111111111111111112";
 const V091_ACTOR_PARSER_REVISION = "official-pump-account-bound-v3";
+const DROP_IDENTITY_SCHEMA_SQL = `
+  DROP TABLE identity_decisions;
+  DROP TABLE identity_proposals;
+  DROP TABLE identity_relationships;
+  DROP TABLE identity_variants;
+  DROP TABLE identity_entities;
+`;
 
 function actorObservation(overrides = {}) {
   return {
@@ -143,19 +150,29 @@ test("creates and verifies a no-clobber snapshot containing committed WAL data",
       retentionEnforced: true,
       rawIdentityRejected: true,
       rawIdentityViolations: 0
+    },
+    identity: {
+      entityWritten: true,
+      variantsWritten: 2,
+      relationshipWritten: true,
+      proposalWritten: true,
+      decisionWritten: true,
+      privacyViolations: 0
     }
   });
   assert.deepEqual(report.backup.rowCounts, {
     tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1,
-    actor_installation: 1, actor_cohort: 1, actor_observations: 1, actor_summaries: 1
+    actor_installation: 1, actor_cohort: 1, actor_observations: 1, actor_summaries: 1,
+    identity_entities: 0, identity_variants: 0, identity_relationships: 0, identity_proposals: 0, identity_decisions: 0
   });
   assert.deepEqual(report.backup.invalidJsonPayloads, {
     tokens: 0, events: 0, callouts: 0, brief_runs: 0, outcome_enrichment: 0, risk_identity_enrichment: 0,
-    actor_observations: 0, actor_summaries: 0
+    actor_observations: 0, actor_summaries: 0, identity_proposals: 0, identity_decisions: 0
   });
   assert.equal(report.backup.actorInstallationSecretValid, true);
   assert.equal(report.backup.actorMethodRevision, SOLANA_ACTOR_PARSER_REVISION);
   assert.equal(report.backup.actorPrivacyViolations, 0);
+  assert.equal(report.backup.identityPrivacyViolations, 0);
   assert.equal(statSync(destination).mode & 0o777, 0o600);
   assert.equal(digest(databasePath), sourceBefore);
   assert.equal(digest(`${databasePath}-wal`), walBefore);
@@ -220,7 +237,8 @@ test("standalone restore verification is read-only and removes its disposable co
   assert.deepEqual(readdirSync(scratchDirectory), []);
   assert.deepEqual(inspectDatabaseFile(destination).rowCounts, {
     tokens: 1, events: 1, alerts: 1, callouts: 1, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1,
-    actor_installation: 1, actor_cohort: 1, actor_observations: 1, actor_summaries: 1
+    actor_installation: 1, actor_cohort: 1, actor_observations: 1, actor_summaries: 1,
+    identity_entities: 0, identity_variants: 0, identity_relationships: 0, identity_proposals: 0, identity_decisions: 0
   });
 });
 
@@ -409,7 +427,8 @@ test("verifies an exact v0.7 artifact and migrates only the disposable restore c
   assert.equal(report.disposableRestore.userVersion, STORE_SCHEMA_VERSION);
   assert.deepEqual(report.disposableRestore.rowCounts, {
     tokens: 1, events: 1, alerts: 1, callouts: 0, brief_runs: 0, outcome_enrichment: 1, risk_identity_enrichment: 1,
-    actor_installation: 1, actor_cohort: 0, actor_observations: 0, actor_summaries: 0
+    actor_installation: 1, actor_cohort: 0, actor_observations: 0, actor_summaries: 0,
+    identity_entities: 0, identity_variants: 0, identity_relationships: 0, identity_proposals: 0, identity_decisions: 0
   });
 
   const disposableMigrationPath = path.join(directory, "v0.7-disposable-migration.db");
@@ -472,6 +491,7 @@ test("verifies schema 800 and repairs a pending outbox row only in the disposabl
     DROP TABLE actor_observations;
     DROP TABLE actor_cohort;
     DROP TABLE actor_installation;
+    ${DROP_IDENTITY_SCHEMA_SQL}
     PRAGMA user_version = 800;
   `);
   actionStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
@@ -522,6 +542,7 @@ test("verifies an exact schema 801 artifact and adds actor storage only to the d
     DROP TABLE actor_observations;
     DROP TABLE actor_cohort;
     DROP TABLE actor_installation;
+    ${DROP_IDENTITY_SCHEMA_SQL}
     PRAGMA user_version = 801;
     PRAGMA wal_checkpoint(TRUNCATE);
     PRAGMA journal_mode = DELETE;
@@ -563,6 +584,7 @@ test("migrates schema 900 by preserving the installation secret and clearing pre
     INSERT INTO actor_installation (id,secret,created_at)
       SELECT id,secret,created_at FROM actor_installation_schema_901;
     DROP TABLE actor_installation_schema_901;
+    ${DROP_IDENTITY_SCHEMA_SQL}
     PRAGMA user_version = 900;
     PRAGMA wal_checkpoint(TRUNCATE);
     PRAGMA journal_mode = DELETE;

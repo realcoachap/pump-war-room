@@ -120,6 +120,7 @@ function normalizedPublicKey(value) {
 
 function allowsPublicSolanaIdentifier(key, value) {
   const normalized = normalizedPublicKey(key || "");
+  if (normalized === "entityid" && value.startsWith("mint:")) return true;
   if (/^(?:name|symbol)$/.test(normalized)
     || /(?:narrative|label|title|description|message|detail|reason|scope|limitation|note|text)$/.test(normalized)) return false;
   if (normalized === "mint" || normalized === "mints" || normalized.endsWith("mint") || normalized.endsWith("mints")
@@ -458,18 +459,22 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     ...(snapshot.leaderboard?.top100 || []).map((entry) => entry?.token?.mint)
   ].filter((mint) => typeof mint === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)))].slice(0, 2);
   requireValue(endpointMints.length === 2, "snapshot", "two exact retained mints were unavailable for release endpoint smoke checks");
-  const [dossierResult, timelineResult, compareResult, dailyBriefResult, weeklyBriefResult] = await Promise.all([
+  const [dossierResult, timelineResult, compareResult, dailyBriefResult, weeklyBriefResult, identityResult, identityWriteGuardResult] = await Promise.all([
     request(normalizedBaseUrl, `/api/coins/${endpointMints[0]}`, { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, `/api/coins/${endpointMints[0]}/timeline?limit=2`, { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, `/api/compare?mints=${encodeURIComponent(endpointMints.join(","))}`, { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/api/briefs/daily", { timeoutMs, fetchImpl }),
-    request(normalizedBaseUrl, "/api/briefs/weekly", { timeoutMs, fetchImpl })
+    request(normalizedBaseUrl, "/api/briefs/weekly", { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, `/api/v1/entities/resolve?mint=${encodeURIComponent(endpointMints[0])}`, { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, `/api/v1/entities/resolve?mint=${encodeURIComponent(endpointMints[0])}`, { timeoutMs, fetchImpl, method: "POST", expectedStatus: 405 })
   ]);
   const dossier = parseJson(dossierResult, "dossier");
   const timeline = parseJson(timelineResult, "timeline");
   const comparison = parseJson(compareResult, "compare");
   const dailyBrief = parseJson(dailyBriefResult, "daily brief");
   const weeklyBrief = parseJson(weeklyBriefResult, "weekly brief");
+  const identity = parseJson(identityResult, "identity resolver");
+  const identityWriteGuard = parseJson(identityWriteGuardResult, "identity write guard");
 
   for (const [check, result, expectedType] of [
     ["health", healthResult, "application/json"],
@@ -486,6 +491,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     ["compare", compareResult, "application/json"],
     ["daily brief", dailyBriefResult, "application/json"],
     ["weekly brief", weeklyBriefResult, "application/json"]
+    , ["identity resolver", identityResult, "application/json"]
+    , ["identity write guard", identityWriteGuardResult, "application/json"]
   ]) {
     requireValue(result.contentType.toLowerCase().includes(expectedType), check, `content-type ${result.contentType || "missing"} did not include ${expectedType}`);
     requireValue(result.nosniff.toLowerCase() === "nosniff", check, "x-content-type-options nosniff was missing");
@@ -501,6 +508,18 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
 
   requireValue(dossier?.schemaVersion === 1 && dossier?.token?.mint === endpointMints[0]
     && dossier?.radar && dossier?.timeline === `/api/coins/${endpointMints[0]}/timeline`, "dossier", "strict public dossier contract was missing");
+  requireValue(dossier?.identity?.mint === endpointMints[0] && Array.isArray(dossier.identity.proposals),
+    "dossier", "canonical identity projection was missing from the dossier");
+  requireValue(identity?.schemaVersion === 1 && identity.mint === endpointMints[0]
+    && ["singleton-exact-mint", "reviewed-registry-variant"].includes(identity.resolvedBy)
+    && identity.primary?.meaning === "identity resolution only; not a safety, quality, or trade recommendation"
+    && Array.isArray(identity.relationships) && Array.isArray(identity.proposals),
+  "identity resolver", "typed exact-mint identity resolution contract was missing");
+  requireValue(identity.relationships.every((relationship) => relationship.reviewState === "verified")
+    && identity.proposals.every((proposal) => proposal.reviewState === "proposed"),
+  "identity resolver", "reviewed relationships and unverified proposals were not clearly separated");
+  requireValue(identityWriteGuard?.ok === false && identityWriteGuardResult.status === 405,
+    "identity write guard", "public identity writes did not fail closed");
   requireValue(Object.hasOwn(dossier, "earlyActor"), "dossier", "early-actor evidence field was missing");
   if (dossier.earlyActor !== null) validateActorSummary(dossier.earlyActor, endpointMints[0], "dossier.earlyActor", "dossier");
   requireValue(timeline?.schemaVersion === 1 && timeline?.mint === endpointMints[0] && timeline?.limit === 2
@@ -540,6 +559,12 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && health.actionIntelligence?.alertDedupe === "persistent"
     && health.actionIntelligence?.materialPersistence === "atomic-with-durable-baseline",
   "health", "action intelligence health contract was missing");
+  requireValue(health.identityRegistry?.schemaVersion === 1
+    && health.identityRegistry.proposalMethod === "metadata-collision-proposals-v1"
+    && health.identityRegistry.automatedVerification === false
+    && health.identityRegistry.publicWrites === false
+    && /identity resolution only/.test(health.identityRegistry.primaryMeaning || ""),
+  "health", "canonical identity review and public-write boundaries were missing");
   requireValue(["configured", "not-configured"].includes(health.actionIntelligence?.telegram?.status)
     && typeof health.actionIntelligence?.telegram?.tokenConfigured === "boolean"
     && typeof health.actionIntelligence?.telegram?.chatConfigured === "boolean"
@@ -630,6 +655,11 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   if (expectedMode === "live") requireValue(snapshot.storage?.mountPointVerified === true, "snapshot", "database mount point was not verified");
   requireValue(Number.isFinite(snapshot.service?.uptimeSeconds), "snapshot", "service uptime was missing");
   requireValue(snapshot.outcomes?.schemaVersion === 1, "snapshot", "outcome engine schema was missing");
+  requireValue(snapshot.identityRegistry?.schemaVersion === 1
+    && snapshot.identityRegistry.automatedVerification === false
+    && snapshot.identityRegistry.publicWrites === false
+    && JSON.stringify(snapshot.identityRegistry) === JSON.stringify(health.identityRegistry),
+  "snapshot", "canonical identity coverage disagreed across health and snapshot");
   requireValue(snapshot.leaderboard?.schemaVersion === 2
     && snapshot.leaderboard?.ranking?.metric === "evidence_score_or_recency_v2"
     && snapshot.leaderboard?.ranking?.scorePolicy === "withheld-without-substantive-input", "snapshot", "truthful v2 leaderboard contract was missing");
@@ -939,6 +969,10 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && htmlResult.body.includes("Per-installation keyed Actor numbers")
     && htmlResult.body.includes("CORRELATIONS WITHHELD"),
   "html", "anonymous early-actor privacy or downstream-withholding marker was missing");
+  requireValue(htmlResult.body.includes('data-release-marker="canonical-identity-v1"')
+    && htmlResult.body.includes("NO PUBLIC WRITES · NO AUTOMATED CANONIZATION")
+    && htmlResult.body.includes("Primary mint means identity resolution only"),
+  "html", "canonical identity review boundary marker was missing");
   requireValue(scriptResult.body.includes("renderFeedObservability"), "app.js", "feed observability UI marker was missing");
   requireValue(scriptResult.body.includes("renderOutcomes") && scriptResult.body.includes("raw candle retention off"), "app.js", "outcome engine UI marker was missing");
   requireValue(scriptResult.body.includes("renderRiskIntelligence")
@@ -951,6 +985,10 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && scriptResult.body.includes("installation-scoped, non-reversible labels")
     && scriptResult.body.includes("trade signal"),
   "app.js", "anonymous early-actor evidence UI markers were missing");
+  requireValue(scriptResult.body.includes("renderIdentityRegistry") && scriptResult.body.includes("identityDetail")
+    && scriptResult.body.includes("PROPOSED · NOT A FACT")
+    && scriptResult.body.includes("/api/coins/${encodeURIComponent(mint)}"),
+  "app.js", "canonical identity summary, dossier, or proposal truthfulness markers were missing");
   requireValue(scriptResult.body.includes("createSnapshotRefreshScheduler")
     && scriptResult.body.includes("vaultExportsEnabled")
     && refreshScriptResult.body.includes("SNAPSHOT_REFRESH_COOLDOWN_MS = 15_000")
@@ -967,9 +1005,14 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && stylesResult.body.includes(".early-actors") && stylesResult.body.includes(".early-actor-detail")
     && stylesResult.body.includes("@media(max-width:650px)"),
   "styles.css", "anonymous early-actor desktop or responsive styles were missing");
+  requireValue(stylesResult.body.includes(".identity-registry") && stylesResult.body.includes(".identity-detail")
+    && stylesResult.body.includes(".identity-edge.proposed"),
+  "styles.css", "canonical identity desktop or responsive styles were missing");
   requireValue(termsResult.body.includes("CoinGecko API Terms") && termsResult.body.includes("not verified prices")
     && termsResult.body.includes("does not prove duplicate content") && termsResult.body.includes("common control")
-    && termsResult.body.includes("materiality policy") && termsResult.body.includes("migration observation"), "terms", "provider ownership, alert, or risk-evidence terms were missing");
+    && termsResult.body.includes("materiality policy") && termsResult.body.includes("migration observation")
+    && termsResult.body.includes("Automated metadata collisions remain proposals")
+    && termsResult.body.includes("Public registry endpoints are read-only"), "terms", "provider ownership, alert, risk-evidence, or identity terms were missing");
   requireValue(privacyResult.body.includes("Minimal data by design") && privacyResult.body.includes("does not persist or expose bulk GeckoTerminal responses") && privacyResult.body.includes("domain-separated hashes"), "privacy", "privacy and retention notice was missing");
   requireValue(privacyResult.body.includes("browser-local") && privacyResult.body.includes("Telegram")
     && privacyResult.body.includes("Bot API") && privacyResult.body.includes("opt out"), "privacy", "watchlist or Telegram privacy notice was missing");
@@ -981,6 +1024,10 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && /raw wallet addresses/i.test(privacyResult.body) && /transaction signatures/i.test(privacyResult.body)
     && /(?:72[- ]hour|72 hours)/i.test(privacyResult.body) && /mapping material/i.test(privacyResult.body),
   "privacy", "early-actor pseudonymization, retention, or raw-identity privacy notice was missing");
+  requireValue(privacyResult.body.includes("append-only review decisions")
+    && privacyResult.body.includes("Proposed edges remain visibly separate from reviewed facts")
+    && privacyResult.body.includes("exposes no write operation"),
+  "privacy", "canonical identity review-data privacy notice was missing");
 
   return {
     ok: true,
@@ -999,13 +1046,14 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     },
     http: {
       health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
-      dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200,
+      dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200, identityResolver: 200,
+      identityWriteGuard: 405,
       vaultExportGuard: vaultExportGuardResult ? 403 : "not-applicable"
     },
     markers: {
       version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
       actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-      parserRevision: true, anonymousEarlyActors: true, publicDeliveryHardening: true, legalNotices: true
+      parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, publicDeliveryHardening: true, legalNotices: true
     }
   };
 }

@@ -15,7 +15,7 @@ import {
 
 void PREFERENCE_KEY;
 
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, publicDelivery: { vaultExports: "disabled" }, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, identityRegistry: {}, publicDelivery: { vaultExports: "disabled" }, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let caesarRequestPending = false;
@@ -934,6 +934,7 @@ function render() {
   renderFeedObservability();
   renderStats();
   renderLeaderboard();
+  renderIdentityRegistry();
   renderActionIntelligence();
   renderRiskIntelligence();
   renderEarlyActors();
@@ -965,7 +966,8 @@ async function refresh({ signal } = {}) {
       outcomes: snapshot.outcomes && typeof snapshot.outcomes === "object" ? snapshot.outcomes : {},
       riskIntelligence: snapshot.riskIntelligence && typeof snapshot.riskIntelligence === "object" ? snapshot.riskIntelligence : {},
       actionIntelligence: snapshot.actionIntelligence && typeof snapshot.actionIntelligence === "object" ? snapshot.actionIntelligence : {},
-      earlyActorIntelligence: snapshot.earlyActorIntelligence && typeof snapshot.earlyActorIntelligence === "object" ? snapshot.earlyActorIntelligence : {}
+      earlyActorIntelligence: snapshot.earlyActorIntelligence && typeof snapshot.earlyActorIntelligence === "object" ? snapshot.earlyActorIntelligence : {},
+      identityRegistry: snapshot.identityRegistry && typeof snapshot.identityRegistry === "object" ? snapshot.identityRegistry : {}
     };
     snapshotFailed = false;
     render();
@@ -998,13 +1000,45 @@ async function renderCoinTimeline(mint) {
 
 async function openCoin(mint) {
   if (!PUBLIC_MINT.test(mint)) return;
-  if (rankedTokens().some((candidate) => candidate.mint === mint)) { openToken(mint); return; }
+  const fallback = rankedTokens().find((candidate) => candidate.mint === mint) || null;
   try {
     const response = await fetch(`/api/coins/${encodeURIComponent(mint)}`, { cache: "no-store" });
     if (!response.ok) throw new Error(`Coin dossier returned ${response.status}`);
     const dossier = await response.json();
     openToken(mint, dossier);
-  } catch { toast("Retained coin dossier is unavailable"); }
+  } catch {
+    if (fallback) openToken(mint);
+    else toast("Retained coin dossier is unavailable");
+  }
+}
+
+function renderIdentityRegistry() {
+  const target = $("#identity-registry-summary");
+  if (!target) return;
+  const registry = state.identityRegistry || {};
+  const proposals = registry.proposalStatusCounts || {};
+  const cards = [
+    ["REVIEWED ENTITIES", number(registry.entityCount), "stable project or meme identities"],
+    ["REGISTERED MINTS", number(registry.variantCount), "exact official / migration / relaunch variants"],
+    ["REVIEWED EDGES", number(registry.relationshipCount), "typed cross-mint relationships"],
+    ["PENDING PROPOSALS", number(proposals.pending), "locally derived; never facts without review"],
+    ["DECISIONS", number(registry.decisionCount), "append-only review history"]
+  ];
+  target.innerHTML = cards.map(([label, value, note]) => `<article><span>${label}</span><strong>${nf.format(value)}</strong><small>${note}</small></article>`).join("");
+  $("#identity-registry-status").textContent = registry.automatedVerification === false ? "REVIEW-GATED" : "REGISTRY DEGRADED";
+}
+
+function identityDetail(identity) {
+  if (!identity || typeof identity !== "object") return `<section class="identity-detail"><span class="kicker">CANONICAL IDENTITY</span><p>Identity resolution is unavailable for this fallback view.</p></section>`;
+  const entity = identity.entity || {};
+  const primary = identity.primary || {};
+  const relationships = Array.isArray(identity.relationships) ? identity.relationships : [];
+  const proposals = Array.isArray(identity.proposals) ? identity.proposals : [];
+  const edge = (item, proposed = false) => {
+    const other = item.fromMint === identity.mint ? item.toMint : item.fromMint;
+    return `<div class="identity-edge ${proposed ? "proposed" : "reviewed"}"><span><b>${esc(item.kind || "unresolved")}</b><small>${proposed ? "PROPOSED · NOT A FACT" : esc(item.reviewState || "reviewed").toUpperCase()}</small></span><code>${esc(shortMint(other))}</code><em>${esc(item.evidenceClass || "unavailable")}</em></div>`;
+  };
+  return `<section class="identity-detail"><div class="identity-detail-head"><div><span class="kicker">CANONICAL IDENTITY // ${esc(identity.resolvedBy || "unresolved")}</span><h3>${esc(entity.displayName || "Unresolved exact mint")}</h3></div><span class="identity-review-state">${esc(entity.reviewState || "proposed").toUpperCase()}</span></div><div class="identity-detail-grid"><div><b>ENTITY</b><strong>${esc(entity.entityId || `mint:${identity.mint}`)}</strong></div><div><b>PRIMARY MINT</b><strong>${primary.mint ? esc(shortMint(primary.mint)) : "WITHHELD"}</strong><small>${esc(primary.selectionReason || "unavailable")}</small></div><div><b>REVIEWED EDGES</b><strong>${relationships.length}</strong></div><div><b>OPEN PROPOSALS</b><strong>${proposals.length}</strong></div></div><div class="identity-edges">${relationships.map((item) => edge(item)).join("")}${proposals.map((item) => edge(item, true)).join("") || '<div class="action-empty">No reviewed or proposed cross-mint edges for this exact mint.</div>'}</div><p>${esc(primary.meaning || "Identity resolution only; not a trade recommendation.")}</p></section>`;
 }
 
 function openToken(mint, dossier = null) {
@@ -1020,7 +1054,7 @@ function openToken(mint, dossier = null) {
   if (hasNumber(token.bondingProgress) && number(token.bondingProgress) >= 75) momentum.push("approaching migration");
   $("#token-detail").innerHTML = `<div class="detail"><span class="kicker">${esc(token.narrative || "Unclassified")} // ${esc(token.status || "observed")}</span><h2>${esc(token.name || "Unnamed mint")} <span class="risk-low">${esc(token.symbol || "??")}</span></h2><div class="mint">${esc(token.mint)}</div>
     <div class="detail-grid"><div class="detail-card"><label>MOMENTUM</label><strong>${hasNumber(token.momentum) ? `${number(token.momentum)}/100` : "—"}</strong></div><div class="detail-card"><label>RISK COMPOSITE</label><strong class="risk-unverified">WITHHELD</strong><small>${esc(confidence)}</small></div><div class="detail-card"><label>MARKET CAP</label><strong>${hasNumber(token.marketCap) ? money(token.marketCap) : "—"}</strong></div><div class="detail-card"><label>BUYERS</label><strong>${hasNumber(token.uniqueBuyers) ? nf.format(number(token.uniqueBuyers)) : "—"}</strong></div><div class="detail-card"><label>BUY RATIO</label><strong>${hasNumber(token.buyRatio) ? `${Math.round(number(token.buyRatio) * 100)}%` : "—"}</strong></div><div class="detail-card"><label>ACTIVITY EVIDENCE</label><strong>SEE BELOW</strong><small>never rank input</small></div></div>
-    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${riskIdentityDetail(token)}${earlyActorDetail(dossier?.earlyActor || state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.summary, state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.acquisition)}${outcomeDetail(leaderboardEntry)}
+    <div class="reasons"><div class="reason"><strong>Observed movement</strong><br>${esc((momentum.length ? momentum : ["early observation—limited history"]).join(" · "))}</div><div class="reason risk"><strong>Risk interpretation</strong><br>Withheld until factors have labeled outcomes and holdout calibration. Missing evidence is unknown, never safe.</div></div>${identityDetail(dossier?.identity)}${riskIdentityDetail(token)}${earlyActorDetail(dossier?.earlyActor || state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.summary, state.earlyActorIntelligence?.cohort?.observations?.find((observation) => observation.mint === token.mint)?.acquisition)}${outcomeDetail(leaderboardEntry)}
     <div class="coin-timeline"><span class="kicker">DISCRETE RETAINED TIMELINE // NO INTERPOLATION</span><div id="coin-timeline"><div class="action-empty">Loading typed observations…</div></div></div>
     <div class="detail-actions"><button class="primary" id="watch-coin" aria-pressed="${watched(token.mint)}">${watched(token.mint) ? "★ WATCHED" : "☆ WATCH IN BROWSER"}</button>${vaultExportsEnabled() ? '<button id="export-coin">EXPORT TO OBSIDIAN</button>' : ""}<a href="https://pump.fun/coin/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">PUMP.FUN ↗</a><a href="https://dexscreener.com/solana/${encodeURIComponent(token.mint)}" target="_blank" rel="noreferrer">DEX SCREENER ↗</a><a href="${fomoUrl(token.mint)}" target="_blank" rel="noreferrer">FOMO ↗</a></div></div>`;
   $("#token-dialog").showModal();

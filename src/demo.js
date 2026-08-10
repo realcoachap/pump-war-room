@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { classifyNarrative, momentumScore, riskScore } from "./signals.js";
 
 const names = [
@@ -7,14 +8,27 @@ const names = [
   ["Moon Clerk", "CLERK"], ["Meme Reserve", "MEMER"], ["Red Button", "BUTTON"]
 ];
 const b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-const randomMint = () => Array.from({ length: 38 }, () => b58[Math.floor(Math.random() * b58.length)]).join("") + "pump";
+function encodeBase58(bytes) {
+  let value = BigInt(`0x${Buffer.from(bytes).toString("hex") || "0"}`);
+  let encoded = "";
+  while (value > 0n) {
+    encoded = b58[Number(value % 58n)] + encoded;
+    value /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    encoded = `1${encoded}`;
+  }
+  return encoded || "1";
+}
+const randomMint = () => encodeBase58(randomBytes(32));
 const between = (min, max) => min + Math.random() * (max - min);
 
 export function createDemoToken(index = 0, ageMinutes = 0) {
   const [name, symbol] = names[index % names.length];
   const buyRatio = between(0.38, 0.79);
   const token = {
-    mint: randomMint(), name, symbol, creator: randomMint().slice(0, 42),
+    mint: randomMint(), name, symbol, creator: randomMint(),
     description: `${name} is a community meme experiment`,
     createdAt: new Date(Date.now() - ageMinutes * 60_000).toISOString(),
     status: "bonding", narrative: classifyNarrative(`${name} ${symbol}`),

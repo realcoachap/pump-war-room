@@ -1,9 +1,9 @@
 {
   "name": "opencaesar-pump-war-room",
-  "version": "0.9.5",
+  "version": "0.10.0",
   "private": true,
   "type": "module",
-  "description": "Read-only Pump.fun intelligence radar with auditable outcomes, risk evidence, and anonymous early-actor observations.",
+  "description": "Read-only Pump.fun intelligence radar with auditable outcomes, risk evidence, anonymous early-actor observations, and canonical mint identity resolution.",
   "scripts": {
     "start": "node src/server.js",
     "demo": "PUMP_MODE=demo node src/server.js",
@@ -13,6 +13,10 @@
     "db:backup": "node scripts/database-cli.js backup",
     "db:restore:verify": "node scripts/database-cli.js restore-verify",
     "outcomes:purge": "node scripts/outcome-data-cli.js",
+    "identity:status": "node scripts/identity-cli.js status",
+    "identity:proposals": "node scripts/identity-cli.js proposals",
+    "identity:decide": "node scripts/identity-cli.js decide",
+    "identity:import": "node scripts/identity-cli.js import",
     "screenshot": "mkdir -p screenshots && playwright screenshot -b chromium --full-page --viewport-size=1440,1100 --wait-for-selector=.token-row http://127.0.0.1:4173 screenshots/dashboard-desktop.png && playwright screenshot -b chromium --full-page --viewport-size=390,844 --wait-for-selector=.token-row http://127.0.0.1:4173 screenshots/dashboard-mobile.png"
   },
   "engines": {

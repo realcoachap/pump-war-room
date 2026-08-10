@@ -3,8 +3,9 @@ import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { validateRiskIdentityPersistenceEvidence } from "./risk-identity.js";
 import { isCanonicalSolanaAddress } from "./early-actors.js";
+import { CanonicalRegistry, validateCanonicalEntity, validateCanonicalRelationship } from "./canonical-registry.js";
 
-export const STORE_SCHEMA_VERSION = 901;
+export const STORE_SCHEMA_VERSION = 902;
 const LEGACY_ACTOR_SCHEMA_VERSION = 900;
 export const ACTOR_OBSERVATION_MAX_RETENTION_MS = 72 * 60 * 60 * 1_000;
 
@@ -676,6 +677,58 @@ function rowBriefRun(row) {
   };
 }
 
+function identityEvidence(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be an object`);
+  const allowed = new Set(["basis", "match", "source", "scope", "variantCount", "proposalKey"]);
+  const normalized = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (!allowed.has(key)) throw new TypeError(`${label} key is not allowed: ${key}`);
+    normalized[key] = key === "variantCount"
+      ? boundedInteger(entry, `${label}.${key}`, { min: 0, max: 100 })
+      : text(entry, `${label}.${key}`, { max: key === "proposalKey" ? 128 : 80, code: key !== "proposalKey" });
+    if (typeof normalized[key] === "string" && SENSITIVE_KEY.test(normalized[key])) {
+      throw new TypeError(`${label} must not contain credentials or secrets`);
+    }
+  }
+  if (sensitiveText(JSON.stringify(normalized))) throw new TypeError(`${label} must not contain credentials or secrets`);
+  return normalized;
+}
+
+function identityDecision(value, { subjectType, subjectId, defaultEvidence } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("identity decision must be an object");
+  const normalizedSubjectType = text(subjectType ?? value.subjectType, "identity decision subjectType", { max: 24, code: true });
+  if (!["entity", "relationship", "proposal"].includes(normalizedSubjectType)) throw new TypeError("identity decision subjectType is invalid");
+  const normalizedSubjectId = text(subjectId ?? value.subjectId, "identity decision subjectId", { max: 160 });
+  const normalizedDecision = text(value.decision, "identity decision", { max: 24, code: true });
+  if (!["accept", "reject", "supersede", "split"].includes(normalizedDecision)) throw new TypeError("identity decision is invalid");
+  return {
+    decisionId: text(value.decisionId, "identity decisionId", { max: 128, code: true }),
+    subjectType: normalizedSubjectType,
+    subjectId: normalizedSubjectId,
+    decision: normalizedDecision,
+    reasonCode: text(value.reasonCode, "identity decision reasonCode", { max: 80, code: true }),
+    evidence: identityEvidence(value.evidence ?? defaultEvidence ?? {}, "identity decision evidence"),
+    decidedAt: timestamp(value.decidedAt, "identity decision decidedAt"),
+    supersedesDecisionId: text(value.supersedesDecisionId, "identity decision supersedesDecisionId", { max: 128, optional: true, code: true })
+  };
+}
+
+function rowIdentityProposal(row) {
+  if (!row) return null;
+  return {
+    proposalKey: row.proposal_key,
+    fromMint: row.from_mint,
+    toMint: row.to_mint,
+    kind: row.kind,
+    evidenceClass: row.evidence_class,
+    methodVersion: row.method_version,
+    evidence: JSON.parse(row.evidence),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
 export class Store {
   constructor(dbPath) {
     mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -773,6 +826,69 @@ export class Store {
         summary TEXT NOT NULL CHECK(json_valid(summary) AND json_type(summary)='object'),
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS identity_entities (
+        entity_id TEXT PRIMARY KEY NOT NULL,
+        display_name TEXT NOT NULL,
+        symbol TEXT,
+        review_state TEXT NOT NULL CHECK(review_state IN ('proposed','verified','rejected')),
+        primary_mint TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS identity_variants (
+        mint TEXT PRIMARY KEY NOT NULL,
+        entity_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('official','migration','relaunch')),
+        review_state TEXT NOT NULL CHECK(review_state IN ('proposed','verified','rejected')),
+        evidence_class TEXT NOT NULL CHECK(evidence_class IN ('on-chain-finalized','provider-observed','feed-observed-processed','locally-derived','unavailable')),
+        observed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(entity_id) REFERENCES identity_entities(entity_id)
+      );
+      CREATE INDEX IF NOT EXISTS identity_variants_entity ON identity_variants(entity_id,mint);
+      CREATE TABLE IF NOT EXISTS identity_relationships (
+        relationship_id TEXT PRIMARY KEY NOT NULL,
+        from_mint TEXT NOT NULL,
+        to_mint TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('same-creator','same-narrative','probable-copycat','name-collision')),
+        review_state TEXT NOT NULL CHECK(review_state IN ('proposed','verified','rejected')),
+        evidence_class TEXT NOT NULL CHECK(evidence_class IN ('on-chain-finalized','provider-observed','feed-observed-processed','locally-derived','unavailable')),
+        observed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(from_mint) REFERENCES identity_variants(mint),
+        FOREIGN KEY(to_mint) REFERENCES identity_variants(mint),
+        CHECK(from_mint<>to_mint)
+      );
+      CREATE INDEX IF NOT EXISTS identity_relationships_from ON identity_relationships(from_mint,updated_at DESC,relationship_id);
+      CREATE INDEX IF NOT EXISTS identity_relationships_to ON identity_relationships(to_mint,updated_at DESC,relationship_id);
+      CREATE TABLE IF NOT EXISTS identity_proposals (
+        proposal_key TEXT PRIMARY KEY NOT NULL,
+        from_mint TEXT NOT NULL,
+        to_mint TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('same-narrative','name-collision')),
+        evidence_class TEXT NOT NULL CHECK(evidence_class='locally-derived'),
+        method_version TEXT NOT NULL,
+        evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence)='object'),
+        status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected','superseded')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(from_mint<>to_mint)
+      );
+      CREATE INDEX IF NOT EXISTS identity_proposals_status_updated ON identity_proposals(status,updated_at DESC,proposal_key);
+      CREATE TABLE IF NOT EXISTS identity_decisions (
+        decision_id TEXT PRIMARY KEY NOT NULL,
+        subject_type TEXT NOT NULL CHECK(subject_type IN ('entity','relationship','proposal')),
+        subject_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK(decision IN ('accept','reject','supersede','split')),
+        reason_code TEXT NOT NULL,
+        evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence)='object'),
+        decided_at TEXT NOT NULL,
+        supersedes_decision_id TEXT,
+        FOREIGN KEY(supersedes_decision_id) REFERENCES identity_decisions(decision_id)
+      );
+      CREATE INDEX IF NOT EXISTS identity_decisions_subject ON identity_decisions(subject_type,subject_id,decided_at,decision_id);
       `);
       const alertColumns = new Set(this.db.prepare("PRAGMA table_info(alerts)").all().map(({ name }) => name));
       for (const [name, definition] of [
@@ -885,6 +1001,10 @@ export class Store {
     this.calloutStmt = this.db.prepare(`INSERT INTO callouts (external_id,mint,payload,created_at)
       VALUES (?,?,?,?) ON CONFLICT(external_id) DO UPDATE SET payload=excluded.payload`);
     this.calloutMintListStmt = this.db.prepare(`SELECT payload FROM callouts WHERE mint=? ORDER BY created_at DESC LIMIT ?`);
+    this.identityProposalInsertStmt = this.db.prepare(`INSERT INTO identity_proposals
+      (proposal_key,from_mint,to_mint,kind,evidence_class,method_version,evidence,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(proposal_key) DO UPDATE SET
+        updated_at=CASE WHEN identity_proposals.status='pending' THEN excluded.updated_at ELSE identity_proposals.updated_at END`);
     this.briefInsertStmt = this.db.prepare(`INSERT OR IGNORE INTO brief_runs
       (brief_key,kind,period_start,period_end,timezone,method_version,provider,data_cutoff,model,created_at)
       VALUES (?,?,?,?,?,?,?,?,?,?)`);
@@ -1377,6 +1497,215 @@ export class Store {
       }
       throw new Error(`Provider purge requires exclusive database access and verified SQLite cleanup: ${error.message}`, { cause: error });
     }
+  }
+  identityRegistrySnapshot() {
+    const entityRows = this.db.prepare(`SELECT entity_id,display_name,symbol,review_state,primary_mint,created_at,updated_at
+      FROM identity_entities WHERE review_state<>'rejected' ORDER BY entity_id`).all();
+    const variantRows = this.db.prepare(`SELECT mint,entity_id,kind,review_state,evidence_class,observed_at,created_at,updated_at
+      FROM identity_variants WHERE review_state<>'rejected' ORDER BY entity_id,mint`).all();
+    const variantsByEntity = new Map();
+    for (const row of variantRows) {
+      const variants = variantsByEntity.get(row.entity_id) || [];
+      variants.push({
+        mint: row.mint,
+        kind: row.kind,
+        reviewState: row.review_state,
+        evidenceClass: row.evidence_class,
+        observedAt: row.observed_at
+      });
+      variantsByEntity.set(row.entity_id, variants);
+    }
+    const entities = entityRows.flatMap((row) => {
+      const variants = variantsByEntity.get(row.entity_id) || [];
+      return variants.length ? [{
+        entityId: row.entity_id,
+        displayName: row.display_name,
+        symbol: row.symbol,
+        reviewState: row.review_state,
+        primaryMint: row.primary_mint,
+        variants
+      }] : [];
+    });
+    const registeredMints = new Set(variantRows.map(({ mint }) => mint));
+    const relationships = this.db.prepare(`SELECT relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at
+      FROM identity_relationships WHERE review_state<>'rejected' ORDER BY relationship_id`).all().flatMap((row) => (
+        registeredMints.has(row.from_mint) && registeredMints.has(row.to_mint) ? [{
+          relationshipId: row.relationship_id,
+          fromMint: row.from_mint,
+          toMint: row.to_mint,
+          kind: row.kind,
+          reviewState: row.review_state,
+          evidenceClass: row.evidence_class,
+          observedAt: row.observed_at
+        }] : []
+      ));
+    new CanonicalRegistry({ entities, relationships });
+    return { schemaVersion: 1, entities, relationships };
+  }
+  saveIdentityEntity({ entity, decision } = {}) {
+    const normalized = validateCanonicalEntity(entity);
+    const reviewed = identityDecision(decision, {
+      subjectType: "entity",
+      subjectId: normalized.entityId,
+      defaultEvidence: { scope: "entity-and-variants", variantCount: normalized.variants.length }
+    });
+    if (!["accept", "reject", "split", "supersede"].includes(reviewed.decision)) throw new TypeError("identity entity decision is invalid");
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const now = reviewed.decidedAt;
+      const existing = this.db.prepare("SELECT created_at FROM identity_entities WHERE entity_id=?").get(normalized.entityId);
+      this.db.prepare(`INSERT INTO identity_entities
+        (entity_id,display_name,symbol,review_state,primary_mint,created_at,updated_at) VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(entity_id) DO UPDATE SET display_name=excluded.display_name,symbol=excluded.symbol,
+          review_state=excluded.review_state,primary_mint=excluded.primary_mint,updated_at=excluded.updated_at`)
+        .run(normalized.entityId, normalized.displayName, normalized.symbol, normalized.reviewState,
+          normalized.primaryMint, existing?.created_at ?? now, now);
+      for (const variant of normalized.variants) {
+        const existingVariant = this.db.prepare("SELECT created_at FROM identity_variants WHERE mint=?").get(variant.mint);
+        this.db.prepare(`INSERT INTO identity_variants
+          (mint,entity_id,kind,review_state,evidence_class,observed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(mint) DO UPDATE SET entity_id=excluded.entity_id,kind=excluded.kind,review_state=excluded.review_state,
+            evidence_class=excluded.evidence_class,observed_at=excluded.observed_at,updated_at=excluded.updated_at`)
+          .run(variant.mint, normalized.entityId, variant.kind, variant.reviewState, variant.evidenceClass,
+            variant.observedAt, existingVariant?.created_at ?? now, now);
+      }
+      const keep = new Set(normalized.variants.map(({ mint }) => mint));
+      for (const { mint } of this.db.prepare("SELECT mint FROM identity_variants WHERE entity_id=?").all(normalized.entityId)) {
+        if (!keep.has(mint)) this.db.prepare("UPDATE identity_variants SET review_state='rejected',updated_at=? WHERE mint=?").run(now, mint);
+      }
+      this.#insertIdentityDecision(reviewed);
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return this.identityRegistrySnapshot().entities.find(({ entityId }) => entityId === normalized.entityId) ?? null;
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  saveIdentityRelationship({ relationship, decision } = {}) {
+    const snapshot = this.identityRegistrySnapshot();
+    const registeredMints = new Set(snapshot.entities.flatMap(({ variants }) => variants.map(({ mint }) => mint)));
+    const normalized = validateCanonicalRelationship(relationship, registeredMints);
+    const reviewed = identityDecision(decision, {
+      subjectType: "relationship",
+      subjectId: normalized.relationshipId,
+      defaultEvidence: { scope: "reviewed-cross-mint-edge" }
+    });
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const now = reviewed.decidedAt;
+      const existing = this.db.prepare("SELECT created_at FROM identity_relationships WHERE relationship_id=?").get(normalized.relationshipId);
+      this.db.prepare(`INSERT INTO identity_relationships
+        (relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(relationship_id) DO UPDATE SET
+          from_mint=excluded.from_mint,to_mint=excluded.to_mint,kind=excluded.kind,review_state=excluded.review_state,
+          evidence_class=excluded.evidence_class,observed_at=excluded.observed_at,updated_at=excluded.updated_at`)
+        .run(normalized.relationshipId, normalized.fromMint, normalized.toMint, normalized.kind,
+          normalized.reviewState, normalized.evidenceClass, normalized.observedAt, existing?.created_at ?? now, now);
+      this.#insertIdentityDecision(reviewed);
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return this.identityRegistrySnapshot().relationships.find(({ relationshipId }) => relationshipId === normalized.relationshipId) ?? null;
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  upsertIdentityProposals(proposals, { observedAt = new Date().toISOString() } = {}) {
+    if (!Array.isArray(proposals) || proposals.length > 2_000) throw new RangeError("identity proposals must be an array of at most 2000 entries");
+    const now = timestamp(observedAt, "identity proposals observedAt");
+    let written = 0;
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      for (const proposal of proposals) {
+        if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) throw new TypeError("identity proposal must be an object");
+        const proposalKey = text(proposal.proposalKey, "identity proposalKey", { max: 128, code: true });
+        const fromMint = text(proposal.fromMint, "identity proposal fromMint", { max: 44 });
+        const toMint = text(proposal.toMint, "identity proposal toMint", { max: 44 });
+        if (!isCanonicalSolanaAddress(fromMint) || !isCanonicalSolanaAddress(toMint) || fromMint === toMint) throw new TypeError("identity proposal mints are invalid");
+        const kind = text(proposal.kind, "identity proposal kind", { max: 32, code: true });
+        if (!["same-narrative", "name-collision"].includes(kind)) throw new TypeError("identity proposal kind is invalid");
+        if (proposal.evidenceClass !== "locally-derived" || proposal.status !== "pending") throw new TypeError("identity proposals must remain pending locally-derived evidence");
+        const methodVersion = text(proposal.methodVersion, "identity proposal methodVersion", { max: 80, code: true });
+        const evidence = identityEvidence(proposal.evidence, "identity proposal evidence");
+        const existing = this.db.prepare("SELECT created_at FROM identity_proposals WHERE proposal_key=?").get(proposalKey);
+        const result = this.identityProposalInsertStmt.run(proposalKey, fromMint, toMint, kind, "locally-derived",
+          methodVersion, JSON.stringify(evidence), "pending", existing?.created_at ?? now, now);
+        written += Number(result.changes > 0);
+      }
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return { observedAt: now, supplied: proposals.length, written };
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  identityProposals({ status = "pending", limit = 100 } = {}) {
+    const normalizedStatus = text(status, "identity proposal status", { max: 24, code: true });
+    if (!["pending", "accepted", "rejected", "superseded"].includes(normalizedStatus)) throw new TypeError("identity proposal status is invalid");
+    const normalizedLimit = boundedInteger(limit, "identity proposal limit", { min: 1, max: 500 });
+    return this.db.prepare(`SELECT * FROM identity_proposals WHERE status=?
+      ORDER BY updated_at DESC,proposal_key LIMIT ?`).all(normalizedStatus, normalizedLimit).map(rowIdentityProposal);
+  }
+  decideIdentityProposal({ proposalKey, decision } = {}) {
+    const normalizedKey = text(proposalKey, "identity proposalKey", { max: 128, code: true });
+    const proposal = this.db.prepare("SELECT * FROM identity_proposals WHERE proposal_key=?").get(normalizedKey);
+    if (!proposal) throw new TypeError("identity proposal does not exist");
+    const reviewed = identityDecision(decision, {
+      subjectType: "proposal",
+      subjectId: normalizedKey,
+      defaultEvidence: { proposalKey: normalizedKey, scope: "proposal-review-only" }
+    });
+    const status = reviewed.decision === "accept" ? "accepted"
+      : reviewed.decision === "reject" ? "rejected"
+        : reviewed.decision === "supersede" ? "superseded" : null;
+    if (!status) throw new TypeError("identity proposal decisions support accept, reject, or supersede");
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      this.db.prepare("UPDATE identity_proposals SET status=?,updated_at=? WHERE proposal_key=?")
+        .run(status, reviewed.decidedAt, normalizedKey);
+      this.#insertIdentityDecision(reviewed);
+      this.db.exec("COMMIT");
+      transactionStarted = false;
+      return rowIdentityProposal(this.db.prepare("SELECT * FROM identity_proposals WHERE proposal_key=?").get(normalizedKey));
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  identityDecisions({ subjectType = null, subjectId = null, limit = 100 } = {}) {
+    const normalizedType = subjectType == null ? null : text(subjectType, "identity decision subjectType", { max: 24, code: true });
+    const normalizedId = subjectId == null ? null : text(subjectId, "identity decision subjectId", { max: 160 });
+    const normalizedLimit = boundedInteger(limit, "identity decision limit", { min: 1, max: 500 });
+    return this.db.prepare(`SELECT decision_id AS decisionId,subject_type AS subjectType,subject_id AS subjectId,
+      decision,reason_code AS reasonCode,evidence,decided_at AS decidedAt,supersedes_decision_id AS supersedesDecisionId
+      FROM identity_decisions WHERE (? IS NULL OR subject_type=?) AND (? IS NULL OR subject_id=?)
+      ORDER BY decided_at DESC,decision_id DESC LIMIT ?`).all(normalizedType, normalizedType, normalizedId, normalizedId, normalizedLimit)
+      .map((row) => ({ ...row, evidence: JSON.parse(row.evidence) }));
+  }
+  identityRegistryCoverage() {
+    const entityCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_entities WHERE review_state<>'rejected'").get().count);
+    const variantCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_variants WHERE review_state<>'rejected'").get().count);
+    const relationshipCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_relationships WHERE review_state<>'rejected'").get().count);
+    const decisionCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_decisions").get().count);
+    const proposalStatusCounts = Object.fromEntries(this.db.prepare("SELECT status,count(*) AS count FROM identity_proposals GROUP BY status ORDER BY status")
+      .all().map(({ status, count }) => [status, Number(count)]));
+    return { entityCount, variantCount, relationshipCount, decisionCount, proposalStatusCounts };
+  }
+  #insertIdentityDecision(decision) {
+    this.db.prepare(`INSERT INTO identity_decisions
+      (decision_id,subject_type,subject_id,decision,reason_code,evidence,decided_at,supersedes_decision_id)
+      VALUES (?,?,?,?,?,?,?,?)`).run(decision.decisionId, decision.subjectType, decision.subjectId, decision.decision,
+        decision.reasonCode, JSON.stringify(decision.evidence), decision.decidedAt, decision.supersedesDecisionId);
   }
   tokens(limit = 100) {
     return parsePayloadRows(this.db.prepare("SELECT payload FROM tokens ORDER BY updated_at DESC LIMIT ?").all(limit));

@@ -1,8 +1,10 @@
 # Pump War Room
 
-Current release: **v0.9.5**
+Current release: **v0.10.0**
 
-A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, and reports bounded anonymous early-actor observations without presenting an uncalibrated probability or trade signal.
+A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, reports bounded anonymous early-actor observations, and resolves exact mints through a review-gated canonical identity graph without presenting an uncalibrated probability or trade signal.
+
+The additive [v0.10 Canonical Identity Graph roadmap](V0.10_CANONICAL_IDENTITY_ROADMAP.md) ships the persistent review ledger, deterministic proposal engine, local curator workflow, public read-only resolver, and dossier/coverage UI. It keeps every exact mint distinct until reviewed evidence explicitly groups variants. This release does not satisfy or weaken the separate v1.0 evidence gate.
 
 ## Deploy to Railway
 
@@ -30,7 +32,7 @@ Re-run the restore drill on an existing artifact without touching `DB_PATH`:
 npm run db:restore:verify -- --backup /app/data/backups/pump-war-room-2026-08-08.db
 ```
 
-The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Exact v0.5.1/schema-501, v0.6/schema-600, v0.7/schema-700, v0.8.0/schema-800, v0.8.1/schema-801, and initial v0.9/schema-900 artifacts remain drillable: the verifier proves the original copy, migrates only its disposable restore copy to schema 901, then runs the current application write probe without changing the artifact. A v0.9.1/schema-901 artifact carrying the known v3 actor-parser revision is likewise inspected read-only and byte-for-byte before only its disposable copy advances to v4; that preparation preserves the installation secret while clearing the superseded actor cohort, observations, and summaries. Schema 901 additionally verifies the singleton installation secret, the active actor-parser revision, prospective actor cohort, minimized deduplicated observations, bounded retention indexes, and aggregate summaries. Migrating schema 900 preserves the installation secret but clears actor evidence created before the account-bound parser revision, so unsupported evidence cannot survive a restart. The probe proves secret and parser-revision continuity, actor admission, dedupe/conflict handling, retention, and summary writes while rejecting raw wallet, profile, transaction, digest, and key material. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
+The verifier accepts only a standalone artifact and refuses candidates with `-wal`, `-shm`, or `-journal` sidecars; create a backup first instead of pointing it at the live database. Exact v0.5.1/schema-501, v0.6/schema-600, v0.7/schema-700, v0.8.0/schema-800, v0.8.1/schema-801, initial v0.9/schema-900, and v0.9.1–v0.9.5/schema-901 artifacts remain drillable: the verifier proves the original copy, migrates only its disposable restore copy to schema 902, then runs the current application write probe without changing the artifact. The current probe verifies actor privacy and retention plus identity entities, variants, relationships, proposals, append-only decisions, and allowlisted evidence. Budget at least twice the expected backup size in temporary free space when staging and the disposable restore copy share a filesystem, with additional headroom so live SQLite writes cannot be starved. Use `--scratch-dir /path/on/a/suitable-volume` to choose that location; disposable copies are removed after the check. This project intentionally provides no in-place production restore command: stop the service and follow a separately reviewed recovery procedure before replacing a live database. Never copy only the `.db` file from a running WAL database. A backup on the same Railway volume is not disaster recovery, so retain verified copies on separate protected storage according to your recovery policy.
 
 ## Quick look
 
@@ -90,6 +92,21 @@ The separate `risk_identity_enrichment` table retains only allowlisted scalars, 
 Exact matching is deliberately narrow: X and Telegram handles are case-folded; URLs use the WHATWG parser, IDNA normalization, and the open-source `tldts` public/private suffix list (`allowPrivateDomains: true`) to compare registrable domains; names and symbols use NFKC/case-fold normalization. The headline identity-reuse count includes only exact declared X, Telegram, or registrable-domain matches. Name/symbol collisions are disclosed separately as low-confidence content warnings. Equality proves identifier or registrable-domain reuse only, not duplicate content. It does **not** establish a shared controller, fraud, maliciousness, or safety. Creator/deployer-user history counts only launches observed prospectively in the fixed cohort by this deployment and identifies which role was counted; it is not an all-time chain history. A provider developer address contributes only when it exactly matches an observed creator/deployer identity. Provider-reported developer holding is not verified creator identity. Top-10 methodology and custody exclusions are unpublished and may include curve or liquidity custody. GeckoTerminal pool reserve is shown as provider-observed reserve, not locked liquidity.
 
 Evidence classes are explicit: `on-chain-finalized`, `provider-observed`, `feed-observed-processed`, `locally-derived`, and `unavailable`. A PumpPortal migration frame is labeled processed-feed evidence and no longer forces 100% curve progress or a finalized graduation claim. Missing factors stay unknown. v0.7.0 publishes no probability-like composite risk score and makes no risk-based leaderboard adjustment because no labeled holdout calibration exists.
+
+### Canonical Identity Graph
+
+v0.10.0 adds schema 902 tables for reviewed entities, exact-mint variants, typed cross-mint relationships, deterministic proposals, and append-only decisions. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
+
+The bounded proposal worker compares metadata already present in the authorized local feed. Exact normalized name/symbol or narrative matches become deterministic, locally derived proposals; they never mutate reviewed facts, select a primary mint, affect ranking, or appear as verified edges. Public surfaces are read-only. Operator review requires direct local access to an existing SQLite database:
+
+```bash
+npm run identity:status -- --database /app/data/pump-war-room.db
+npm run identity:proposals -- --database /app/data/pump-war-room.db --status pending --limit 100
+npm run identity:decide -- --database /app/data/pump-war-room.db --proposal identity-proposal:... --decision reject --decision-id decision:... --reason-code reviewed-not-related
+npm run identity:import -- --database /app/data/pump-war-room.db --file reviewed-identity.json
+```
+
+An import document contains bounded `entities` and `relationships` arrays. Each entry wraps the validated `entity` or `relationship` plus its append-only `decision`; malformed, duplicate, unregistered, or credential-bearing evidence fails closed. Back up the database before importing reviewed facts.
 
 ### Actionable intelligence
 
@@ -171,8 +188,9 @@ The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permissi
 
 - `GET /api/health`
 - `GET /api/snapshot`
+- `GET /api/v1/entities/resolve?mint=<mint>`
 
-The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `actionIntelligence`, and `earlyActorIntelligence` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability. Action intelligence exposes browser-local preference limits, materiality rules, aggregate outbox health, timeline/compare contracts, and the frozen daily/weekly models without secrets or raw provider histories. Early-actor intelligence exposes only aggregate prospective-cohort acquisition state and gated per-mint summaries; there is no actor lookup endpoint.
+The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `actionIntelligence`, `earlyActorIntelligence`, and aggregate `identityRegistry` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability. Canonical resolution returns the exact mint, entity/variant, primary-selection reason, reviewed relationships, separate pending proposals, and explicit limitations. Action intelligence exposes browser-local preference limits, materiality rules, aggregate outbox health, timeline/compare contracts, and the frozen daily/weekly models without secrets or raw provider histories. Early-actor intelligence exposes only aggregate prospective-cohort acquisition state and gated per-mint summaries; there is no actor lookup endpoint.
 - `GET /api/stream` (server-sent events)
 - `GET /api/coins/:mint`
 - `GET /api/coins/:mint/timeline?limit=50&before=<cursor>` (`limit` 1–200)
@@ -191,7 +209,7 @@ Vault exports are filesystem-writing operator actions, not public live API capab
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.9.5 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.0 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

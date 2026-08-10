@@ -29,7 +29,15 @@ const RISK_SCHEMA_VERSION = 700;
 const ACTION_SCHEMA_VERSION = 800;
 const HARDENED_ACTION_SCHEMA_VERSION = 801;
 const ACTOR_SCHEMA_VERSION = 900;
+const PRE_IDENTITY_SCHEMA_VERSION = 901;
 const DEPLOYED_V091_ACTOR_PARSER_REVISION = "official-pump-account-bound-v3";
+const IDENTITY_SENSITIVE_TEXT = /(?:api.?key|secret|password|authorization|cookie|credential|access.?token|refresh.?token|private.?key)/i;
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function disposableProbeMint(label) {
+  const bytes = createHash("sha256").update(`${label}:${randomUUID()}`).digest();
+  return [...bytes].map((byte) => BASE58_ALPHABET[byte % BASE58_ALPHABET.length]).join("");
+}
 
 export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   tokens: Object.freeze(["mint", "payload", "created_at", "updated_at"]),
@@ -60,7 +68,12 @@ export const REQUIRED_DATABASE_SCHEMA = Object.freeze({
   actor_observations: Object.freeze([
     "event_key", "mint", "event", "source_at", "observed_at", "retained_until", "created_at"
   ]),
-  actor_summaries: Object.freeze(["mint", "summary", "updated_at"])
+  actor_summaries: Object.freeze(["mint", "summary", "updated_at"]),
+  identity_entities: Object.freeze(["entity_id", "display_name", "symbol", "review_state", "primary_mint", "created_at", "updated_at"]),
+  identity_variants: Object.freeze(["mint", "entity_id", "kind", "review_state", "evidence_class", "observed_at", "created_at", "updated_at"]),
+  identity_relationships: Object.freeze(["relationship_id", "from_mint", "to_mint", "kind", "review_state", "evidence_class", "observed_at", "created_at", "updated_at"]),
+  identity_proposals: Object.freeze(["proposal_key", "from_mint", "to_mint", "kind", "evidence_class", "method_version", "evidence", "status", "created_at", "updated_at"]),
+  identity_decisions: Object.freeze(["decision_id", "subject_type", "subject_id", "decision", "reason_code", "evidence", "decided_at", "supersedes_decision_id"])
 });
 
 const REQUIRED_COLUMN_TYPES = Object.freeze({
@@ -99,7 +112,12 @@ const REQUIRED_COLUMN_TYPES = Object.freeze({
     event_key: "TEXT", mint: "TEXT", event: "TEXT", source_at: "TEXT", observed_at: "TEXT",
     retained_until: "TEXT", created_at: "TEXT"
   }),
-  actor_summaries: Object.freeze({ mint: "TEXT", summary: "TEXT", updated_at: "TEXT" })
+  actor_summaries: Object.freeze({ mint: "TEXT", summary: "TEXT", updated_at: "TEXT" }),
+  identity_entities: Object.freeze({ entity_id: "TEXT", display_name: "TEXT", symbol: "TEXT", review_state: "TEXT", primary_mint: "TEXT", created_at: "TEXT", updated_at: "TEXT" }),
+  identity_variants: Object.freeze({ mint: "TEXT", entity_id: "TEXT", kind: "TEXT", review_state: "TEXT", evidence_class: "TEXT", observed_at: "TEXT", created_at: "TEXT", updated_at: "TEXT" }),
+  identity_relationships: Object.freeze({ relationship_id: "TEXT", from_mint: "TEXT", to_mint: "TEXT", kind: "TEXT", review_state: "TEXT", evidence_class: "TEXT", observed_at: "TEXT", created_at: "TEXT", updated_at: "TEXT" }),
+  identity_proposals: Object.freeze({ proposal_key: "TEXT", from_mint: "TEXT", to_mint: "TEXT", kind: "TEXT", evidence_class: "TEXT", method_version: "TEXT", evidence: "TEXT", status: "TEXT", created_at: "TEXT", updated_at: "TEXT" }),
+  identity_decisions: Object.freeze({ decision_id: "TEXT", subject_type: "TEXT", subject_id: "TEXT", decision: "TEXT", reason_code: "TEXT", evidence: "TEXT", decided_at: "TEXT", supersedes_decision_id: "TEXT" })
 });
 
 const REQUIRED_PRIMARY_KEYS = Object.freeze({
@@ -113,7 +131,12 @@ const REQUIRED_PRIMARY_KEYS = Object.freeze({
   actor_installation: Object.freeze(["id"]),
   actor_cohort: Object.freeze(["mint"]),
   actor_observations: Object.freeze(["event_key"]),
-  actor_summaries: Object.freeze(["mint"])
+  actor_summaries: Object.freeze(["mint"]),
+  identity_entities: Object.freeze(["entity_id"]),
+  identity_variants: Object.freeze(["mint"]),
+  identity_relationships: Object.freeze(["relationship_id"]),
+  identity_proposals: Object.freeze(["proposal_key"]),
+  identity_decisions: Object.freeze(["decision_id"])
 });
 
 const REQUIRED_NOT_NULL = Object.freeze({
@@ -130,7 +153,12 @@ const REQUIRED_NOT_NULL = Object.freeze({
   actor_installation: Object.freeze(["id", "secret", "created_at", "method_revision"]),
   actor_cohort: Object.freeze(["mint", "launch_observed_at", "admitted_at", "status", "attempt_count", "updated_at"]),
   actor_observations: Object.freeze(["event_key", "mint", "event", "observed_at", "retained_until", "created_at"]),
-  actor_summaries: Object.freeze(["mint", "summary", "updated_at"])
+  actor_summaries: Object.freeze(["mint", "summary", "updated_at"]),
+  identity_entities: Object.freeze(["entity_id", "display_name", "review_state", "created_at", "updated_at"]),
+  identity_variants: Object.freeze(["mint", "entity_id", "kind", "review_state", "evidence_class", "observed_at", "created_at", "updated_at"]),
+  identity_relationships: Object.freeze(["relationship_id", "from_mint", "to_mint", "kind", "review_state", "evidence_class", "observed_at", "created_at", "updated_at"]),
+  identity_proposals: Object.freeze(["proposal_key", "from_mint", "to_mint", "kind", "evidence_class", "method_version", "evidence", "status", "created_at", "updated_at"]),
+  identity_decisions: Object.freeze(["decision_id", "subject_type", "subject_id", "decision", "reason_code", "evidence", "decided_at"])
 });
 
 const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
@@ -352,6 +380,84 @@ const EXPECTED_SCHEMA_OBJECTS = Object.freeze([
     name: "tokens",
     tableName: "tokens",
     sql: "CREATE TABLE tokens (mint TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+  }),
+  Object.freeze({ type: "index", name: "identity_variants_entity", tableName: "identity_variants", sql: "CREATE INDEX identity_variants_entity ON identity_variants(entity_id,mint)" }),
+  Object.freeze({ type: "index", name: "identity_relationships_from", tableName: "identity_relationships", sql: "CREATE INDEX identity_relationships_from ON identity_relationships(from_mint,updated_at DESC,relationship_id)" }),
+  Object.freeze({ type: "index", name: "identity_relationships_to", tableName: "identity_relationships", sql: "CREATE INDEX identity_relationships_to ON identity_relationships(to_mint,updated_at DESC,relationship_id)" }),
+  Object.freeze({ type: "index", name: "identity_proposals_status_updated", tableName: "identity_proposals", sql: "CREATE INDEX identity_proposals_status_updated ON identity_proposals(status,updated_at DESC,proposal_key)" }),
+  Object.freeze({ type: "index", name: "identity_decisions_subject", tableName: "identity_decisions", sql: "CREATE INDEX identity_decisions_subject ON identity_decisions(subject_type,subject_id,decided_at,decision_id)" }),
+  Object.freeze({
+    type: "table", name: "identity_entities", tableName: "identity_entities",
+    sql: `CREATE TABLE identity_entities (
+      entity_id TEXT PRIMARY KEY NOT NULL,
+      display_name TEXT NOT NULL,
+      symbol TEXT,
+      review_state TEXT NOT NULL CHECK(review_state IN ('proposed','verified','rejected')),
+      primary_mint TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`
+  }),
+  Object.freeze({
+    type: "table", name: "identity_variants", tableName: "identity_variants",
+    sql: `CREATE TABLE identity_variants (
+      mint TEXT PRIMARY KEY NOT NULL,
+      entity_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('official','migration','relaunch')),
+      review_state TEXT NOT NULL CHECK(review_state IN ('proposed','verified','rejected')),
+      evidence_class TEXT NOT NULL CHECK(evidence_class IN ('on-chain-finalized','provider-observed','feed-observed-processed','locally-derived','unavailable')),
+      observed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(entity_id) REFERENCES identity_entities(entity_id)
+    )`
+  }),
+  Object.freeze({
+    type: "table", name: "identity_relationships", tableName: "identity_relationships",
+    sql: `CREATE TABLE identity_relationships (
+      relationship_id TEXT PRIMARY KEY NOT NULL,
+      from_mint TEXT NOT NULL,
+      to_mint TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('same-creator','same-narrative','probable-copycat','name-collision')),
+      review_state TEXT NOT NULL CHECK(review_state IN ('proposed','verified','rejected')),
+      evidence_class TEXT NOT NULL CHECK(evidence_class IN ('on-chain-finalized','provider-observed','feed-observed-processed','locally-derived','unavailable')),
+      observed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(from_mint) REFERENCES identity_variants(mint),
+      FOREIGN KEY(to_mint) REFERENCES identity_variants(mint),
+      CHECK(from_mint<>to_mint)
+    )`
+  }),
+  Object.freeze({
+    type: "table", name: "identity_proposals", tableName: "identity_proposals",
+    sql: `CREATE TABLE identity_proposals (
+      proposal_key TEXT PRIMARY KEY NOT NULL,
+      from_mint TEXT NOT NULL,
+      to_mint TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('same-narrative','name-collision')),
+      evidence_class TEXT NOT NULL CHECK(evidence_class='locally-derived'),
+      method_version TEXT NOT NULL,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence)='object'),
+      status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected','superseded')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK(from_mint<>to_mint)
+    )`
+  }),
+  Object.freeze({
+    type: "table", name: "identity_decisions", tableName: "identity_decisions",
+    sql: `CREATE TABLE identity_decisions (
+      decision_id TEXT PRIMARY KEY NOT NULL,
+      subject_type TEXT NOT NULL CHECK(subject_type IN ('entity','relationship','proposal')),
+      subject_id TEXT NOT NULL,
+      decision TEXT NOT NULL CHECK(decision IN ('accept','reject','supersede','split')),
+      reason_code TEXT NOT NULL,
+      evidence TEXT NOT NULL CHECK(json_valid(evidence) AND json_type(evidence)='object'),
+      decided_at TEXT NOT NULL,
+      supersedes_decision_id TEXT,
+      FOREIGN KEY(supersedes_decision_id) REFERENCES identity_decisions(decision_id)
+    )`
   })
 ]);
 
@@ -370,6 +476,15 @@ const ACTION_SCHEMA_ALERT_OBJECT = Object.freeze({
 const ACTOR_TABLES = Object.freeze(new Set([
   "actor_installation", "actor_cohort", "actor_observations", "actor_summaries"
 ]));
+const IDENTITY_TABLES = Object.freeze(new Set([
+  "identity_entities", "identity_variants", "identity_relationships", "identity_proposals", "identity_decisions"
+]));
+const PRE_IDENTITY_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
+  Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => !IDENTITY_TABLES.has(table))
+));
+const PRE_IDENTITY_SCHEMA_OBJECTS = Object.freeze(
+  EXPECTED_SCHEMA_OBJECTS.filter(({ tableName }) => !IDENTITY_TABLES.has(tableName))
+);
 const LEGACY_ACTOR_INSTALLATION_OBJECT = Object.freeze({
   type: "table",
   name: "actor_installation",
@@ -381,17 +496,17 @@ const LEGACY_ACTOR_INSTALLATION_OBJECT = Object.freeze({
   )`
 });
 const ACTOR_DATABASE_SCHEMA = Object.freeze({
-  ...REQUIRED_DATABASE_SCHEMA,
+  ...PRE_IDENTITY_DATABASE_SCHEMA,
   actor_installation: Object.freeze(["id", "secret", "created_at"])
 });
-const ACTOR_SCHEMA_OBJECTS = Object.freeze(EXPECTED_SCHEMA_OBJECTS.map((entry) => (
+const ACTOR_SCHEMA_OBJECTS = Object.freeze(PRE_IDENTITY_SCHEMA_OBJECTS.map((entry) => (
   entry.type === "table" && entry.name === "actor_installation" ? LEGACY_ACTOR_INSTALLATION_OBJECT : entry
 )));
 const HARDENED_ACTION_DATABASE_SCHEMA = Object.freeze(Object.fromEntries(
-  Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => !ACTOR_TABLES.has(table))
+  Object.entries(REQUIRED_DATABASE_SCHEMA).filter(([table]) => !ACTOR_TABLES.has(table) && !IDENTITY_TABLES.has(table))
 ));
 const HARDENED_ACTION_SCHEMA_OBJECTS = Object.freeze(
-  EXPECTED_SCHEMA_OBJECTS.filter(({ tableName }) => !ACTOR_TABLES.has(tableName))
+  EXPECTED_SCHEMA_OBJECTS.filter(({ tableName }) => !ACTOR_TABLES.has(tableName) && !IDENTITY_TABLES.has(tableName))
 );
 const ACTION_SCHEMA_OBJECTS = Object.freeze(HARDENED_ACTION_SCHEMA_OBJECTS.map((entry) => (
   entry.type === "table" && entry.name === "alerts" ? ACTION_SCHEMA_ALERT_OBJECT : entry
@@ -555,6 +670,23 @@ function verifyActorPrivacyRows(database) {
   return 0;
 }
 
+function verifyIdentityPrivacyRows(database) {
+  const allowed = new Set(["basis", "match", "source", "scope", "variantCount", "proposalKey"]);
+  for (const [table, column] of [["identity_proposals", "evidence"], ["identity_decisions", "evidence"]]) {
+    for (const { payload } of database.prepare(`SELECT ${column} AS payload FROM ${table}`).all()) {
+      let value;
+      try { value = JSON.parse(payload); } catch { continue; }
+      if (!value || typeof value !== "object" || Array.isArray(value)) fail(`Database ${table}.${column} is not a bounded object`);
+      for (const [key, entry] of Object.entries(value)) {
+        if (!allowed.has(key)) fail(`Database ${table}.${column} contains unsupported key ${key}`);
+        if (entry !== null && typeof entry !== "string" && !Number.isSafeInteger(entry)) fail(`Database ${table}.${column} contains unsupported value type`);
+        if (typeof entry === "string" && IDENTITY_SENSITIVE_TEXT.test(entry)) fail(`Database ${table}.${column} persists credential-like evidence`);
+      }
+    }
+  }
+  return 0;
+}
+
 function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const integrity = pragmaValues(database, "PRAGMA integrity_check");
   if (integrity.length !== 1 || integrity[0] !== "ok") {
@@ -573,11 +705,13 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   const actionOnly = allowLegacy && userVersion === ACTION_SCHEMA_VERSION;
   const hardenedActionOnly = allowLegacy && userVersion === HARDENED_ACTION_SCHEMA_VERSION;
   const actorOnly = allowLegacy && userVersion === ACTOR_SCHEMA_VERSION;
+  const preIdentityOnly = allowLegacy && userVersion === PRE_IDENTITY_SCHEMA_VERSION;
   const requiredSchema = legacy ? LEGACY_DATABASE_SCHEMA
     : outcomeOnly ? OUTCOME_DATABASE_SCHEMA
       : riskOnly ? RISK_DATABASE_SCHEMA
         : actionOnly || hardenedActionOnly ? HARDENED_ACTION_DATABASE_SCHEMA
-          : actorOnly ? ACTOR_DATABASE_SCHEMA
+            : actorOnly ? ACTOR_DATABASE_SCHEMA
+              : preIdentityOnly ? PRE_IDENTITY_DATABASE_SCHEMA
             : REQUIRED_DATABASE_SCHEMA;
   const expectedSchemaObjects = legacy ? LEGACY_SCHEMA_OBJECTS
     : outcomeOnly ? OUTCOME_SCHEMA_OBJECTS
@@ -585,6 +719,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
         : actionOnly ? ACTION_SCHEMA_OBJECTS
           : hardenedActionOnly ? HARDENED_ACTION_SCHEMA_OBJECTS
             : actorOnly ? ACTOR_SCHEMA_OBJECTS
+              : preIdentityOnly ? PRE_IDENTITY_SCHEMA_OBJECTS
               : EXPECTED_SCHEMA_OBJECTS;
   const tables = database.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all().map(({ name }) => name);
   const rowCounts = {};
@@ -640,16 +775,18 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   }
   if (userVersion !== STORE_SCHEMA_VERSION && !(allowLegacy
     && [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION, ACTION_SCHEMA_VERSION,
-      HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION].includes(userVersion))) {
+      HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION, PRE_IDENTITY_SCHEMA_VERSION].includes(userVersion))) {
     fail(`Database schema version ${userVersion} does not match required version ${STORE_SCHEMA_VERSION}`);
   }
-  const actorSchema = [ACTOR_SCHEMA_VERSION, STORE_SCHEMA_VERSION].includes(userVersion);
+  const actorSchema = [ACTOR_SCHEMA_VERSION, PRE_IDENTITY_SCHEMA_VERSION, STORE_SCHEMA_VERSION].includes(userVersion);
+  const identitySchema = userVersion === STORE_SCHEMA_VERSION;
   const jsonColumns = {
     tokens: "payload", events: "payload", callouts: "payload",
     ...(legacy ? {} : { outcome_enrichment: "evidence" }),
     ...(legacy || outcomeOnly ? {} : { risk_identity_enrichment: "evidence" }),
     ...(legacy || outcomeOnly || riskOnly ? {} : { brief_runs: "model" }),
-    ...(actorSchema ? { actor_observations: "event", actor_summaries: "summary" } : {})
+    ...(actorSchema ? { actor_observations: "event", actor_summaries: "summary" } : {}),
+    ...(identitySchema ? { identity_proposals: "evidence", identity_decisions: "evidence" } : {})
   };
   const invalidJsonPayloads = Object.fromEntries(Object.entries(jsonColumns).map(([table, column]) => [
     table,
@@ -658,6 +795,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
   let actorPrivacyViolations = null;
   let actorInstallationSecretValid = null;
   let actorMethodRevision = null;
+  let identityPrivacyViolations = null;
   if (actorSchema) {
     const installation = database.prepare(actorOnly
       ? "SELECT id,secret FROM actor_installation"
@@ -668,7 +806,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     if (!actorInstallationSecretValid) fail("Database actor installation secret is missing or malformed");
     if (!actorOnly) {
       actorMethodRevision = installation[0].methodRevision;
-      const knownPreviousRevision = allowLegacy && userVersion === STORE_SCHEMA_VERSION
+      const knownPreviousRevision = allowLegacy && [PRE_IDENTITY_SCHEMA_VERSION, STORE_SCHEMA_VERSION].includes(userVersion)
         && actorMethodRevision === DEPLOYED_V091_ACTOR_PARSER_REVISION;
       if (actorMethodRevision !== SOLANA_ACTOR_PARSER_REVISION && !knownPreviousRevision) {
         fail(`Database actor method revision ${actorMethodRevision || "missing"} does not match ${SOLANA_ACTOR_PARSER_REVISION}`);
@@ -676,6 +814,7 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     }
     actorPrivacyViolations = verifyActorPrivacyRows(database);
   }
+  if (identitySchema) identityPrivacyViolations = verifyIdentityPrivacyRows(database);
   return {
     integrityCheck: "ok",
     foreignKeyViolations: 0,
@@ -687,7 +826,8 @@ function inspectOpenDatabase(database, { allowLegacy = false } = {}) {
     invalidJsonPayloads,
     actorInstallationSecretValid,
     actorMethodRevision,
-    actorPrivacyViolations
+    actorPrivacyViolations,
+    identityPrivacyViolations
   };
 }
 
@@ -891,6 +1031,35 @@ function verifyApplicationWrites(databasePath) {
     actorSecretAfter.fill(0);
     if (!actorSecretStable) fail("Database application write probe changed the actor installation secret");
     const actorPrivacyViolations = verifyActorPrivacyRows(database);
+    const identityMint = disposableProbeMint("identity-primary");
+    const identityRelatedMint = disposableProbeMint("identity-related");
+    const identityEntityId = `restore-identity-${suffix}`;
+    database.prepare(`INSERT INTO identity_entities
+      (entity_id,display_name,symbol,review_state,primary_mint,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(identityEntityId, "Restore identity", "RESTORE", "verified", identityMint, createdAt, createdAt);
+    database.prepare(`INSERT INTO identity_variants
+      (mint,entity_id,kind,review_state,evidence_class,observed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(identityMint, identityEntityId, "official", "verified", "on-chain-finalized", createdAt, createdAt, createdAt);
+    database.prepare(`INSERT INTO identity_variants
+      (mint,entity_id,kind,review_state,evidence_class,observed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(identityRelatedMint, identityEntityId, "migration", "verified", "on-chain-finalized", createdAt, createdAt, createdAt);
+    database.prepare(`INSERT INTO identity_relationships
+      (relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(`restore-edge-${suffix}`, identityMint, identityRelatedMint, "same-creator",
+        "verified", "on-chain-finalized", createdAt, createdAt, createdAt);
+    const proposalKey = `identity-proposal:${suffix}`;
+    database.prepare(`INSERT INTO identity_proposals
+      (proposal_key,from_mint,to_mint,kind,evidence_class,method_version,evidence,status,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`).run(proposalKey, identityMint, identityRelatedMint, "name-collision", "locally-derived",
+        "restore-probe-v1", JSON.stringify({ basis: "name-and-symbol", match: "exact-normalized", source: "restore-verification" }), "pending", createdAt, createdAt);
+    database.prepare(`INSERT INTO identity_decisions
+      (decision_id,subject_type,subject_id,decision,reason_code,evidence,decided_at,supersedes_decision_id)
+      VALUES (?,?,?,?,?,?,?,?)`).run(`restore-decision-${suffix}`, "entity", identityEntityId, "accept",
+        "restore-verification", JSON.stringify({ scope: "entity-and-variants", variantCount: 2 }), createdAt, null);
+    const identityPrivacyViolations = verifyIdentityPrivacyRows(database);
+    if (database.prepare("SELECT count(*) AS count FROM identity_variants WHERE entity_id=?").get(identityEntityId).count !== 2) {
+      fail("Database application write probe could not persist identity variants");
+    }
     const inserted = Number(database.prepare("SELECT count(*) AS count FROM tokens WHERE mint=?").get(mint).count);
     if (inserted !== 1) fail("Database application write probe could not read its disposable token row");
     database.exec("ROLLBACK");
@@ -910,6 +1079,14 @@ function verifyApplicationWrites(databasePath) {
         retentionEnforced: true,
         rawIdentityRejected,
         rawIdentityViolations: actorPrivacyViolations
+      },
+      identity: {
+        entityWritten: true,
+        variantsWritten: 2,
+        relationshipWritten: true,
+        proposalWritten: true,
+        decisionWritten: true,
+        privacyViolations: identityPrivacyViolations
       }
     };
   } catch (error) {
@@ -956,7 +1133,8 @@ function assertSameRestore(original, restored) {
       JSON.stringify(original.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads) ||
       original.actorInstallationSecretValid !== restored.actorInstallationSecretValid ||
       original.actorMethodRevision !== restored.actorMethodRevision ||
-      original.actorPrivacyViolations !== restored.actorPrivacyViolations) {
+      original.actorPrivacyViolations !== restored.actorPrivacyViolations ||
+      original.identityPrivacyViolations !== restored.identityPrivacyViolations) {
     fail("Disposable restore does not match the backup schema and row counts");
   }
 }
@@ -977,7 +1155,7 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
     let restored = inspectDatabaseFile(restoredPath, { allowLegacy: true });
     assertSameRestore(artifact, restored);
     const migratedFromSchemaVersion = [LEGACY_SCHEMA_VERSION, OUTCOME_SCHEMA_VERSION, RISK_SCHEMA_VERSION,
-      ACTION_SCHEMA_VERSION, HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION].includes(restored.userVersion)
+      ACTION_SCHEMA_VERSION, HARDENED_ACTION_SCHEMA_VERSION, ACTOR_SCHEMA_VERSION, PRE_IDENTITY_SCHEMA_VERSION].includes(restored.userVersion)
       ? restored.userVersion
       : null;
     const migratedFromActorMethodRevision = restored.userVersion === STORE_SCHEMA_VERSION
@@ -1006,7 +1184,8 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
         JSON.stringify(afterProbe.invalidJsonPayloads) !== JSON.stringify(restored.invalidJsonPayloads) ||
         afterProbe.actorInstallationSecretValid !== restored.actorInstallationSecretValid ||
         afterProbe.actorMethodRevision !== restored.actorMethodRevision ||
-        afterProbe.actorPrivacyViolations !== restored.actorPrivacyViolations) {
+        afterProbe.actorPrivacyViolations !== restored.actorPrivacyViolations ||
+        afterProbe.identityPrivacyViolations !== restored.identityPrivacyViolations) {
       fail("Disposable application write probe did not roll back cleanly");
     }
     assertStandaloneArtifact(backup.realPath);
@@ -1034,7 +1213,8 @@ export function verifyRestorableBackup(backupPath, { scratchRoot = tmpdir() } = 
         invalidJsonPayloads: restored.invalidJsonPayloads,
         actorInstallationSecretValid: restored.actorInstallationSecretValid,
         actorMethodRevision: restored.actorMethodRevision,
-        actorPrivacyViolations: restored.actorPrivacyViolations
+        actorPrivacyViolations: restored.actorPrivacyViolations,
+        identityPrivacyViolations: restored.identityPrivacyViolations
       }
     };
   } catch (error) {

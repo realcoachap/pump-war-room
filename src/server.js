@@ -5,6 +5,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "./store.js";
+import { CanonicalRegistry } from "./canonical-registry.js";
+import { proposeIdentityCandidates } from "./identity-proposals.js";
 import { createDemoToken, tickDemoToken } from "./demo.js";
 import { PumpPortalIngestor } from "./ingest.js";
 import { BarkCalloutIngestor } from "./callouts.js";
@@ -116,6 +118,8 @@ let feedStatus = mode === "demo" ? "simulated" : "connecting";
 let calloutStatus = process.env.BARK_API_KEY ? "connecting" : "disabled";
 let lastEventAt = null;
 let lastMintAt = null;
+let identityProposalTimer = null;
+let identityProposalLastRunAt = null;
 let feedConnectedAt = null;
 let feedLastMessageAt = null;
 let feedLastActivityAt = null;
@@ -224,6 +228,18 @@ function feedHealth() {
 
 function telegramHealth() {
   return { ...telegramAlertStatus(), outbox: store.telegramDeliveryCoverage() };
+}
+
+function identityRegistryHealth() {
+  return {
+    schemaVersion: 1,
+    ...store.identityRegistryCoverage(),
+    proposalMethod: "metadata-collision-proposals-v1",
+    proposalLastRunAt: identityProposalLastRunAt,
+    automatedVerification: false,
+    publicWrites: false,
+    primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation"
+  };
 }
 
 function healthStatus(feed = feedObservation()) {
@@ -459,6 +475,7 @@ function upsert(token) {
     catch (error) { runtimeTelemetry.error("alerts.risk_admission_evaluation_failed", error, { mint: token.mint }); }
   }
   broadcastMaterialAlerts(committed.alerts);
+  scheduleIdentityProposalRefresh();
   send(previous ? "token-update" : "new-token", publicToken(token));
 }
 
@@ -471,6 +488,40 @@ function addCallout(callout) {
 
 function normalizeLiveToken(token) {
   return normalizePersistedLiveToken(token, { mode });
+}
+
+function scheduleIdentityProposalRefresh(delayMs = 15_000) {
+  if (identityProposalTimer !== null) return;
+  identityProposalTimer = setTimeout(() => {
+    identityProposalTimer = null;
+    try {
+      const proposals = proposeIdentityCandidates(store.tokens(100).map(publicToken).filter(Boolean));
+      const result = store.upsertIdentityProposals(proposals);
+      identityProposalLastRunAt = result.observedAt;
+      runtimeTelemetry.info("identity.proposals_refreshed", result);
+    } catch (error) {
+      runtimeTelemetry.error("identity.proposals_failed", error);
+    }
+  }, Math.max(0, delayMs));
+  identityProposalTimer.unref?.();
+}
+
+function resolveCanonicalIdentity(mint, token = null) {
+  const stored = store.identityRegistrySnapshot();
+  const resolution = new CanonicalRegistry(stored).resolveMint(mint, { token });
+  const proposals = store.identityProposals({ status: "pending", limit: 500 })
+    .filter((proposal) => proposal.fromMint === mint || proposal.toMint === mint)
+    .map((proposal) => ({
+      proposalKey: proposal.proposalKey,
+      fromMint: proposal.fromMint,
+      toMint: proposal.toMint,
+      kind: proposal.kind,
+      reviewState: "proposed",
+      evidenceClass: proposal.evidenceClass,
+      methodVersion: proposal.methodVersion,
+      observedAt: proposal.updatedAt
+    }));
+  return { ...resolution, proposals };
 }
 
 function snapshot() {
@@ -701,7 +752,7 @@ function snapshot() {
   };
   return {
     version: appVersion, generatedAt, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage,
-    telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery,
+    telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery, identityRegistry: identityRegistryHealth(),
     feedStatus, feedHealth: feed.state, feed, calloutStatus, lastEventAt, lastMintAt,
     liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
     demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
@@ -866,6 +917,7 @@ function coinDossier(mint, currentSnapshot) {
     },
     outcome: entry.outcome,
     earlyActor: store.actorSummary(mint),
+    identity: resolveCanonicalIdentity(mint, entry.token),
     timeline: `/api/coins/${mint}/timeline`,
     scope: "bounded observations retained by this deployment; not a complete market or on-chain dossier",
     disclaimer: "Observational research only; missing evidence stays unavailable and nothing here is financial advice."
@@ -1058,6 +1110,7 @@ if (telegramAlertStatus().status === "configured") {
 }
 
 snapshot();
+scheduleIdentityProposalRefresh(0);
 scheduleBriefBoundary();
 
 const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml" };
@@ -1094,12 +1147,25 @@ const server = http.createServer(async (req, res) => {
         materialPersistence: "atomic-with-durable-baseline",
         telegram: telegramHealth()
       },
-      earlyActors: actorIngestor?.getStatus() || persistedActorStatus()
+      earlyActors: actorIngestor?.getStatus() || persistedActorStatus(),
+      identityRegistry: identityRegistryHealth()
     });
     }
     if (url.pathname === "/api/snapshot") {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
       return json(res, 200, snapshot());
+    }
+    if (url.pathname === "/api/v1/entities/resolve") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      if ([...url.searchParams.keys()].some((key) => key !== "mint") || url.searchParams.getAll("mint").length !== 1) {
+        throw new HttpError(400, "Entity resolution requires one mint query parameter");
+      }
+      const mint = String(url.searchParams.get("mint") || "").trim();
+      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
+      const storedToken = store.token(mint);
+      const currentToken = snapshot().tokens.find((candidate) => candidate.mint === mint) || null;
+      const token = currentToken || (storedToken ? publicToken(normalizePersistedLiveToken(storedToken, { mode })) : null);
+      return json(res, 200, resolveCanonicalIdentity(mint, token));
     }
     if (url.pathname.startsWith("/api/coins/") && url.pathname.endsWith("/timeline")) {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
@@ -1109,7 +1175,7 @@ const server = http.createServer(async (req, res) => {
       }
       const limitText = url.searchParams.get("limit");
       const limit = limitText === null ? 50 : Number(limitText);
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || String(limit) !== limitText) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200 || (limitText !== null && String(limit) !== limitText)) {
         throw new HttpError(400, "Timeline limit must be an integer between 1 and 200");
       }
       const before = url.searchParams.get("before");

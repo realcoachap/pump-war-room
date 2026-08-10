@@ -5,7 +5,7 @@ import { gzipSync } from "node:zlib";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.9.5";
+const version = "0.10.0";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -52,6 +52,15 @@ function actionHealth() {
       delivery: "restart-safe-bounded-at-least-once-material-alerts-only", paidBroadcastsRequired: false,
       outbox: { total: 0, statusCounts: {} }
     }
+  };
+}
+
+function identityHealth() {
+  return {
+    schemaVersion: 1, entityCount: 0, variantCount: 0, relationshipCount: 0, decisionCount: 0,
+    proposalStatusCounts: {}, proposalMethod: "metadata-collision-proposals-v1", proposalLastRunAt: null,
+    automatedVerification: false, publicWrites: false,
+    primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation"
   };
 }
 
@@ -359,6 +368,7 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
       telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
       actionIntelligence: actionHealth(),
+      identityRegistry: identityHealth(),
       outcomes: {
         source: "geckoterminal", status: "observing", queueDepth: 2,
         lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 30,
@@ -455,6 +465,7 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         compare: { endpoint: "/api/compare?mints={mint},{mint}", minimumMints: 2, maximumMints: 4 },
         briefs: { daily: measuredBrief("daily"), weekly: measuredBrief("weekly") }
       },
+      identityRegistry: identityHealth(),
       riskIntelligence: {
         schemaVersion: 1,
         engine: { schemaVersion: 1, source: "geckoterminal", status: "available", queueDepth: 0 },
@@ -479,8 +490,24 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     [`/api/coins/${cohortMint(0)}`]: JSON.stringify({
       schemaVersion: 1, generatedAt: "2026-08-08T12:00:00.000Z", token: { mint: cohortMint(0), symbol: "T1" },
       radar: { score: null, orderingBasis: "recency", reasons: [], freshness: { state: "fresh" }, riskConfidence: "unavailable" },
-      outcome: { windows: {} }, earlyActor: actorSummary(), timeline: `/api/coins/${cohortMint(0)}/timeline`, scope: "bounded", disclaimer: "observational"
+      outcome: { windows: {} }, earlyActor: actorSummary(),
+      identity: {
+        schemaVersion: 1, resolvedBy: "singleton-exact-mint", mint: cohortMint(0),
+        entity: { entityId: `mint:${cohortMint(0)}`, displayName: "Token 1", symbol: "T1", reviewState: "proposed" },
+        variant: { mint: cohortMint(0), kind: "unresolved", reviewState: "proposed", evidenceClass: "unavailable" },
+        primary: { mint: cohortMint(0), selectionReason: "only-exact-mint", meaning: "identity resolution only; not a safety, quality, or trade recommendation" },
+        relationships: [], proposals: [], limitations: ["No reviewed cross-mint relationship is registered."]
+      },
+      timeline: `/api/coins/${cohortMint(0)}/timeline`, scope: "bounded", disclaimer: "observational"
     }),
+    [`/api/v1/entities/resolve?mint=${cohortMint(0)}`]: JSON.stringify({
+      schemaVersion: 1, resolvedBy: "singleton-exact-mint", mint: cohortMint(0),
+      entity: { entityId: `mint:${cohortMint(0)}`, displayName: "Token 1", symbol: "T1", reviewState: "proposed" },
+      variant: { mint: cohortMint(0), kind: "unresolved", reviewState: "proposed", evidenceClass: "unavailable" },
+      primary: { mint: cohortMint(0), selectionReason: "only-exact-mint", meaning: "identity resolution only; not a safety, quality, or trade recommendation" },
+      relationships: [], proposals: [], limitations: ["No reviewed cross-mint relationship is registered."]
+    }),
+    [`POST /api/v1/entities/resolve?mint=${cohortMint(0)}`]: JSON.stringify({ ok: false, error: "Method not allowed" }),
     [`/api/coins/${cohortMint(0)}/timeline?limit=2`]: JSON.stringify({
       schemaVersion: 1, mint: cohortMint(0), generatedAt: "2026-08-08T12:00:00.000Z", limit: 2,
       entries: [], nextBefore: null, historyAvailableSince: "2026-08-08T11:45:00.000Z",
@@ -503,13 +530,13 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       mode: "live",
       requestId: "00000000-0000-4000-8000-000000000001"
     }),
-    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section></body>`,
-    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} function createSnapshotRefreshScheduler() {} function vaultExportsEnabled() {} fetch('/api/compare?mints='); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal",
+    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section><section data-release-marker="canonical-identity-v1">NO PUBLIC WRITES · NO AUTOMATED CANONIZATION · Primary mint means identity resolution only</section></body>`,
+    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} function renderIdentityRegistry() {} function identityDetail() {} function createSnapshotRefreshScheduler() {} function vaultExportsEnabled() {} fetch('/api/compare?mints='); fetch(`/api/coins/${encodeURIComponent(mint)}`); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal; PROPOSED · NOT A FACT",
     "/snapshot-refresh.js": "export const SNAPSHOT_REFRESH_COOLDOWN_MS = 15_000; export const SNAPSHOT_REFRESH_TIMEOUT_MS = 10_000; export function createSnapshotLiveUpdates() {}",
     "/preferences.js": "export const WATCHLIST_LIMIT = 50; export const PRESET_LIMIT = 12; export function normalizePreferences() {}",
-    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}@media(max-width:650px){}",
-    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p><p>Early-actor evidence has partial and unmeasured coverage and does not establish identity or coordination and is not a trade signal.</p>",
-    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p><p>Per-installation keyed Actor numbers replace raw wallet addresses. Transaction signatures and mapping material are not persisted; normalized observations expire after 72 hours.</p>"
+    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}.identity-registry{}.identity-detail{}.identity-edge.proposed{}@media(max-width:650px){}",
+    "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p><p>Early-actor evidence has partial and unmeasured coverage and does not establish identity or coordination and is not a trade signal.</p><p>Automated metadata collisions remain proposals. Public registry endpoints are read-only.</p>",
+    "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p><p>Per-installation keyed Actor numbers replace raw wallet addresses. Transaction signatures and mapping material are not persisted; normalized observations expire after 72 hours.</p><p>append-only review decisions. Proposed edges remain visibly separate from reviewed facts; the resolver exposes no write operation.</p>"
   };
   for (const [pathname, override] of Object.entries(overrides)) {
     bodies[pathname] = typeof override === "function" ? override(bodies[pathname]) : override;
@@ -535,7 +562,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       : { "content-length": String(payload.length) };
     const status = Number.isInteger(statusOverride)
       ? statusOverride
-      : requestKey === "POST /api/export/coin/not-a-solana-mint" ? 403 : 200;
+      : requestKey === "POST /api/export/coin/not-a-solana-mint" ? 403
+        : requestKey.startsWith("POST /api/v1/entities/resolve?") ? 405 : 200;
     res.writeHead(status, {
       "content-type": contentType,
       "x-content-type-options": "nosniff",
@@ -563,14 +591,39 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   assert.equal(result.ok, true);
   assert.deepEqual(result.http, {
     health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
-    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200,
+    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200, identityResolver: 200,
+    identityWriteGuard: 405,
     vaultExportGuard: 403
   });
   assert.deepEqual(result.markers, {
     version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
     actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-    parserRevision: true, anonymousEarlyActors: true, publicDeliveryHardening: true, legalNotices: true
+    parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, publicDeliveryHardening: true, legalNotices: true
   });
+});
+
+test("fails release smoke when automated identity verification or public writes are enabled", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => { health.identityRegistry.automatedVerification = true; }),
+    "/api/snapshot": jsonOverride((snapshot) => { snapshot.identityRegistry.automatedVerification = true; })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health" && /identity review/.test(error.message)
+  );
+});
+
+test("fails release smoke when proposed identity edges are presented as verified", async (t) => {
+  const path = `/api/v1/entities/resolve?mint=${cohortMint(0)}`;
+  const baseUrl = await fixture(t, {
+    [path]: jsonOverride((identity) => {
+      identity.proposals.push({ fromMint: cohortMint(0), toMint: cohortMint(1), kind: "name-collision", reviewState: "verified" });
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "identity resolver" && /clearly separated/.test(error.message)
+  );
 });
 
 test("fails release smoke when the public edge omits snapshot gzip evidence", async (t) => {
@@ -1063,6 +1116,7 @@ test("fails when the live outcome provider has no successful refresh", async (t)
       feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
       telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
       actionIntelligence: actionHealth(),
+      identityRegistry: identityHealth(),
       outcomes: { source: "geckoterminal", status: "degraded", queueDepth: 2, lastSuccessAt: null, counters: { attempts: 2, successes: 0, consecutiveFailures: 2 } }
     })
   });
@@ -1098,6 +1152,7 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
     feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
     telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
     actionIntelligence: actionHealth(),
+    identityRegistry: identityHealth(),
     outcomes: {
       source: "geckoterminal", status: "idle", queueDepth: 0,
       lastSuccessAt: "2026-08-08T12:00:00.000Z", lastSuccessAgeSeconds: 3_600,
