@@ -5,7 +5,7 @@ import { gzipSync } from "node:zlib";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.10.1";
+const version = "0.10.2";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -530,11 +530,12 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       mode: "live",
       requestId: "00000000-0000-4000-8000-000000000001"
     }),
-    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section><section data-release-marker="canonical-identity-v1">NO PUBLIC WRITES · NO AUTOMATED CANONIZATION · Primary mint means identity resolution only</section></body>`,
+    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button><nav class="section-nav"><a href="/help.html">HELP</a></nav>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section><section data-release-marker="canonical-identity-v1">NO PUBLIC WRITES · NO AUTOMATED CANONIZATION · Primary mint means identity resolution only</section></body>`,
     "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} function renderIdentityRegistry() {} function identityDetail() {} function createSnapshotRefreshScheduler() {} function vaultExportsEnabled() {} fetch('/api/compare?mints='); fetch(`/api/coins/${encodeURIComponent(mint)}`); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal; PROPOSED · NOT A FACT",
     "/snapshot-refresh.js": "export const SNAPSHOT_REFRESH_COOLDOWN_MS = 15_000; export const SNAPSHOT_REFRESH_TIMEOUT_MS = 10_000; export function createSnapshotLiveUpdates() {}",
     "/preferences.js": "export const WATCHLIST_LIMIT = 50; export const PRESET_LIMIT = 12; export function normalizePreferences() {}",
-    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}.identity-registry{}.identity-detail{}.identity-edge.proposed{}@media(max-width:650px){}",
+    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}.identity-registry{}.identity-detail{}.identity-edge.proposed{}@media(max-width:650px){}/* v0.10.2 compact navigation and help center */.section-nav{}.method-disclosure{}",
+    "/help.html": "<h1>The 3-minute workflow</h1><h2>Canonical identity graph</h2><p>The pending proposal backlog is hard-capped at 500.</p><h2>Common questions</h2>",
     "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p><p>Early-actor evidence has partial and unmeasured coverage and does not establish identity or coordination and is not a trade signal.</p><p>Automated metadata collisions remain proposals. Public registry endpoints are read-only.</p>",
     "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p><p>Per-installation keyed Actor numbers replace raw wallet addresses. Transaction signatures and mapping material are not persisted; normalized observations expire after 72 hours.</p><p>append-only review decisions. Proposed edges remain visibly separate from reviewed facts; the resolver exposes no write operation.</p>"
   };
@@ -590,7 +591,7 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
   assert.equal(result.ok, true);
   assert.deepEqual(result.http, {
-    health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
+    health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, help: 200, terms: 200, privacy: 200,
     dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200, identityResolver: 200,
     identityWriteGuard: 405,
     vaultExportGuard: 403
@@ -598,7 +599,7 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   assert.deepEqual(result.markers, {
     version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
     actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-    parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, publicDeliveryHardening: true, legalNotices: true
+    parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, compactHelp: true, publicDeliveryHardening: true, legalNotices: true
   });
 });
 

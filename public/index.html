@@ -19,12 +19,22 @@
       <span id="feed-indicator" class="feed-indicator connecting" aria-label="Feed state: CONNECTING"><span class="live-dot"></span><strong id="feed-status">CONNECTING</strong></span>
       <span class="compact-telemetry">LAST REAL MINT <b id="last-mint-compact">WAITING</b></span>
       <span class="divider"></span><span id="clock">--:--:-- ET</span>
+      <a class="quiet-button help-link" href="/help.html">HELP</a>
       <button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button>
     </div>
   </header>
 
+  <nav class="section-nav" aria-label="War Room sections">
+    <a href="#radar">RADAR</a>
+    <a href="#identity">IDENTITY</a>
+    <a href="#workbench">WORKBENCH</a>
+    <a href="#evidence">EVIDENCE</a>
+    <a href="#tape">TAPE</a>
+    <a class="section-nav-help" href="/help.html">3-MINUTE GUIDE ↗</a>
+  </nav>
+
   <main>
-    <section class="hero">
+    <section class="hero" id="radar">
       <div>
         <p class="eyebrow">SOLANA MEMECOIN INTELLIGENCE // READ-ONLY</p>
         <h1>The tape, without<br><em>the noise.</em></h1>
@@ -157,7 +167,7 @@
       </div>
     </section>
 
-    <section class="identity-registry panel" aria-labelledby="identity-registry-title" data-release-marker="canonical-identity-v1">
+    <section id="identity" class="identity-registry panel" aria-labelledby="identity-registry-title" data-release-marker="canonical-identity-v1">
       <header class="identity-registry-header">
         <div>
           <span class="kicker">CANONICAL IDENTITY GRAPH // EXACT MINT FIRST</span>
@@ -170,7 +180,7 @@
       <div class="identity-registry-boundary" role="note"><b>Primary mint means identity resolution only.</b> It is never a safety, quality, legitimacy, or trade recommendation. Name, ticker, image, and narrative matches do not merge contracts.</div>
     </section>
 
-    <section class="action-intelligence panel" aria-labelledby="action-intelligence-title" data-release-marker="actionable-intelligence-v1">
+    <section id="workbench" class="action-intelligence panel" aria-labelledby="action-intelligence-title" data-release-marker="actionable-intelligence-v1">
       <header class="action-intelligence-header">
         <div>
           <span class="kicker">ACTIONABLE INTELLIGENCE // READ-ONLY</span>
@@ -212,7 +222,7 @@
       <div class="action-boundary" role="note"><b>Boundary:</b> timelines are discrete retained observations—not continuous price charts. Briefs cover only this deployment and fixed cohorts. Score alerts remain unavailable when comparable numeric evidence is missing.</div>
     </section>
 
-    <section class="risk-intelligence panel" aria-labelledby="risk-intelligence-title" data-release-marker="risk-identity-evidence-v1">
+    <section id="evidence" class="risk-intelligence panel" aria-labelledby="risk-intelligence-title" data-release-marker="risk-identity-evidence-v1">
       <header class="risk-intelligence-header">
         <div>
           <span class="kicker">RISK + IDENTITY EVIDENCE // NO COMPOSITE SCORE</span>
@@ -226,10 +236,10 @@
         <div><span class="kicker">INSPECTABLE v0.7 PROSPECTIVE COHORT</span><small id="risk-cohort-scope">0/120 admitted independently from the outcome cohort</small></div>
         <div id="risk-cohort" class="risk-cohort"><div class="loading">Waiting for v0.7 launch admissions…</div></div>
       </div>
-      <div class="risk-method" role="note">
-        <div><span class="kicker">EVIDENCE CONTRACT</span><p>Provider observations are unvetted public-beta data. Exact declared-social or registrable-domain matches show identifier reuse only—not duplicate content, common control, fraud, or safety. Creator and deployer counts cover only launches observed by this deployment. Missing evidence remains unavailable.</p></div>
-        <div><strong id="risk-coverage">0 normalized records</strong><small>These uncalibrated factors never alter v0.7 leaderboard rank.</small></div>
-      </div>
+      <details class="method-disclosure">
+        <summary><span><b>EVIDENCE CONTRACT</b><small id="risk-coverage">0 normalized records</small></span><em>METHOD + LIMITS</em></summary>
+        <div class="method-disclosure-body"><p>Provider observations are unvetted public-beta data. Exact declared-social or registrable-domain matches show identifier reuse only—not duplicate content, common control, fraud, or safety. Creator and deployer counts cover only launches observed by this deployment. Missing evidence remains unavailable.</p><small>These uncalibrated factors never alter v0.7 leaderboard rank.</small></div>
+      </details>
     </section>
 
     <section class="early-actors panel" aria-labelledby="early-actors-title" data-release-marker="anonymous-early-actor-v1">
@@ -246,10 +256,10 @@
         <div><span class="kicker">INSPECTABLE v0.9 PROSPECTIVE COHORT</span><small id="early-actor-cohort-scope">0/32 admitted · partial acquisition expected</small></div>
         <div id="early-actor-cohort" class="early-actor-cohort"><div class="loading">No prospective launch has been admitted yet.</div></div>
       </div>
-      <div class="early-actor-method" role="note">
-        <div><span class="kicker">PRIVACY + EVIDENCE CONTRACT</span><p>Per-installation keyed Actor numbers replace public wallet identities. Actor evidence tables exclude raw wallet addresses, transaction signatures, source payloads, and reversible lookup mappings; a short-lived keyed dedupe digest prevents duplicate observations. None of that internal material is exposed. Generic balance changes are rejected; side requires an official program instruction. Coverage is partial and unmeasured.</p></div>
-        <div><strong id="early-actor-gate">CORRELATIONS WITHHELD</strong><small>Actor observations never affect rank, risk, Telegram alerts, or recommendations.</small></div>
-      </div>
+      <details class="method-disclosure">
+        <summary><span><b>PRIVACY + EVIDENCE CONTRACT</b><small id="early-actor-gate">CORRELATIONS WITHHELD</small></span><em>METHOD + LIMITS</em></summary>
+        <div class="method-disclosure-body"><p>Per-installation keyed Actor numbers replace public wallet identities. Actor evidence tables exclude raw wallet addresses, transaction signatures, source payloads, and reversible lookup mappings; a short-lived keyed dedupe digest prevents duplicate observations. None of that internal material is exposed. Generic balance changes are rejected; side requires an official program instruction. Coverage is partial and unmeasured.</p><small>Actor observations never affect rank, risk, Telegram alerts, or recommendations.</small></div>
+      </details>
     </section>
 
     <section class="outcomes panel" aria-labelledby="outcomes-title" data-release-marker="provider-observed-outcome-engine">
@@ -268,7 +278,7 @@
       </div>
     </section>
 
-    <section class="workspace-grid">
+    <section id="tape" class="workspace-grid">
       <article class="panel movers-panel">
         <header class="panel-header">
           <div><span class="kicker" id="ranking-kicker">REAL-MINT RANKING</span><h2>What’s moving</h2></div>
@@ -294,7 +304,7 @@
       </aside>
     </section>
 
-    <footer><span>NO WALLET · NO EXECUTION · NO PRICE PROMISES · <b id="app-version">v—</b></span><span>Factors are observational evidence, not safety claims or financial advice. <a href="https://www.geckoterminal.com/" target="_blank" rel="noreferrer">On-chain data: GeckoTerminal</a> · <a href="https://www.coingecko.com/" target="_blank" rel="noreferrer">Powered by CoinGecko</a> · <a href="/terms.html">Terms</a> · <a href="/privacy.html">Privacy</a>.</span></footer>
+    <footer><span>NO WALLET · NO EXECUTION · NO PRICE PROMISES · <b id="app-version">v—</b></span><span>Factors are observational evidence, not safety claims or financial advice. <a href="/help.html">Help + FAQ</a> · <a href="https://www.geckoterminal.com/" target="_blank" rel="noreferrer">On-chain data: GeckoTerminal</a> · <a href="https://www.coingecko.com/" target="_blank" rel="noreferrer">Powered by CoinGecko</a> · <a href="/terms.html">Terms</a> · <a href="/privacy.html">Privacy</a>.</span></footer>
   </main>
 
   <dialog id="token-dialog">

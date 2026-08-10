@@ -414,7 +414,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(["live", "demo"].includes(expectedMode), "configuration", "expectedMode must be live or demo");
 
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
-  const [healthResult, snapshotResult, htmlResult, scriptResult, refreshScriptResult, preferencesResult, stylesResult, termsResult, privacyResult] = await Promise.all([
+  const [healthResult, snapshotResult, htmlResult, scriptResult, refreshScriptResult, preferencesResult, stylesResult, helpResult, termsResult, privacyResult] = await Promise.all([
     request(normalizedBaseUrl, "/api/health", { timeoutMs, fetchImpl, headers: { "accept-encoding": "gzip" } }),
     request(normalizedBaseUrl, "/api/snapshot", { timeoutMs, fetchImpl, headers: { "accept-encoding": "gzip" } }),
     request(normalizedBaseUrl, "/", { timeoutMs, fetchImpl }),
@@ -422,6 +422,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     request(normalizedBaseUrl, "/snapshot-refresh.js", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/preferences.js", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/styles.css", { timeoutMs, fetchImpl }),
+    request(normalizedBaseUrl, "/help.html", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/terms.html", { timeoutMs, fetchImpl }),
     request(normalizedBaseUrl, "/privacy.html", { timeoutMs, fetchImpl })
   ]);
@@ -484,6 +485,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     ["snapshot-refresh.js", refreshScriptResult, "text/javascript"],
     ["preferences.js", preferencesResult, "text/javascript"],
     ["styles.css", stylesResult, "text/css"],
+    ["help", helpResult, "text/html"],
     ["terms", termsResult, "text/html"],
     ["privacy", privacyResult, "text/html"],
     ["dossier", dossierResult, "application/json"],
@@ -975,6 +977,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     && htmlResult.body.includes("NO PUBLIC WRITES · NO AUTOMATED CANONIZATION")
     && htmlResult.body.includes("Primary mint means identity resolution only"),
   "html", "canonical identity review boundary marker was missing");
+  requireValue(htmlResult.body.includes('class="section-nav"') && htmlResult.body.includes('href="/help.html"'),
+    "html", "compact section navigation or help entry point was missing");
   requireValue(scriptResult.body.includes("renderFeedObservability"), "app.js", "feed observability UI marker was missing");
   requireValue(scriptResult.body.includes("renderOutcomes") && scriptResult.body.includes("raw candle retention off"), "app.js", "outcome engine UI marker was missing");
   requireValue(scriptResult.body.includes("renderRiskIntelligence")
@@ -1010,6 +1014,13 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(stylesResult.body.includes(".identity-registry") && stylesResult.body.includes(".identity-detail")
     && stylesResult.body.includes(".identity-edge.proposed"),
   "styles.css", "canonical identity desktop or responsive styles were missing");
+  requireValue(stylesResult.body.includes("v0.10.2 compact navigation and help center")
+    && stylesResult.body.includes(".section-nav") && stylesResult.body.includes(".method-disclosure"),
+  "styles.css", "compact navigation or disclosure styles were missing");
+  requireValue(helpResult.body.includes("The 3-minute workflow")
+    && helpResult.body.includes("Canonical identity graph") && helpResult.body.includes("Common questions")
+    && helpResult.body.includes("pending proposal backlog is hard-capped at 500"),
+  "help", "tutorial, identity guide, FAQ, or bounded-backlog explanation was missing");
   requireValue(termsResult.body.includes("CoinGecko API Terms") && termsResult.body.includes("not verified prices")
     && termsResult.body.includes("does not prove duplicate content") && termsResult.body.includes("common control")
     && termsResult.body.includes("materiality policy") && termsResult.body.includes("migration observation")
@@ -1047,7 +1058,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
       earlyActorState: health.earlyActors.status
     },
     http: {
-      health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, terms: 200, privacy: 200,
+      health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, help: 200, terms: 200, privacy: 200,
       dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200, identityResolver: 200,
       identityWriteGuard: 405,
       vaultExportGuard: vaultExportGuardResult ? 403 : "not-applicable"
@@ -1055,7 +1066,7 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
     markers: {
       version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
       actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-      parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, publicDeliveryHardening: true, legalNotices: true
+      parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, compactHelp: true, publicDeliveryHardening: true, legalNotices: true
     }
   };
 }

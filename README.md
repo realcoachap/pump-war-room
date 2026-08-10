@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.10.1**
+Current release: **v0.10.2**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, reports bounded anonymous early-actor observations, and resolves exact mints through a review-gated canonical identity graph without presenting an uncalibrated probability or trade signal.
 
@@ -95,7 +95,7 @@ Evidence classes are explicit: `on-chain-finalized`, `provider-observed`, `feed-
 
 ### Canonical Identity Graph
 
-v0.10.1 adds schema 902 tables for reviewed entities, exact-mint variants, typed cross-mint relationships, deterministic proposals, and append-only decisions. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
+v0.10.2 includes the schema 902 reviewed-identity release and its v0.10.1 durability cap. It also tightens the public dashboard layout, adds persistent section navigation, collapsible method disclosures, and a dedicated `/help.html` tutorial and FAQ. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
 
 The bounded proposal worker compares metadata already present in the authorized local feed. Exact normalized name/symbol or narrative matches become deterministic, locally derived proposals; they never mutate reviewed facts, select a primary mint, affect ranking, or appear as verified edges. Each refresh and the persisted pending backlog are capped at 500; stale pending rows are pruned while accepted, rejected, and superseded review records remain retained. Public surfaces are read-only. Operator review requires direct local access to an existing SQLite database:
 
@@ -209,7 +209,7 @@ Vault exports are filesystem-writing operator actions, not public live API capab
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.1 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.2 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

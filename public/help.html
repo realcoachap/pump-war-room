@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090b10">
+  <title>Help + Tutorial — Pump War Room</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <header class="topbar help-topbar">
+    <a class="brand brand-link" href="/">
+      <span class="sigil">C</span>
+      <span><strong>PUMP WAR ROOM</strong><small>HELP CENTER</small></span>
+    </a>
+    <a class="quiet-button help-link" href="/">BACK TO RADAR</a>
+  </header>
+
+  <main class="help-page">
+    <header class="help-hero">
+      <span class="eyebrow">OPENCAESAR FIELD GUIDE // READ-ONLY</span>
+      <h1>Find the signal.<br><em>Keep the uncertainty.</em></h1>
+      <p>Pump War Room organizes launches observed by this deployment. It does not trade, connect a wallet, promise complete market coverage, or turn missing evidence into a safety claim.</p>
+    </header>
+
+    <nav class="help-index" aria-label="Help topics">
+      <a href="#tutorial">3-minute tutorial</a>
+      <a href="#identity-guide">New: identity graph</a>
+      <a href="#glossary">What each area does</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+
+    <section id="tutorial" class="help-section">
+      <span class="kicker">START HERE</span>
+      <h2>The 3-minute workflow</h2>
+      <ol class="tutorial-steps">
+        <li><b>Check the feed.</b><p>Confirm the top status says LIVE and inspect “Last real mint.” STALE or CONNECTING means the screen may not represent current activity.</p></li>
+        <li><b>Scan Top 100 Radar.</b><p>Start with the default evidence/recency lens. Search by name, ticker, or exact mint; use freshness and evidence filters to narrow the tape.</p></li>
+        <li><b>Open a coin.</b><p>Select a row to inspect its exact mint, supporting momentum observations, named risk factors, identity resolution, outcomes, and retained timeline.</p></li>
+        <li><b>Build a watchlist.</b><p>Star coins worth revisiting. Your list and saved filter lenses stay in this browser only. Select two to four watched coins for a side-by-side evidence comparison.</p></li>
+        <li><b>Ask Caesar.</b><p>Use a quick brief or ask a focused question. Caesar summarizes only the War Room snapshot available at that moment and cites the observations behind the answer.</p></li>
+      </ol>
+      <div class="help-callout"><b>Best habit:</b> treat <strong>—</strong>, unavailable, stale, and insufficient evidence as “we do not know”—never as zero, safe, or bad.</div>
+    </section>
+
+    <section id="identity-guide" class="help-section feature-guide">
+      <span class="kicker">NEW IN v0.10</span>
+      <h2>Canonical identity graph</h2>
+      <p>Memecoins can reuse names, tickers, images, and narratives across different contracts. The identity graph keeps the exact Solana mint as the source of truth while allowing reviewed relationships between mints.</p>
+      <div class="identity-guide-grid">
+        <article><b>Exact mint first</b><p>Every mint resolves independently. Two tokens with the same branding remain separate unless a human-reviewed relationship says otherwise.</p></article>
+        <article><b>Entity + variants</b><p>A reviewed entity may connect an official launch, migration, or relaunch and may name a primary mint when the evidence is unambiguous.</p></article>
+        <article><b>Proposals are not facts</b><p>Automated name, ticker, or narrative collisions are visibly labeled proposals. They cannot canonize an identity, change rank, or become a recommendation.</p></article>
+        <article><b>Bounded by design</b><p>The pending proposal backlog is hard-capped at 500. Stale pending suggestions are pruned while reviewed decisions remain retained.</p></article>
+      </div>
+      <div class="help-callout warning"><b>Primary mint means identity resolution only.</b> It does not mean authentic, safe, high quality, or worth buying.</div>
+    </section>
+
+    <section id="glossary" class="help-section">
+      <span class="kicker">MAP OF THE ROOM</span>
+      <h2>What each area does</h2>
+      <dl class="help-glossary">
+        <div><dt>Upstream telemetry</dt><dd>Shows whether real mint ingestion and browser updates are current.</dd></div>
+        <div><dt>Caesar Intel</dt><dd>Answers questions from the current snapshot; it cannot execute trades.</dd></div>
+        <div><dt>Top 100 Radar</dt><dd>Ranks only observed mints using supported evidence, falling back to recency when evidence is thin.</dd></div>
+        <div><dt>Identity registry</dt><dd>Separates exact contracts from reviewed project, migration, relaunch, collision, or copycat relationships.</dd></div>
+        <div><dt>Workbench</dt><dd>Stores browser-local watchlists and filters, compares exact mints, and shows closed-period briefs.</dd></div>
+        <div><dt>Risk evidence</dt><dd>Displays named factors and unknowns; no composite safety probability is calculated.</dd></div>
+        <div><dt>Early actors</dt><dd>Shows bounded, privacy-preserving activity summaries when the evidence gate is met; wallets are not exposed.</dd></div>
+        <div><dt>Outcomes</dt><dd>Measures completed provider candles after observation. Missing or immature windows stay unavailable.</dd></div>
+      </dl>
+    </section>
+
+    <section id="faq" class="help-section">
+      <span class="kicker">FAQ</span>
+      <h2>Common questions</h2>
+      <div class="faq-list">
+        <details><summary>Is this financial advice or a trading bot?</summary><p>No. It is read-only observational research. There is no wallet connection, order execution, or recommendation engine.</p></details>
+        <details><summary>Does Top 100 mean the whole Pump.fun market?</summary><p>No. It means the highest-ranked mints inside this deployment’s observed feed and evidence contract.</p></details>
+        <details><summary>Why do I see dashes or “unavailable”?</summary><p>The required evidence is missing, immature, stale, outside retention, or failed validation. The War Room refuses to invent a value.</p></details>
+        <details><summary>Does a high radar score mean a token is safe?</summary><p>No. Radar describes supported movement and attention evidence. It is not a calibrated risk or safety probability.</p></details>
+        <details><summary>What does “pending proposal” mean?</summary><p>Local metadata found a possible relationship between exact mints. It remains unverified until an operator explicitly reviews it.</p></details>
+        <details><summary>Where is my watchlist stored?</summary><p>In this browser’s local storage. It is not synced across devices and does not configure Telegram delivery.</p></details>
+        <details><summary>Why can a coin disappear or change position?</summary><p>The observed inventory, freshness, and supporting evidence change as new snapshots arrive. Filters and ranking lenses also affect what you see.</p></details>
+        <details><summary>How do I verify the exact token?</summary><p>Open the coin and compare the full mint address. Names, tickers, images, and narratives are not unique identifiers.</p></details>
+      </div>
+    </section>
+
+    <footer><span>PUMP WAR ROOM HELP</span><span><a href="/">Radar</a> · <a href="/terms.html">Terms</a> · <a href="/privacy.html">Privacy</a></span></footer>
+  </main>
+</body>
+</html>
