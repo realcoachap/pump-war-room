@@ -6,6 +6,7 @@ import { isCanonicalSolanaAddress } from "./early-actors.js";
 import { CanonicalRegistry, validateCanonicalEntity, validateCanonicalRelationship } from "./canonical-registry.js";
 
 export const STORE_SCHEMA_VERSION = 902;
+export const IDENTITY_PENDING_PROPOSAL_LIMIT = 500;
 const LEGACY_ACTOR_SCHEMA_VERSION = 900;
 export const ACTOR_OBSERVATION_MAX_RETENTION_MS = 72 * 60 * 60 * 1_000;
 
@@ -1639,9 +1640,13 @@ export class Store {
           methodVersion, JSON.stringify(evidence), "pending", existing?.created_at ?? now, now);
         written += Number(result.changes > 0);
       }
+      const pruned = Number(this.db.prepare(`DELETE FROM identity_proposals WHERE status='pending' AND proposal_key NOT IN (
+        SELECT proposal_key FROM identity_proposals WHERE status='pending'
+        ORDER BY updated_at DESC,proposal_key ASC LIMIT ?
+      )`).run(IDENTITY_PENDING_PROPOSAL_LIMIT).changes);
       this.db.exec("COMMIT");
       transactionStarted = false;
-      return { observedAt: now, supplied: proposals.length, written };
+      return { observedAt: now, supplied: proposals.length, written, pruned, pendingLimit: IDENTITY_PENDING_PROPOSAL_LIMIT };
     } catch (error) {
       if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
       throw error;

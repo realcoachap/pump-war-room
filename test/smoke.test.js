@@ -5,7 +5,7 @@ import { gzipSync } from "node:zlib";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.10.0";
+const version = "0.10.1";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -58,7 +58,7 @@ function actionHealth() {
 function identityHealth() {
   return {
     schemaVersion: 1, entityCount: 0, variantCount: 0, relationshipCount: 0, decisionCount: 0,
-    proposalStatusCounts: {}, proposalMethod: "metadata-collision-proposals-v1", proposalLastRunAt: null,
+    proposalStatusCounts: {}, proposalMethod: "metadata-collision-proposals-v1", pendingProposalLimit: 500, proposalLastRunAt: null,
     automatedVerification: false, publicWrites: false,
     primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation"
   };

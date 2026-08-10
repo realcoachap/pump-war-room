@@ -561,6 +561,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   "health", "action intelligence health contract was missing");
   requireValue(health.identityRegistry?.schemaVersion === 1
     && health.identityRegistry.proposalMethod === "metadata-collision-proposals-v1"
+    && health.identityRegistry.pendingProposalLimit === 500
+    && Number(health.identityRegistry.proposalStatusCounts?.pending || 0) <= health.identityRegistry.pendingProposalLimit
     && health.identityRegistry.automatedVerification === false
     && health.identityRegistry.publicWrites === false
     && /identity resolution only/.test(health.identityRegistry.primaryMeaning || ""),

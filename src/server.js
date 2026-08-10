@@ -4,7 +4,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "./store.js";
+import { IDENTITY_PENDING_PROPOSAL_LIMIT, Store } from "./store.js";
 import { CanonicalRegistry } from "./canonical-registry.js";
 import { proposeIdentityCandidates } from "./identity-proposals.js";
 import { createDemoToken, tickDemoToken } from "./demo.js";
@@ -235,6 +235,7 @@ function identityRegistryHealth() {
     schemaVersion: 1,
     ...store.identityRegistryCoverage(),
     proposalMethod: "metadata-collision-proposals-v1",
+    pendingProposalLimit: IDENTITY_PENDING_PROPOSAL_LIMIT,
     proposalLastRunAt: identityProposalLastRunAt,
     automatedVerification: false,
     publicWrites: false,
