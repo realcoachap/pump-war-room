@@ -4,7 +4,7 @@ import http from "node:http";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.9.2";
+const version = "0.9.3";
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,

@@ -77,7 +77,13 @@ function mergeOutcomeHistory(previousValue, candidate) {
     merged.windows[key] = prior;
   }
   const observed = OUTCOME_KEYS.filter((key) => merged.windows[key]?.status === "observed").length;
-  merged.status = observed === OUTCOME_KEYS.length ? "complete" : observed ? "partial" : merged.status;
+  merged.status = observed === OUTCOME_KEYS.length
+    ? "complete"
+    : observed > 0
+      ? "partial"
+      : merged.baseline?.status === "observed"
+        ? "awaiting-observations"
+        : "awaiting-baseline";
   merged.observationCounts.retainedObservedWindows = observed;
   const history = Array.isArray(previous.revisionHistory) ? previous.revisionHistory : [];
   merged.revisionHistory = (changedWindows.length || missingWindows.length || newlyObservedWindows.length)

@@ -165,6 +165,41 @@ test("records a valid provider refresh as operational success even when complete
   assert.equal(ingestor.getStatus().counters.successes, 1);
 });
 
+test("retains an observed baseline and awaiting-observations status across an empty provider revision", async () => {
+  const store = memoryStore();
+  seedFixedSelection(store);
+  let clock = Date.parse("2026-08-08T12:03:00Z");
+  let refresh = 0;
+  const client = {
+    poolForToken: async () => { throw new Error("fixed pool must be reused"); },
+    ohlcv: async () => {
+      refresh++;
+      const rows = refresh === 1
+        ? [{ ...candle("2026-08-08T12:00:00.000Z", 1), fetchedAt: new Date(clock).toISOString() }]
+        : [];
+      return { observations: rows, received: rows.length, rejected: 0, incomplete: 0 };
+    }
+  };
+  const ingestor = new VerifiedOutcomeIngestor({ store, client, now: () => clock });
+  const first = await ingestor.refreshToken(token);
+  assert.equal(first.status, "observing");
+  assert.equal(first.evidence.outcome.baseline.status, "observed");
+  assert.equal(first.evidence.outcome.status, "awaiting-observations");
+  assert.equal(Object.values(first.evidence.outcome.windows).filter(({ status }) => status === "observed").length, 0);
+
+  store.states.get(mint).nextAttemptAt = null;
+  clock += 60_000;
+  const second = await ingestor.refreshToken(token);
+  assert.equal(second.status, "observing");
+  assert.equal(second.errorCode, null);
+  assert.equal(second.lastSuccessAt, "2026-08-08T12:04:00.000Z");
+  assert.equal(second.evidence.outcome.baseline.status, "observed");
+  assert.equal(second.evidence.outcome.status, "awaiting-observations");
+  assert.equal(second.evidence.outcome.observationCounts.retainedObservedWindows, 0);
+  assert.equal(ingestor.getStatus().counters.successes, 2);
+  assert.doesNotMatch(JSON.stringify(second.evidence.outcome), /"(?:close|volume)":/);
+});
+
 test("terminalizes a permanently missing baseline after a bounded acquisition window", async () => {
   const store = memoryStore();
   seedFixedSelection(store);
@@ -326,6 +361,7 @@ test("an empty later refresh retains first-observed derived windows and records 
   clock += 60_000;
   const second = await ingestor.refreshToken(token);
   assert.equal(first.evidence.outcome.windows["5m"].returnPct, 100);
+  assert.equal(second.evidence.outcome.status, "partial");
   assert.equal(second.evidence.outcome.windows["5m"].returnPct, 100);
   assert.deepEqual(second.evidence.outcome.revisionHistory.at(-1).missingWindows, ["5m"]);
   assert.doesNotMatch(JSON.stringify(second.evidence.outcome), /"(?:close|volume)":/);
