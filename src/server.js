@@ -4,15 +4,15 @@ import { readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { IDENTITY_PENDING_PROPOSAL_LIMIT, Store } from "./store.js";
+import { IDENTITY_PENDING_PROPOSAL_LIMIT, IDENTITY_RESOLVER_RELATIONSHIP_LIMIT, isPublishableIdentityProposal, Store } from "./store.js";
 import { CanonicalRegistry } from "./canonical-registry.js";
+import { buildEntityIntelligence, paginateEntityIntelligence, projectVerifiedIdentityRegistry } from "./entity-intelligence.js";
 import { proposeIdentityCandidates } from "./identity-proposals.js";
 import { createDemoToken, tickDemoToken } from "./demo.js";
 import { PumpPortalIngestor } from "./ingest.js";
 import { BarkCalloutIngestor } from "./callouts.js";
-import { exportCoin, exportMeasuredBrief } from "./vault.js";
 import { analyzeSnapshot } from "./analyst.js";
-import { createRateLimiter, encodeJsonResponse, HttpError, readJsonBody } from "./http.js";
+import { broadcastBoundedSse, createConcurrencyGuard, createRateLimiter, encodeJsonResponse, HttpError, readJsonBody } from "./http.js";
 import { createTop100 } from "./ranking.js";
 import { createRuntimeTelemetry, FEED_STALE_AFTER_MS, observeFeed, observeStorage } from "./observability.js";
 import { GECKOTERMINAL_PROVIDER, GeckoTerminalClient } from "./geckoterminal.js";
@@ -28,6 +28,7 @@ import { attachRiskIdentityEvidence } from "./risk-public.js";
 import { normalizePersistedLiveToken } from "./live-token.js";
 import { projectPublicCallout, projectPublicToken } from "./privacy.js";
 import { ACTOR_COHORT_LIMIT, ACTOR_EARLY_WINDOW_MS, ACTOR_RAW_RETENTION_MS, ACTOR_SIGNATURE_LIMIT, ACTOR_TRANSACTION_LIMIT, EarlyActorIngestor } from "./actor-ingest.js";
+import { isCanonicalSolanaAddress } from "./early-actors.js";
 import { SOLANA_ACTOR_PARSER_REVISION, SOLANA_MAINNET_RPC, SolanaRpcClient } from "./solana-rpc.js";
 import {
   buildCoinComparison,
@@ -59,19 +60,17 @@ const publicDelivery = Object.freeze({
   schemaVersion: 1,
   snapshotEncoding: "gzip-when-accepted",
   browserRefresh: "coalesced-with-15-second-post-completion-cooldown",
-  vaultExports: mode === "live" ? "disabled" : "local-demo-only"
+  vaultExports: "disabled"
 });
 const dbPath = path.resolve(root, process.env.DB_PATH || "data/pump-war-room.db");
-const vaultPath = path.resolve(root, process.env.VAULT_PATH || "vault");
 const startedAt = new Date().toISOString();
 const runtimeTelemetry = createRuntimeTelemetry({ version: appVersion, mode, startedAt });
 const configuredPublicBaseUrl = process.env.PUBLIC_BASE_URL;
 const publicBaseUrl = typeof configuredPublicBaseUrl === "string" && /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(configuredPublicBaseUrl)
   ? configuredPublicBaseUrl
   : "https://pump-war-room-production.up.railway.app";
-const publicMintPattern = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const rawSolanaIdentityText = /(?:^|[^1-9A-HJ-NP-Za-km-z])(?:[1-9A-HJ-NP-Za-km-z]{64,88}|[1-9A-HJ-NP-Za-km-z]{32,44})(?=$|[^1-9A-HJ-NP-Za-km-z])/;
-const rawSocialProfileText = /(?:^|[\s(])(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)]+)/i;
+const rawSolanaIdentityText = /[1-9A-HJ-NP-Za-km-z]{32,}/;
+const rawSocialProfileText = /(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)\]}>"']+)/i;
 const MATERIAL_BASELINE_EVENT_KEY = "material-baseline-v1";
 process.on("uncaughtExceptionMonitor", (error, origin) => runtimeTelemetry.error("process.uncaught_exception", error, { origin }));
 const store = new Store(dbPath);
@@ -104,6 +103,12 @@ const publicToken = (token) => {
   }
   return projected;
 };
+const canonicalStoredToken = (mint) => {
+  if (!isCanonicalSolanaAddress(mint)) return null;
+  const token = store.token(mint);
+  return token && token.mint === mint && isCanonicalSolanaAddress(token.mint) ? token : null;
+};
+const canonicalStoredTokens = (limit) => store.canonicalTokens(limit);
 const publicCallout = (callout) => projectPublicCallout(callout, { installationSecret: actorPrivacySecret });
 const identityCleanup = store.sanitizeLegacyCalloutProfiles(publicCallout);
 const storage = observeStorage({
@@ -112,8 +117,13 @@ const storage = observeStorage({
   mountInfo: (() => { try { return readFileSync("/proc/self/mountinfo", "utf8"); } catch { return null; } })()
 });
 const cleanup = mode === "live" ? store.purgeDemoData() : { tokens: 0, events: 0, alerts: 0 };
-const clients = new Set();
-const checkAgentRate = createRateLimiter({ limit: 20, windowMs: 60_000 });
+const clients = new Map();
+const checkAgentRate = createRateLimiter({ limit: 60, windowMs: 60_000, maxKeys: 1 });
+const checkSnapshotRate = createRateLimiter({ limit: 120, windowMs: 60_000, maxKeys: 1 });
+const checkIdentityListRate = createRateLimiter({ limit: 120, windowMs: 60_000, maxKeys: 1 });
+const checkIdentityResolverRate = createRateLimiter({ limit: 120, windowMs: 60_000, maxKeys: 1 });
+const acquireStreamConnection = createConcurrencyGuard({ limit: 64 });
+let sseSlowClientDrops = 0;
 let feedStatus = mode === "demo" ? "simulated" : "connecting";
 let calloutStatus = process.env.BARK_API_KEY ? "connecting" : "disabled";
 let lastEventAt = null;
@@ -129,6 +139,8 @@ let lastLoggedFeedStatus = null;
 let reconnects = 0;
 let feedMessages = 0;
 let feedParseErrors = 0;
+const SNAPSHOT_CACHE_MAX_AGE_MS = 5_000;
+let snapshotCache = null;
 let pumpPortalIngestor = null;
 let outcomeIngestor = null;
 let riskIdentityIngestor = null;
@@ -230,17 +242,102 @@ function telegramHealth() {
   return { ...telegramAlertStatus(), outbox: store.telegramDeliveryCoverage() };
 }
 
-function identityRegistryHealth() {
+function identityRegistryHealth(projection = null) {
   return {
     schemaVersion: 1,
-    ...store.identityRegistryCoverage(),
+    ...store.identityRegistryCoverage({ projection }),
     proposalMethod: "metadata-collision-proposals-v1",
     pendingProposalLimit: IDENTITY_PENDING_PROPOSAL_LIMIT,
     proposalLastRunAt: identityProposalLastRunAt,
     automatedVerification: false,
     publicWrites: false,
-    primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation"
+    primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation",
+    api: {
+      schemaVersion: 1,
+      version: "v1",
+      list: "/api/v1/entities",
+      resolver: "/api/v1/entities/resolve?mint={mint}",
+      specification: "/api/v1/openapi.json",
+      documentation: "/api.html",
+      pagination: "opaque-cursor-entity-id-order",
+      authentication: "none-read-only",
+      externalApiKeys: "not-offered",
+      quotaScope: "process-global-per-instance",
+      limiter: {
+        schemaVersion: 1,
+        scope: "process-global-per-instance",
+        key: "one-shared-bucket-per-endpoint",
+        list: checkIdentityListRate.snapshot(),
+        resolver: checkIdentityResolverRate.snapshot()
+      },
+      stream: { ...acquireStreamConnection.snapshot(), slowClientDrops: sseSlowClientDrops }
+    }
   };
+}
+
+function rateLimitHeaders(rate) {
+  return {
+    "x-ratelimit-limit": String(rate.limit),
+    "x-ratelimit-remaining": String(rate.remaining),
+    "x-ratelimit-reset": String(rate.resetAtUnix)
+  };
+}
+
+function applyRateLimit(req, res, requestId, limiter, { code, message }) {
+  const rate = limiter("process");
+  const headers = rateLimitHeaders(rate);
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+  if (rate.allowed) return headers;
+  json(res, 429, {
+    ok: false,
+    code,
+    error: message,
+    requestId
+  }, { ...headers, "retry-after": String(rate.retryAfter) });
+  return null;
+}
+
+function identityApiRate(req, res, requestId, endpoint) {
+  const limiter = endpoint === "list" ? checkIdentityListRate : checkIdentityResolverRate;
+  return applyRateLimit(req, res, requestId, limiter, {
+    code: "identity-api-rate-limited",
+    message: "Too many identity API requests"
+  });
+}
+
+function analystApiRate(req, res, requestId) {
+  return applyRateLimit(req, res, requestId, checkAgentRate, {
+    code: "analyst-rate-limited",
+    message: "Too many analyst requests"
+  });
+}
+
+function apiLimitHealth() {
+  return {
+    schemaVersion: 1,
+    scope: "process-global-per-instance",
+    key: "single-shared-bucket",
+    snapshot: checkSnapshotRate.snapshot()
+  };
+}
+
+function responseRouteClass(requestUrl) {
+  const pathname = String(requestUrl || "").split("?")[0];
+  if (pathname === "/api/health") return "health";
+  if (pathname === "/api/snapshot") return "snapshot";
+  if (pathname === "/api/v1/entities") return "identity-list";
+  if (pathname === "/api/v1/entities/resolve") return "identity-resolver";
+  if (pathname === "/api/v1/openapi.json") return "openapi";
+  if (pathname.startsWith("/api/coins/") && pathname.endsWith("/timeline")) return "coin-timeline";
+  if (pathname.startsWith("/api/coins/")) return "coin-dossier";
+  if (pathname === "/api/compare") return "compare";
+  if (pathname === "/api/briefs/daily" || pathname === "/api/briefs/weekly") return "briefs";
+  if (pathname === "/api/agent/chat") return "analyst";
+  if (pathname === "/api/stream") return "stream";
+  if (pathname.startsWith("/api/export/")) return "export";
+  if (pathname.startsWith("/api/")) return "api-other";
+  if (pathname.startsWith("/") || pathname === "") return "static";
+  return "other";
 }
 
 function healthStatus(feed = feedObservation()) {
@@ -253,7 +350,7 @@ function healthStatus(feed = feedObservation()) {
 const send = (kind, payload) => {
   lastEventAt = new Date().toISOString();
   const chunk = `event: ${kind}\ndata: ${JSON.stringify(payload)}\n\n`;
-  for (const client of clients) client.write(chunk);
+  sseSlowClientDrops += broadcastBoundedSse(clients, chunk).dropped;
 };
 
 function radarScore(token) {
@@ -367,7 +464,7 @@ function priorRiskToken(token, events) {
 function evaluateRiskMateriality({ seedOnly = !store.hasIntelligenceEvent(MATERIAL_BASELINE_EVENT_KEY) } = {}) {
   if (mode !== "live") return;
   const riskStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 120 });
-  const baseTokens = riskStates.map(({ mint }) => store.token(mint)).filter((token) => token?.source === "pumpportal")
+  const baseTokens = riskStates.map(({ mint }) => canonicalStoredToken(mint)).filter((token) => token?.source === "pumpportal")
     .map((token) => normalizePersistedLiveToken(token, { mode }));
   const outcomeStates = baseTokens.map(({ mint }) => store.enrichmentState(mint)).filter(Boolean);
   const currentTokens = attachRiskIdentityEvidence(baseTokens, {
@@ -455,7 +552,7 @@ function evaluateRiskMateriality({ seedOnly = !store.hasIntelligenceEvent(MATERI
 }
 
 function upsert(token) {
-  const previous = store.token(token.mint);
+  const previous = canonicalStoredToken(token.mint);
   const candidates = mode === "live" ? detectMaterialAlerts({
     current: normalizePersistedLiveToken(token, { mode }),
     previous: previous ? normalizePersistedLiveToken(previous, { mode }) : null,
@@ -496,7 +593,7 @@ function scheduleIdentityProposalRefresh(delayMs = 15_000) {
   identityProposalTimer = setTimeout(() => {
     identityProposalTimer = null;
     try {
-      const proposals = proposeIdentityCandidates(store.tokens(100).map(publicToken).filter(Boolean));
+      const proposals = proposeIdentityCandidates(canonicalStoredTokens(100).map(publicToken).filter(Boolean));
       const result = store.upsertIdentityProposals(proposals);
       identityProposalLastRunAt = result.observedAt;
       runtimeTelemetry.info("identity.proposals_refreshed", result);
@@ -508,12 +605,52 @@ function scheduleIdentityProposalRefresh(delayMs = 15_000) {
 }
 
 function resolveCanonicalIdentity(mint, token = null) {
-  const stored = store.identityRegistrySnapshot();
-  const resolution = new CanonicalRegistry(stored).resolveMint(mint, { token });
-  const proposals = store.identityProposals({ status: "pending", limit: 500 })
-    .filter((proposal) => proposal.fromMint === mint || proposal.toMint === mint)
+  const reviewedMint = store.hasReviewedIdentityMint(mint);
+  const stored = reviewedMint ? projectVerifiedIdentityRegistry(store.identityRegistrySnapshot({ prioritizeMint: mint })) : {
+    schemaVersion: 1,
+    entities: [],
+    relationships: [],
+    projection: {
+      exactRelationshipEligibleCount: 0,
+      exactRelationshipPublishableEligibleCount: 0,
+      exactRelationshipPublishedCount: 0,
+      exactRelationshipLimitOmittedCount: 0,
+      exactRelationshipProjectionOmittedCount: 0,
+      exactRelationshipIntegrityOmittedCount: 0,
+      exactRelationshipTruncated: false
+    }
+  };
+  const integrityOmission = ["legacy-invalid-variant", "legacy-invalid-primary"].includes(stored.exactOmission?.reason);
+  const resolution = stored.exactOmission ? {
+    schemaVersion: 1,
+    resolvedBy: integrityOmission ? "reviewed-registry-integrity-omitted" : "reviewed-registry-capacity-omitted",
+    mint,
+    entity: {
+      entityId: stored.exactOmission.entityId,
+      displayName: stored.exactOmission.displayName,
+      symbol: stored.exactOmission.symbol,
+      reviewState: "verified"
+    },
+    variant: { ...stored.exactOmission.variant },
+    primary: {
+      mint: stored.exactOmission.isPrimary ? mint : null,
+      selectionReason: stored.exactOmission.isPrimary
+        ? "explicit-reviewed-primary"
+        : stored.exactOmission.hasReviewedPrimary
+          ? "reviewed-primary-outside-bounded-projection"
+          : "withheld-ambiguous",
+      meaning: "identity resolution only; not a safety, quality, or trade recommendation"
+    },
+    relationships: [],
+    limitations: [integrityOmission
+      ? "A reviewed entity exists, but legacy invalid identity data is quarantined rather than relabeled as an unreviewed singleton."
+      : "A reviewed entity exists, but a bounded projection omitted its variant set rather than relabeling the mint as an unreviewed singleton."]
+  } : new CanonicalRegistry(stored).resolveMint(mint, { token });
+  const proposalCandidates = store.identityProposals({ status: "pending", limit: 500 })
+    .filter((proposal) => proposal.fromMint === mint || proposal.toMint === mint);
+  const proposals = proposalCandidates
+    .filter(isPublishableIdentityProposal)
     .map((proposal) => ({
-      proposalKey: proposal.proposalKey,
       fromMint: proposal.fromMint,
       toMint: proposal.toMint,
       kind: proposal.kind,
@@ -522,14 +659,40 @@ function resolveCanonicalIdentity(mint, token = null) {
       methodVersion: proposal.methodVersion,
       observedAt: proposal.updatedAt
     }));
-  return { ...resolution, proposals };
+  const displayName = publicDisplayText(resolution.entity?.displayName);
+  const symbol = publicDisplayText(resolution.entity?.symbol);
+  return {
+    ...resolution,
+    entity: {
+      ...resolution.entity,
+      displayName: displayName || (resolution.resolvedBy !== "singleton-exact-mint" ? "Unnamed reviewed entity" : `Mint ${mint.slice(0, 6)}…${mint.slice(-4)}`),
+      symbol
+    },
+    relationshipCoverage: {
+      eligibleCount: stored.projection?.exactRelationshipEligibleCount ?? 0,
+      publishableEligibleCount: stored.projection?.exactRelationshipPublishableEligibleCount ?? 0,
+      includedCount: stored.projection?.exactRelationshipPublishedCount ?? 0,
+      limitOmittedCount: stored.projection?.exactRelationshipLimitOmittedCount ?? 0,
+      projectionOmittedCount: stored.projection?.exactRelationshipProjectionOmittedCount ?? 0,
+      integrityOmittedCount: stored.projection?.exactRelationshipIntegrityOmittedCount ?? 0,
+      truncated: stored.projection?.exactRelationshipTruncated ?? false,
+      limit: IDENTITY_RESOLVER_RELATIONSHIP_LIMIT
+    },
+    proposalCoverage: {
+      eligibleCount: proposalCandidates.length,
+      includedCount: proposals.length,
+      omittedInvalidCount: proposalCandidates.length - proposals.length
+    },
+    proposals
+  };
 }
 
-function snapshot() {
+function buildSnapshot() {
   const generatedAt = new Date().toISOString();
+  const tokenIntegrity = store.tokenMintIntegrityCoverage();
   const callouts = store.callouts(200);
   const calloutCounts = callouts.reduce((counts, callout) => counts.set(callout.mint, (counts.get(callout.mint) || 0) + 1), new Map());
-  const latestTokens = store.tokens(120)
+  const latestTokens = canonicalStoredTokens(120)
     .filter((token) => mode !== "live" || token.source === "pumpportal")
     .map(normalizeLiveToken)
     .map((token) => ({ ...token, calloutCount: calloutCounts.get(token.mint) || 0 }))
@@ -542,7 +705,7 @@ function snapshot() {
     .map((state) => [state.mint, state]));
   const riskIdentityStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
   const riskCohortTokens = mode === "demo" ? latestTokens : riskIdentityStates
-    .map(({ mint }) => normalizeLiveToken(store.token(mint)))
+    .map(({ mint }) => normalizeLiveToken(canonicalStoredToken(mint)))
     .filter((token) => token?.source === "pumpportal");
   const combinedTokens = new Map(latestTokens.map((token) => [token.mint, token]));
   for (const token of riskCohortTokens) {
@@ -585,7 +748,7 @@ function snapshot() {
       row.momentumEvidenceCount++;
     }
     return acc;
-  }, {})).map((row) => ({
+  }, Object.create(null))).map((row) => ({
     ...row,
     momentum: row.momentumEvidenceCount ? Math.round(row.momentum / row.momentumEvidenceCount) : null
   })).sort((a, b) => b.volumeEvidenceCount - a.volumeEvidenceCount
@@ -596,8 +759,15 @@ function snapshot() {
   }));
   const top100 = createTop100(latestEnrichedTokens, { mode, outcomesByMint })
     .map((entry) => ({ ...entry, token: publicToken(entry.token) }));
+  const identityRegistryProjection = store.identityRegistrySnapshot({ prioritizeMints: tokens.map(({ mint }) => mint) });
+  const entityIntelligence = buildEntityIntelligence({
+    tokens: tokens.map(publicToken),
+    registry: identityRegistryProjection,
+    rankings: top100,
+    generatedAt
+  });
   const cohortEntries = enrichmentStates.flatMap((enrichment) => {
-    const token = normalizeLiveToken(store.token(enrichment.mint));
+    const token = normalizeLiveToken(canonicalStoredToken(enrichment.mint));
     if (!token || token.source !== "pumpportal") return [];
     const launchAt = Number.isFinite(Date.parse(token.createdAt)) ? new Date(Date.parse(token.createdAt)).toISOString() : generatedAt;
     let outcome;
@@ -722,7 +892,7 @@ function snapshot() {
       admittedCount: actorStates.length,
       limit: ACTOR_COHORT_LIMIT,
       observations: actorStates.map((actorState) => {
-        const token = publicToken(store.token(actorState.mint));
+        const token = publicToken(canonicalStoredToken(actorState.mint));
         return {
           mint: actorState.mint,
           name: token?.name || "Unnamed mint",
@@ -753,7 +923,8 @@ function snapshot() {
   };
   return {
     version: appVersion, generatedAt, mode, status: healthStatus(feed), service: runtimeTelemetry.service(), storage,
-    telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery, identityRegistry: identityRegistryHealth(),
+    telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery, apiLimits: apiLimitHealth(),
+    tokenIntegrity, identityRegistry: identityRegistryHealth(identityRegistryProjection.projection), entityIntelligence,
     feedStatus, feedHealth: feed.state, feed, calloutStatus, lastEventAt, lastMintAt,
     liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
     demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
@@ -880,14 +1051,24 @@ function snapshot() {
   };
 }
 
+function snapshot() {
+  const now = Date.now();
+  const dataVersion = store.databaseChangeVersion();
+  if (snapshotCache && snapshotCache.dataVersion === dataVersion
+    && now - snapshotCache.builtAt < SNAPSHOT_CACHE_MAX_AGE_MS) return snapshotCache.value;
+  const value = buildSnapshot();
+  snapshotCache = { builtAt: now, dataVersion, value };
+  return value;
+}
+
 function coinDossier(mint, currentSnapshot) {
-  const storedToken = store.token(mint);
+  const storedToken = canonicalStoredToken(mint);
   if (!storedToken) return null;
   let token = currentSnapshot.tokens.find((candidate) => candidate.mint === mint) || null;
   if (!token) {
     const baseToken = normalizePersistedLiveToken(storedToken, { mode });
     const riskStates = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
-    const riskTokens = riskStates.map(({ mint: riskMint }) => store.token(riskMint))
+    const riskTokens = riskStates.map(({ mint: riskMint }) => canonicalStoredToken(riskMint))
       .filter((candidate) => candidate?.source === "pumpportal")
       .map((candidate) => normalizePersistedLiveToken(candidate, { mode }));
     const outcomeStates = store.enrichmentStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 200 });
@@ -970,13 +1151,13 @@ if (mode === "live" && process.env.OUTCOME_ENRICHMENT !== "false") {
     provider: GECKOTERMINAL_PROVIDER.id,
     now: new Date().toISOString(),
     limit: 120
-  }));
+  }).filter((token) => isCanonicalSolanaAddress(token?.mint)));
   setInterval(() => {
     for (const token of store.dueEnrichmentTokens({
       provider: GECKOTERMINAL_PROVIDER.id,
       now: new Date().toISOString(),
       limit: 120
-    })) outcomeIngestor.enqueue(token);
+    }).filter((candidate) => isCanonicalSolanaAddress(candidate?.mint))) outcomeIngestor.enqueue(token);
   }, 60_000).unref();
 }
 
@@ -997,7 +1178,7 @@ if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
     }
   });
   const cohortTokens = store.riskIdentityStates({ provider: GECKOTERMINAL_PROVIDER.id, limit: 120 })
-    .map(({ mint }) => store.token(mint))
+    .map(({ mint }) => canonicalStoredToken(mint))
     .filter((token) => token?.source === "pumpportal");
   riskIdentityIngestor.start(cohortTokens);
   setInterval(() => {
@@ -1005,7 +1186,7 @@ if (mode === "live" && process.env.RISK_IDENTITY_ENRICHMENT !== "false") {
       provider: GECKOTERMINAL_PROVIDER.id,
       now: new Date().toISOString(),
       limit: 120
-    })) riskIdentityIngestor.enqueue(token);
+    }).filter((candidate) => isCanonicalSolanaAddress(candidate?.mint))) riskIdentityIngestor.enqueue(token);
   }, 60_000).unref();
   setInterval(() => {
     try { evaluateRiskMateriality(); }
@@ -1050,7 +1231,7 @@ if (process.env.BARK_API_KEY) {
 if (mode === "demo") {
   if (store.count() === 0) Array.from({ length: 12 }, (_, i) => upsert(createDemoToken(i, i * 3)));
   setInterval(() => {
-    const tokens = store.tokens(50);
+    const tokens = canonicalStoredTokens(50);
     if (Math.random() > 0.55) upsert(createDemoToken(Math.floor(Math.random() * 12)));
     for (const token of tokens.sort(() => Math.random() - 0.5).slice(0, 4)) upsert(tickDemoToken(token));
   }, 2_500).unref();
@@ -1067,7 +1248,7 @@ if (mode === "demo") {
     onMigration: ({ mint, observedAt, raw }) => {
       feedLastActivityAt = observedAt || new Date().toISOString();
       feedLastMessageAt = feedLastActivityAt;
-      const token = store.token(mint);
+      const token = canonicalStoredToken(mint);
       if (token) upsert({
         ...token,
         status: "migration-observed",
@@ -1114,15 +1295,16 @@ snapshot();
 scheduleIdentityProposalRefresh(0);
 scheduleBriefBoundary();
 
-const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml" };
+const types = { ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".json": "application/json; charset=utf-8", ".svg": "image/svg+xml" };
 const server = http.createServer(async (req, res) => {
   const requestId = randomUUID();
   res.setHeader("x-request-id", requestId);
   res.once("finish", () => runtimeTelemetry.recordResponse(res.statusCode, {
-    readiness: req.url?.split("?")[0] === "/api/health"
+    readiness: req.url?.split("?")[0] === "/api/health",
+    routeClass: responseRouteClass(req.url)
   }));
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/health") {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
       const feed = feedObservation();
@@ -1130,13 +1312,19 @@ const server = http.createServer(async (req, res) => {
       return json(res, status === "healthy" ? 200 : 503, {
       ok: status === "healthy", status, version: appVersion, mode, requestId,
       service: runtimeTelemetry.service(), storage, feed, telemetry: runtimeTelemetry.snapshot(), readinessScope, publicDelivery,
+      apiLimits: apiLimitHealth(),
+      tokenIntegrity: store.tokenMintIntegrityCoverage(),
       feedStatus, feedHealth: feed.state, calloutStatus,
       lastEventAt, lastMintAt,
       indexed: mode === "live" ? store.countBySource("pumpportal").tokens : store.count(),
       liveMintCount: mode === "live" ? store.countBySource("pumpportal").tokens : 0,
       demoPurged: mode === "live", demoPurgedCount: cleanup.tokens,
       reconnects: feed.counters.reconnects, feedMessages: feed.counters.messages, feedParseErrors: feed.counters.malformedMessages,
-      analyst: { status: "ready", engine: "local-grounded-v1" },
+      analyst: {
+        status: "ready",
+        engine: "local-grounded-v1",
+        rateLimit: { scope: "process-global-per-instance", key: "single-shared-bucket", ...checkAgentRate.snapshot() }
+      },
       outcomes: outcomeIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
       outcomeCoverage: store.outcomeCoverage({ provider: GECKOTERMINAL_PROVIDER.id }),
       riskIntelligence: riskIdentityIngestor?.getStatus() || { schemaVersion: 1, source: GECKOTERMINAL_PROVIDER.id, status: mode === "live" ? "disabled" : "simulation-disabled", queueDepth: 0 },
@@ -1154,19 +1342,52 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/snapshot") {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
-      return json(res, 200, snapshot());
+      const rateHeaders = applyRateLimit(req, res, requestId, checkSnapshotRate, {
+        code: "snapshot-rate-limited",
+        message: "Too many snapshot requests"
+      });
+      if (rateHeaders === null) return;
+      return json(res, 200, snapshot(), rateHeaders);
+    }
+    if (url.pathname === "/api/v1/openapi.json") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      const specification = JSON.parse((await readFile(path.join(root, "public", "openapi.json"), "utf8")).replaceAll("__APP_VERSION__", appVersion));
+      return json(res, 200, specification);
+    }
+    if (url.pathname === "/api/v1/entities") {
+      if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      const rateHeaders = identityApiRate(req, res, requestId, "list");
+      if (rateHeaders === null) return;
+      if ([...url.searchParams.keys()].some((key) => !["limit", "cursor"].includes(key))
+        || url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("cursor").length > 1) {
+        throw new HttpError(400, "Entity list supports only one limit and one cursor");
+      }
+      const limitText = url.searchParams.get("limit");
+      const limit = limitText === null ? 20 : Number(limitText);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || (limitText !== null && String(limit) !== limitText)) {
+        throw new HttpError(400, "Entity page limit must be an integer between 1 and 100");
+      }
+      const cursor = url.searchParams.get("cursor");
+      let page;
+      try { page = paginateEntityIntelligence(snapshot().entityIntelligence, { limit, cursor }); }
+      catch (error) {
+        if (error instanceof TypeError || error instanceof RangeError) throw new HttpError(400, error.message);
+        throw error;
+      }
+      return json(res, 200, page, rateHeaders);
     }
     if (url.pathname === "/api/v1/entities/resolve") {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      const rateHeaders = identityApiRate(req, res, requestId, "resolver");
+      if (rateHeaders === null) return;
       if ([...url.searchParams.keys()].some((key) => key !== "mint") || url.searchParams.getAll("mint").length !== 1) {
         throw new HttpError(400, "Entity resolution requires one mint query parameter");
       }
       const mint = String(url.searchParams.get("mint") || "").trim();
-      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
-      const storedToken = store.token(mint);
-      const currentToken = snapshot().tokens.find((candidate) => candidate.mint === mint) || null;
-      const token = currentToken || (storedToken ? publicToken(normalizePersistedLiveToken(storedToken, { mode })) : null);
-      return json(res, 200, resolveCanonicalIdentity(mint, token));
+      if (!isCanonicalSolanaAddress(mint)) throw new HttpError(400, "Mint must be a canonical 32-byte Solana base58 address");
+      const storedToken = canonicalStoredToken(mint);
+      const token = storedToken ? publicToken(normalizePersistedLiveToken(storedToken, { mode })) : null;
+      return json(res, 200, resolveCanonicalIdentity(mint, token), rateHeaders);
     }
     if (url.pathname.startsWith("/api/coins/") && url.pathname.endsWith("/timeline")) {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
@@ -1180,11 +1401,12 @@ const server = http.createServer(async (req, res) => {
         throw new HttpError(400, "Timeline limit must be an integer between 1 and 200");
       }
       const before = url.searchParams.get("before");
-      const encodedMint = url.pathname.slice("/api/coins/".length, -"/timeline".length).replace(/\/$/, "");
+      const encodedMint = url.pathname.slice("/api/coins/".length, -"/timeline".length);
+      if (!encodedMint || encodedMint.includes("/")) throw new HttpError(404, "Timeline endpoint not found");
       let mint;
       try { mint = decodeURIComponent(encodedMint); } catch { throw new HttpError(400, "Mint path is invalid"); }
-      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
-      const storedToken = store.token(mint);
+      if (!isCanonicalSolanaAddress(mint)) throw new HttpError(400, "Mint must be a canonical 32-byte Solana base58 address");
+      const storedToken = canonicalStoredToken(mint);
       if (!storedToken) return json(res, 404, { ok: false, error: "Coin was not observed by this deployment", requestId });
       const currentSnapshot = snapshot();
       const token = currentSnapshot.tokens.find((candidate) => candidate.mint === mint) || publicToken(normalizePersistedLiveToken(storedToken, { mode }));
@@ -1218,7 +1440,7 @@ const server = http.createServer(async (req, res) => {
       if (!encodedMint || encodedMint.includes("/")) throw new HttpError(404, "Coin endpoint not found");
       let mint;
       try { mint = decodeURIComponent(encodedMint); } catch { throw new HttpError(400, "Mint path is invalid"); }
-      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
+      if (!isCanonicalSolanaAddress(mint)) throw new HttpError(400, "Mint must be a canonical 32-byte Solana base58 address");
       const currentSnapshot = snapshot();
       const dossier = coinDossier(mint, currentSnapshot);
       if (!dossier) return json(res, 404, { ok: false, error: "Coin was not observed inside the public live-evidence contract", requestId });
@@ -1230,19 +1452,24 @@ const server = http.createServer(async (req, res) => {
         throw new HttpError(400, "Compare requires one mints query parameter");
       }
       const mints = String(url.searchParams.get("mints") || "").split(",").map((value) => value.trim()).filter(Boolean);
-      if (mints.length < 2 || mints.length > 4 || mints.some((mint) => !publicMintPattern.test(mint)) || new Set(mints).size !== mints.length) {
+      if (mints.length < 2 || mints.length > 4 || mints.some((mint) => !isCanonicalSolanaAddress(mint)) || new Set(mints).size !== mints.length) {
         throw new HttpError(400, "Compare requires 2 to 4 unique Solana base58 mints");
       }
       const currentSnapshot = snapshot();
-      const knownTokens = new Set(currentSnapshot.tokens.map((token) => token.mint));
-      const knownEntries = new Set(currentSnapshot.leaderboard.top100.map((entry) => entry.token?.mint));
+      const comparisonSnapshot = {
+        ...currentSnapshot,
+        tokens: [...currentSnapshot.tokens],
+        leaderboard: { ...currentSnapshot.leaderboard, top100: [...currentSnapshot.leaderboard.top100] }
+      };
+      const knownTokens = new Set(comparisonSnapshot.tokens.map((token) => token.mint));
+      const knownEntries = new Set(comparisonSnapshot.leaderboard.top100.map((entry) => entry.token?.mint));
       for (const mint of mints) {
         const dossier = coinDossier(mint, currentSnapshot);
         if (!dossier) continue;
-        if (!knownTokens.has(mint)) currentSnapshot.tokens.push(dossier.token);
-        if (!knownEntries.has(mint)) currentSnapshot.leaderboard.top100.push(comparisonEntry(dossier));
+        if (!knownTokens.has(mint)) comparisonSnapshot.tokens.push(dossier.token);
+        if (!knownEntries.has(mint)) comparisonSnapshot.leaderboard.top100.push(comparisonEntry(dossier));
       }
-      return json(res, 200, buildCoinComparison({ mints, snapshot: currentSnapshot }));
+      return json(res, 200, buildCoinComparison({ mints, snapshot: comparisonSnapshot }));
     }
     if (url.pathname === "/api/briefs/daily" || url.pathname === "/api/briefs/weekly") {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
@@ -1251,8 +1478,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/agent/chat") {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
-      const rate = checkAgentRate(req.socket.remoteAddress || "unknown");
-      if (!rate.allowed) return json(res, 429, { ok: false, error: "Too many analyst requests", requestId }, { "retry-after": String(rate.retryAfter) });
+      if (analystApiRate(req, res, requestId) === null) return;
       const body = await readJsonBody(req, { maxBytes: 2_048 });
       if (Object.keys(body).length !== 1 || !("question" in body)) throw new HttpError(400, "Request must contain only question");
       let analysis;
@@ -1274,34 +1500,45 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === "/api/stream") {
       if (req.method !== "GET") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "GET" });
+      const releaseStreamConnection = acquireStreamConnection();
+      if (releaseStreamConnection === null) {
+        return json(res, 503, {
+          ok: false,
+          code: "stream-capacity-reached",
+          error: "The process-local stream connection cap is full",
+          requestId
+        }, { "retry-after": "5" });
+      }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-content-type-options": "nosniff", connection: "keep-alive" });
-      res.write(`event: ready\ndata: ${JSON.stringify({ mode, feedStatus })}\n\n`); clients.add(res);
-      req.on("close", () => clients.delete(res)); return;
+      if (!res.write(`event: ready\ndata: ${JSON.stringify({ mode, feedStatus })}\n\n`)) {
+        sseSlowClientDrops++;
+        releaseStreamConnection();
+        res.destroy();
+        return;
+      }
+      clients.set(res, releaseStreamConnection);
+      req.on("close", () => {
+        const release = clients.get(res);
+        clients.delete(res);
+        release?.();
+      }); return;
     }
     if (url.pathname === "/api/export/daily" || url.pathname === "/api/export/weekly") {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
-      if (mode === "live") return liveVaultExportDisabled(res, requestId);
-      const period = url.pathname.endsWith("weekly") ? "weekly" : "daily";
-      await exportMeasuredBrief(vaultPath, snapshot().actionIntelligence.briefs[period]);
-      return json(res, 200, { ok: true, period, mode, scope: "local-demo-operator-vault", requestId });
+      return httpVaultExportDisabled(res, requestId);
     }
     if (url.pathname.startsWith("/api/export/coin/")) {
       if (req.method !== "POST") return json(res, 405, { ok: false, error: "Method not allowed", requestId }, { allow: "POST" });
-      if (mode === "live") return liveVaultExportDisabled(res, requestId);
-      let mint;
-      try { mint = decodeURIComponent(url.pathname.split("/").pop()); } catch { throw new HttpError(400, "Mint path is invalid"); }
-      if (!publicMintPattern.test(mint)) throw new HttpError(400, "Mint must be a Solana base58 address");
-      const token = snapshot().tokens.find((candidate) => candidate.mint === mint);
-      if (!token) return json(res, 404, { error: "Token not found" });
-      await exportCoin(vaultPath, token);
-      return json(res, 200, { ok: true, resource: "coin", mode, scope: "local-demo-operator-vault", requestId });
+      return httpVaultExportDisabled(res, requestId);
     }
     let target = url.pathname === "/" ? "/index.html" : url.pathname;
     target = path.normalize(target).replace(/^(\.\.(\/|\\|$))+/, "");
     const file = path.join(root, "public", target);
     if (!file.startsWith(path.join(root, "public"))) return json(res, 403, { error: "Forbidden" });
     let body = await readFile(file);
-    if (target === "/index.html") body = Buffer.from(body.toString("utf8").replaceAll("__APP_VERSION__", appVersion));
+    if (["/index.html", "/help.html", "/api.html", "/openapi.json"].includes(target)) {
+      body = Buffer.from(body.toString("utf8").replaceAll("__APP_VERSION__", appVersion));
+    }
     res.writeHead(200, {
       "content-type": types[path.extname(file)] || "application/octet-stream",
       "x-content-type-options": "nosniff",
@@ -1319,12 +1556,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function liveVaultExportDisabled(res, requestId) {
+function httpVaultExportDisabled(res, requestId) {
   return json(res, 403, {
     ok: false,
     code: "vault-export-disabled",
-    error: "Vault export is disabled in live mode",
-    mode: "live",
+    error: "Filesystem-writing HTTP vault export is disabled",
+    mode,
     requestId
   });
 }

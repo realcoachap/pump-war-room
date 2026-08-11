@@ -1,4 +1,4 @@
-const SOLANA_MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+import { isCanonicalSolanaAddress } from "./early-actors.js";
 
 export const CANONICAL_VARIANT_KINDS = Object.freeze(["official", "migration", "relaunch"]);
 export const CANONICAL_RELATIONSHIP_KINDS = Object.freeze([
@@ -34,7 +34,7 @@ function boundedText(value, label, { maximum = 160, code = false, optional = fal
 
 function mint(value, label = "mint") {
   const normalized = boundedText(value, label, { maximum: 44 });
-  if (!SOLANA_MINT_PATTERN.test(normalized)) throw new TypeError(`${label} must be a Solana base58 address`);
+  if (!isCanonicalSolanaAddress(normalized)) throw new TypeError(`${label} must be a canonical 32-byte Solana base58 address`);
   return normalized;
 }
 
@@ -107,6 +107,11 @@ function normalizeRelationship(value, registeredMints) {
   });
 }
 
+function relationshipSemanticKey({ fromMint, toMint, kind }) {
+  const [first, second] = fromMint < toMint ? [fromMint, toMint] : [toMint, fromMint];
+  return `${kind}\u0000${first}\u0000${second}`;
+}
+
 export function validateCanonicalEntity(value) {
   return normalizeEntity(value);
 }
@@ -133,15 +138,15 @@ function singletonResolution(exactMint, token) {
     resolvedBy: "singleton-exact-mint",
     mint: exactMint,
     entity: {
-      entityId: `mint:${exactMint}`,
+      entityId: `~mint:${exactMint}`,
       displayName,
       symbol,
-      reviewState: "proposed"
+      reviewState: "singleton-unreviewed"
     },
     variant: {
       mint: exactMint,
       kind: "unresolved",
-      reviewState: "proposed",
+      reviewState: "unreviewed",
       evidenceClass: "unavailable"
     },
     primary: {
@@ -171,6 +176,10 @@ export class CanonicalRegistry {
     this.relationships = Object.freeze(relationships.map((relationship) => normalizeRelationship(relationship, this.entityByMint)));
     const relationshipIds = new Set(this.relationships.map(({ relationshipId }) => relationshipId));
     if (relationshipIds.size !== this.relationships.length) throw new TypeError("canonical relationship IDs must be unique");
+    const semanticRelationships = new Set(this.relationships.map(relationshipSemanticKey));
+    if (semanticRelationships.size !== this.relationships.length) {
+      throw new TypeError("canonical relationship endpoint and kind facts must be unique regardless of direction");
+    }
   }
 
   resolveMint(value, { token = null } = {}) {

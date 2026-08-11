@@ -91,6 +91,77 @@ test("narrative counts are derived only from eligible supplied tokens", () => {
   assert.ok(result.evidence.every((item) => item.citation === "snapshot.tokens.narrative"));
 });
 
+test("narrative and lifecycle answers prefer entity envelopes with exact-mint denominators", () => {
+  const entityIntelligence = {
+    methodVersion: "reviewed-entity-intelligence-v1",
+    entities: [{
+      entityId: "agent-entity", displayName: "Agent Entity",
+      variants: {
+        registeredMintCount: 2, observedMintCount: 2,
+        included: [
+          { mint: "AiOne11111111111111111111111111111111pump", narrative: "AI agents", lifecycle: "bonding" },
+          { mint: "AiTwo11111111111111111111111111111111pump", narrative: "AI agents", lifecycle: "migration-observed" }
+        ]
+      },
+      narratives: { values: [{ name: "AI agents", mintCount: 2 }] },
+      trend: { contributingMint: "AiOne11111111111111111111111111111111pump" }
+    }]
+  };
+  const narratives = analyzeSnapshot("What narratives are active?", { mode: "live", tokens: [], entityIntelligence }, { now: NOW });
+  assert.match(narratives.answer, /AI agents \(2 labeled mints across 1 entity; 2\/2 entity-envelope mints observed\)/);
+  assert.match(narratives.answer, /unreviewed proposals have no impact/);
+  assert.equal(narratives.evidence[0].citation, "snapshot.entityIntelligence.narratives");
+  assert.equal(narratives.evidence[0].mint, "AiOne11111111111111111111111111111111pump");
+
+  const lifecycle = analyzeSnapshot("Any graduations?", { mode: "live", tokens: [], entityIntelligence }, { now: NOW });
+  assert.match(lifecycle.answer, /1 entity envelope includes 1 exact mint/);
+  assert.match(lifecycle.answer, /not independently finalized proof/);
+  assert.equal(lifecycle.evidence[0].citation, "snapshot.entityIntelligence.lifecycle");
+  assert.equal(lifecycle.evidence[0].mint, "AiTwo11111111111111111111111111111111pump");
+});
+
+test("entity narrative grouping preserves distinct labels beyond 64 characters", () => {
+  const prefix = "n".repeat(64);
+  const first = `${prefix}A`;
+  const second = `${prefix}B`;
+  const entities = [
+    { name: first, mint: "AiOne11111111111111111111111111111111pump" },
+    { name: second, mint: "AiTwo11111111111111111111111111111111pump" }
+  ].map(({ name, mint }, index) => ({
+    entityId: `long-narrative-${index}`,
+    variants: { registeredMintCount: 1, observedMintCount: 1, included: [{ mint, narrative: name }] },
+    narratives: { values: [{ name, mintCount: 1 }] },
+    trend: { contributingMint: mint }
+  }));
+  const result = analyzeSnapshot("What narratives are active?", {
+    mode: "live",
+    tokens: [],
+    entityIntelligence: { methodVersion: "reviewed-entity-intelligence-v1", entities }
+  }, { now: NOW });
+  assert.ok(result.answer.includes(first));
+  assert.ok(result.answer.includes(second));
+  assert.equal(result.evidence.length, 2);
+});
+
+test("entity narrative grouping preserves canonically similar reviewed labels", () => {
+  const entities = [
+    { name: "AI", mint: "AiOne11111111111111111111111111111111pump" },
+    { name: "ＡＩ", mint: "AiTwo11111111111111111111111111111111pump" }
+  ].map(({ name, mint }, index) => ({
+    entityId: `unicode-narrative-${index}`,
+    variants: { registeredMintCount: 1, observedMintCount: 1, included: [{ mint, narrative: name }] },
+    narratives: { values: [{ name, mintCount: 1 }] },
+    trend: { contributingMint: mint }
+  }));
+  const result = analyzeSnapshot("What narratives are active?", {
+    mode: "live", tokens: [],
+    entityIntelligence: { methodVersion: "reviewed-entity-intelligence-v1", entities }
+  }, { now: NOW });
+  assert.match(result.answer, /AI \(1 labeled mint across 1 entity/);
+  assert.match(result.answer, /ＡＩ \(1 labeled mint across 1 entity/);
+  assert.equal(result.evidence.length, 2);
+});
+
 test("risk analysis reports evidence classes while withholding uncalibrated composites", () => {
   const result = analyzeSnapshot("Explain risk confidence", {
     mode: "live",

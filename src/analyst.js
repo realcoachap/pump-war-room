@@ -17,6 +17,16 @@ const cleanText = (value, maxLength = 96) => {
     .slice(0, maxLength);
 };
 
+const exactEnvelopeText = (value, maxLength = 120) => typeof value === "string"
+  && value.length <= maxLength && value.trim() === value && !CONTROL_CHARACTERS.test(value) ? value : "";
+
+const cleanAnswerText = (value, maxLength = 1_600) => String(value ?? "")
+  .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+  .replace(/[<>]/g, "")
+  .replace(/\s+/g, " ")
+  .trim()
+  .slice(0, maxLength);
+
 const safeMint = (value) => cleanText(value, 96).replace(/[^A-Za-z0-9._:-]/g, "_");
 
 const numberLabel = (value) => Number.isInteger(value)
@@ -178,6 +188,41 @@ function newestAnswer(snapshot, tokens, limit = 3) {
 }
 
 function narrativeAnswer(snapshot, tokens) {
+  const entityEnvelope = isRecord(snapshot.entityIntelligence) ? snapshot.entityIntelligence : null;
+  const entities = entityEnvelope?.methodVersion === "reviewed-entity-intelligence-v1"
+    && Array.isArray(entityEnvelope.entities) ? entityEnvelope.entities.filter(isRecord) : [];
+  if (entities.length) {
+    const rows = new Map();
+    for (const entity of entities) {
+      const included = Array.isArray(entity.variants?.included) ? entity.variants.included.filter(isRecord) : [];
+      if (!included.length) continue;
+      const values = Array.isArray(entity.narratives?.values) ? entity.narratives.values.filter(isRecord) : [];
+      for (const value of values) {
+        const name = exactEnvelopeText(value.name, 120);
+        const mintCount = Number.isSafeInteger(value.mintCount) && value.mintCount > 0 ? value.mintCount : 0;
+        if (!name || !mintCount) continue;
+        const row = rows.get(name) || { name, entities: 0, narrativeMints: 0, observedMints: 0, registeredMints: 0, citationMint: null };
+        row.entities++;
+        row.narrativeMints += mintCount;
+        row.observedMints += Number.isSafeInteger(entity.variants?.observedMintCount) ? entity.variants.observedMintCount : included.length;
+        row.registeredMints += Number.isSafeInteger(entity.variants?.registeredMintCount) ? entity.variants.registeredMintCount : included.length;
+        row.citationMint ||= safeMint(included.find((variant) => exactEnvelopeText(variant.narrative, 120) === name)?.mint) || null;
+        rows.set(name, row);
+      }
+    }
+    const narratives = [...rows.values()].sort((a, b) => b.narrativeMints - a.narrativeMints
+      || b.entities - a.entities || b.observedMints - a.observedMints || a.name.localeCompare(b.name)).slice(0, 5);
+    if (narratives.length) {
+      return {
+        answer: `Most represented entity-level narrative observations: ${narratives.map((row) => `${row.name} (${row.narrativeMints} labeled ${row.narrativeMints === 1 ? "mint" : "mints"} across ${row.entities} ${row.entities === 1 ? "entity" : "entities"}; ${row.observedMints}/${row.registeredMints} entity-envelope mints observed)`).join(", ")}. Exact-mint denominators are retained, each entity trend has at most one exact-mint contributor, grouped entities require a reviewed primary or sole reviewed variant, unreviewed singletons remain separate, and unreviewed proposals have no impact.`,
+        evidence: narratives.map((row) => citation(
+          "snapshot.entityIntelligence.narratives",
+          `${row.name}: ${row.narrativeMints} labeled ${row.narrativeMints === 1 ? "mint" : "mints"} across ${row.entities} ${row.entities === 1 ? "entity" : "entities"}; ${row.observedMints}/${row.registeredMints} entity-envelope mints observed`,
+          row.citationMint
+        ))
+      };
+    }
+  }
   const rows = new Map();
   for (const token of tokens) {
     const name = cleanText(token.narrative, 64);
@@ -249,6 +294,27 @@ function riskAnswer(tokens) {
 }
 
 function graduationAnswer(snapshot, tokens) {
+  const entityEnvelope = isRecord(snapshot.entityIntelligence) ? snapshot.entityIntelligence : null;
+  const entities = entityEnvelope?.methodVersion === "reviewed-entity-intelligence-v1"
+    && Array.isArray(entityEnvelope.entities) ? entityEnvelope.entities.filter(isRecord) : [];
+  if (entities.length) {
+    const matching = entities.flatMap((entity) => {
+      const included = Array.isArray(entity.variants?.included) ? entity.variants.included.filter(isRecord) : [];
+      const lifecycleMints = included.filter((variant) => ["migration-observed", "graduated", "migrated"].includes(cleanText(variant.lifecycle, 32).toLowerCase()));
+      return lifecycleMints.length ? [{ entity, lifecycleMints }] : [];
+    });
+    if (matching.length) {
+      const mintCount = matching.reduce((count, { lifecycleMints }) => count + lifecycleMints.length, 0);
+      return {
+        answer: `${matching.length} ${matching.length === 1 ? "entity envelope includes" : "entity envelopes include"} ${mintCount} exact mint${mintCount === 1 ? "" : "s"} with supplied migration/graduation status. Exact-mint lifecycle denominators remain reproducible; a processed-feed migration observation is not independently finalized proof.`,
+        evidence: matching.slice(0, 5).map(({ entity, lifecycleMints }) => citation(
+          "snapshot.entityIntelligence.lifecycle",
+          `${cleanText(entity.displayName, 120) || cleanText(entity.entityId, 128) || "Entity"}: ${lifecycleMints.length}/${Number.isSafeInteger(entity.variants?.registeredMintCount) ? entity.variants.registeredMintCount : lifecycleMints.length} registered mints have a supplied migration/graduation status`,
+          safeMint(lifecycleMints[0]?.mint)
+        ))
+      };
+    }
+  }
   const lifecycle = tokens.filter((token) => ["migration-observed", "graduated", "migrated"].includes(cleanText(token.status, 32).toLowerCase()));
   const stats = isRecord(snapshot.stats) ? snapshot.stats : {};
   const migrationReported = finiteNumber(stats.migrationsObserved);
@@ -412,7 +478,7 @@ export function analyzeSnapshot(question, snapshot, options = {}) {
   }
 
   return {
-    answer: cleanText(result.answer, 1_600),
+    answer: cleanAnswerText(result.answer),
     evidence: dedupeEvidence(result.evidence),
     generatedAt: now.toISOString(),
     mode: "local"

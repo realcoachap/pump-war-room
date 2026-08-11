@@ -2,13 +2,48 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { scoreReasons } from "./signals.js";
 
-const safeName = (value) => value.replace(/[\\/:*?"<>|]/g, "-").slice(0, 80);
+const MARKDOWN_PUNCTUATION = new Set([
+  "\\", "`", "*", "_", "[", "]", "{", "}", "(", ")", "#", "+", "-", ".", "!", "|", "^", "$", "~",
+  "?", "@", ":", "/", "=", "\"", "'", "%", ","
+]);
+
+function displayText(value, { fallback = "unknown", maximum = 2_048 } = {}) {
+  const source = typeof value === "string" || typeof value === "number" ? String(value) : fallback;
+  const normalized = source.normalize("NFKC")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, maximum);
+  return normalized || fallback;
+}
+
+function markdownText(value, options) {
+  const escapedHtml = displayText(value, options).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  return [...escapedHtml].map((character) => MARKDOWN_PUNCTUATION.has(character) ? `\\${character}` : character).join("");
+}
+
+function inlineCode(value, options) {
+  return `\`${displayText(value, options).replaceAll("`", "ˋ")}\``;
+}
+
+function safeName(value, fallback = "Untitled") {
+  const normalized = displayText(value, { fallback, maximum: 160 })
+    .replace(/[^\p{L}\p{N} ._-]/gu, "-")
+    .replace(/^\.+/, "")
+    .replace(/[. ]+$/, "")
+    .slice(0, 80);
+  return normalized || fallback;
+}
+
 const yaml = (value) => JSON.stringify(value ?? "");
 const finite = (value) => typeof value === "number" && Number.isFinite(value);
 const integerOrUnknown = (value, suffix = "") => finite(value) ? `${Math.round(value).toLocaleString("en-US")}${suffix}` : "unknown";
 
 export function coinMarkdown(token, now = new Date()) {
   const reasons = scoreReasons(token);
+  const mint = displayText(token.mint, { fallback: "unknown mint", maximum: 96 });
+  const encodedMint = encodeURIComponent(mint);
+  const narrative = markdownText(token.narrative, { fallback: "Other", maximum: 120 });
   return `---
 type: pump-coin
 mint: ${yaml(token.mint)}
@@ -16,7 +51,7 @@ symbol: ${yaml(token.symbol)}
 created: ${yaml(token.createdAt)}
 updated: ${yaml(now.toISOString())}
 status: ${yaml(token.status)}
-narrative: ${yaml(token.narrative)}
+narrative: ${yaml(narrative)}
 momentum_score: ${finite(token.momentum) ? Math.round(token.momentum) : "null"}
 risk_score: null
 risk_evidence: ${yaml(token.riskIdentity?.overallEvidence || token.riskConfidence || (token.source === "demo" ? "synthetic" : "unavailable"))}
@@ -25,28 +60,28 @@ bonding_progress: ${finite(token.bondingProgress) ? Math.round(token.bondingProg
 virtual_sol_reserve: ${finite(token.curveSol) ? token.curveSol : "null"}
 ---
 
-# ${token.name} (${token.symbol})
+# ${markdownText(token.name, { fallback: "Unnamed coin", maximum: 120 })} (${markdownText(token.symbol, { fallback: "???", maximum: 24 })})
 
 > Read-only observational research, not investment advice or a safety claim.
 
 ## Snapshot
 
-- **Contract:** \`${token.mint}\`
-- **Creator actor:** ${token.creatorActor || "unavailable"}
-- **Deployer/user actor:** ${token.deployerActor || "unavailable"}
-- **Status:** ${token.status}
-- **Narrative:** [[${token.narrative}]]
+- **Contract:** ${inlineCode(mint, { maximum: 96 })}
+- **Creator actor:** ${markdownText(token.creatorActor, { fallback: "unavailable", maximum: 96 })}
+- **Deployer/user actor:** ${markdownText(token.deployerActor, { fallback: "unavailable", maximum: 96 })}
+- **Status:** ${markdownText(token.status, { fallback: "unavailable", maximum: 64 })}
+- **Narrative:** ${narrative}
 - **Market cap:** ${finite(token.marketCap) ? `$${integerOrUnknown(token.marketCap)}` : "unknown"}
 - **5m volume:** ${finite(token.volume5m) ? `$${integerOrUnknown(token.volume5m)}` : "unknown"}
 - **Virtual SOL reserve:** ${finite(token.curveSol) ? `${token.curveSol.toLocaleString("en-US")} SOL` : "unknown"} (processed-feed observation; not curve progress or migration proof)
-- **Pump.fun:** https://pump.fun/coin/${token.mint}
-- **DEX Screener:** https://dexscreener.com/solana/${token.mint}
+- **Pump.fun:** https://pump.fun/coin/${encodedMint}
+- **DEX Screener:** https://dexscreener.com/solana/${encodedMint}
 
 ## Signal explanation
 
-**Momentum ${finite(token.momentum) ? `${Math.round(token.momentum)}/100` : "unavailable"}:** ${reasons.momentum.join(", ")}.
+**Momentum ${finite(token.momentum) ? `${Math.round(token.momentum)}/100` : "unavailable"}:** ${markdownText(reasons.momentum.join(", "), { maximum: 500 })}.
 
-**Risk probability withheld (${reasons.riskConfidence}):** ${reasons.risk.join(", ")}.
+**Risk probability withheld (${markdownText(reasons.riskConfidence, { fallback: "unavailable", maximum: 64 })}):** ${markdownText(reasons.risk.join(", "), { maximum: 500 })}.
 
 ## Research timeline
 
@@ -63,12 +98,13 @@ export async function exportCoin(vaultPath, token) {
   const narrativeDir = path.join(vaultPath, "Narratives");
   await mkdir(coinDir, { recursive: true });
   await mkdir(narrativeDir, { recursive: true });
-  const fileName = `${safeName(token.symbol)} - ${token.mint.slice(0, 8)}.md`;
+  const fileName = `${safeName(token.symbol, "UNKNOWN")} - ${safeName(token.mint, "unknown-mint").slice(0, 8)}.md`;
   const coinPath = path.join(coinDir, fileName);
   await writeFile(coinPath, coinMarkdown(token), "utf8");
-  const narrativePath = path.join(narrativeDir, `${safeName(token.narrative)}.md`);
-  const narrative = `---\ntype: pump-narrative\nnarrative: ${yaml(token.narrative)}\n---\n\n# ${token.narrative}\n\n## Coins\n\n\`\`\`dataview\nTABLE symbol, momentum_score, risk_score, market_cap_usd\nFROM \"Coins\"\nWHERE narrative = ${yaml(token.narrative)}\nSORT momentum_score DESC\n\`\`\`\n`;
-  await writeFile(narrativePath, narrative, "utf8");
+  const narrativePath = path.join(narrativeDir, `${safeName(token.narrative, "Other")}.md`);
+  const narrativeValue = markdownText(token.narrative, { fallback: "Other", maximum: 120 });
+  const narrativeNote = `---\ntype: pump-narrative\nnarrative: ${yaml(narrativeValue)}\n---\n\n# ${narrativeValue}\n\n## Coins\n\n\`\`\`dataview\nTABLE symbol, momentum_score, risk_score, market_cap_usd\nFROM \"Coins\"\nWHERE narrative = ${yaml(narrativeValue)}\nSORT momentum_score DESC\n\`\`\`\n`;
+  await writeFile(narrativePath, narrativeNote, "utf8");
   return coinPath;
 }
 
@@ -77,7 +113,10 @@ export async function exportDaily(vaultPath, snapshot, now = new Date()) {
   await mkdir(dir, { recursive: true });
   const date = now.toISOString().slice(0, 10);
   const pathName = path.join(dir, `${date} Pump Brief.md`);
-  const movers = snapshot.tokens.slice(0, 7).map((t, i) => `${i + 1}. [[${t.symbol} - ${t.mint.slice(0, 8)}]] — momentum ${finite(t.momentum) ? t.momentum : "unknown"}, risk probability withheld`).join("\n");
+  const movers = snapshot.tokens.slice(0, 7).map((t, i) => {
+    const target = `${safeName(t.symbol, "UNKNOWN")} - ${safeName(t.mint, "unknown-mint").slice(0, 8)}`;
+    return `${i + 1}. [[${target}]] — momentum ${finite(t.momentum) ? t.momentum : "unknown"}, risk probability withheld`;
+  }).join("\n");
   const indexed = Number(snapshot.stats?.indexed || 0);
   const mintedToday = Number(snapshot.stats?.mintedToday || 0);
   const migrationsObserved = Number(snapshot.stats?.migrationsObserved || 0);
@@ -103,6 +142,8 @@ export function measuredBriefMarkdown(brief) {
   const priorOneHour = brief.priorPeriod?.outcomes?.windows?.["1h"] || {};
   const title = brief.period === "weekly" ? "Weekly" : "Daily";
   const delivery = brief.activity?.telegramDelivery || {};
+  const windowStart = displayText(brief.windowStart, { fallback: "unavailable", maximum: 64 });
+  const windowEnd = displayText(brief.windowEnd, { fallback: "unavailable", maximum: 64 });
   const body = `---
 type: pump-measured-${brief.period}-brief
 method_version: ${yaml(brief.methodVersion)}
@@ -113,9 +154,9 @@ data_cutoff: ${yaml(brief.generatedAt)}
 feed_coverage: unmeasured
 ---
 
-# Pump War Room ${title} Brief — ${brief.windowStart.slice(0, 10)}
+# Pump War Room ${title} Brief — ${markdownText(windowStart.slice(0, 10), { fallback: "unavailable", maximum: 10 })}
 
-> Frozen closed-period observational measurement for \`[${brief.windowStart}, ${brief.windowEnd})\`. Not financial advice, a market-wide survey, or a completeness claim.
+> Frozen closed-period observational measurement for ${inlineCode(`[${windowStart}, ${windowEnd})`, { maximum: 160 })}. Not financial advice, a market-wide survey, or a completeness claim.
 
 ## Activity observed by this deployment
 
@@ -136,7 +177,7 @@ feed_coverage: unmeasured
 
 ## Evidence contract
 
-- Source: ${brief.source}
+- Source: ${markdownText(brief.source, { fallback: "unavailable", maximum: 240 })}
 - GeckoTerminal / CoinGecko completed-candle evidence is public-beta and attributed; raw provider payloads and prices are not retained.
 - Browser watchlists do not control operator Telegram delivery.
 - Missing evidence remains unavailable and is never interpreted as performance.
@@ -147,7 +188,8 @@ feed_coverage: unmeasured
 export async function exportMeasuredBrief(vaultPath, brief) {
   const directory = path.join(vaultPath, brief.period === "weekly" ? "Weekly Briefs" : "Daily Briefs");
   await mkdir(directory, { recursive: true });
-  const pathName = path.join(directory, `${brief.windowStart.slice(0, 10)} Pump ${brief.period === "weekly" ? "Weekly" : "Daily"} Brief.md`);
+  const date = safeName(displayText(brief.windowStart, { fallback: "unknown-date", maximum: 64 }).slice(0, 10), "unknown-date");
+  const pathName = path.join(directory, `${date} Pump ${brief.period === "weekly" ? "Weekly" : "Daily"} Brief.md`);
   await writeFile(pathName, measuredBriefMarkdown(brief), "utf8");
   return pathName;
 }

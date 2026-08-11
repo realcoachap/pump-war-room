@@ -866,6 +866,31 @@ test("requires actor retention schema and rejects persisted raw actor identities
   assert.deepEqual(readdirSync(scratchDirectory), []);
 });
 
+test("rejects a schema-902 artifact with malformed required identity evidence", (t) => {
+  const directory = temporaryWorkspace(t);
+  const scratchDirectory = path.join(directory, "scratch");
+  const { store, databasePath } = seededStore(directory);
+  store.db.prepare(`INSERT INTO identity_decisions
+    (decision_id,subject_type,subject_id,decision,reason_code,evidence,decided_at,supersedes_decision_id)
+    VALUES (?,?,?,?,?,?,?,NULL)`).run(
+    "corrupt-identity-decision", "proposal", "missing-proposal", "reject", "corruption-probe", "{}", createdAt
+  );
+  store.db.exec("PRAGMA ignore_check_constraints=ON");
+  store.db.prepare("UPDATE identity_decisions SET evidence=? WHERE decision_id=?")
+    .run("{not-json", "corrupt-identity-decision");
+  store.db.exec("PRAGMA ignore_check_constraints=OFF");
+  assert.throws(() => store.identityDecisions(), /JSON/);
+  store.db.exec("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE");
+  store.db.close();
+
+  assert.throws(
+    () => verifyRestorableBackup(databasePath, { scratchRoot: scratchDirectory }),
+    (error) => error instanceof DatabaseVerificationError
+      && /identity_decisions\.evidence contains invalid JSON/.test(error.message)
+  );
+  assert.deepEqual(readdirSync(scratchDirectory), []);
+});
+
 test("rejects corrupt, truncated, and wrong-schema artifacts and cleans scratch space", (t) => {
   const directory = temporaryWorkspace(t);
   const scratchDirectory = path.join(directory, "scratch");

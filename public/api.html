@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#090b10">
+  <meta name="application-version" content="__APP_VERSION__">
+  <title>API Contract — Pump War Room</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-app-version="__APP_VERSION__">
+  <div class="noise"></div>
+  <header class="topbar help-topbar">
+    <a class="brand brand-link" href="/">
+      <span class="sigil">C</span>
+      <span><strong>PUMP WAR ROOM</strong><small>PUBLIC LIVE READ-ONLY API</small></span>
+    </a>
+    <a class="quiet-button help-link" href="/">BACK TO RADAR</a>
+  </header>
+
+  <main class="help-page api-page" data-release-marker="entity-api-hardening-v1">
+    <header class="help-hero">
+      <span class="eyebrow">OPENAPI 3.1 // v__APP_VERSION__ // PUBLIC READ-ONLY CONTRACT</span>
+      <h1>Exact mints in.<br><em>Bounded evidence out.</em></h1>
+      <p>The public live contract exposes read-only health, snapshot, identity, dossier, timeline, comparison, brief, analyst, and stream surfaces. The identity API is unauthenticated, rate-limited, and does not offer external API keys.</p>
+      <div class="api-actions"><a class="quiet-button" href="/api/v1/openapi.json">DOWNLOAD OPENAPI JSON</a><a class="quiet-button" href="/help.html#identity-guide">IDENTITY GUIDE</a></div>
+    </header>
+
+    <section class="help-section">
+      <span class="kicker">GET /api/v1/entities/resolve</span>
+      <h2>Resolve one exact mint</h2>
+      <p>Every valid mint returns a typed envelope. Unreviewed mints stay singletons; pending proposals remain separate from reviewed relationships. Resolver envelopes cap reviewed incident edges at 100 and disclose eligible/included counts plus truncation. A reviewed mint omitted by a legacy capacity overflow returns a typed reviewed-capacity-omitted state; one quarantined by legacy invalid registry data returns reviewed-registry-integrity-omitted. Neither is mislabeled as a singleton.</p>
+      <pre><code>BASE_URL="${BASE_URL:-http://127.0.0.1:4173}"
+curl "$BASE_URL/api/v1/entities/resolve?mint=SOLANA_MINT"</code></pre>
+    </section>
+
+    <section class="help-section">
+      <span class="kicker">GET /api/v1/entities</span>
+      <h2>Page entity intelligence</h2>
+      <p>Pages are ordered by stable code-unit entity ID. Supply the returned opaque <code>nextCursor</code> to continue. The durable reviewed projection is capped at 500 whole entities, 2,000 variants, and 5,000 relationships; eligible/published/omitted counts and truncation stay explicit. Pages reflect the live tape and may shift if observations change between requests.</p>
+      <pre><code>BASE_URL="${BASE_URL:-http://127.0.0.1:4173}"
+curl "$BASE_URL/api/v1/entities?limit=20"
+curl "$BASE_URL/api/v1/entities?limit=20&amp;cursor=OPAQUE_CURSOR"</code></pre>
+    </section>
+
+    <section class="help-section feature-guide">
+      <span class="kicker">ENTITY AGGREGATION CONTRACT</span>
+      <h2>Denominators stay visible.</h2>
+      <div class="identity-guide-grid">
+        <article><b>One contribution</b><p>Each entity trend has at most one exact-mint contributor. Grouped entities require a reviewed primary or sole reviewed variant; unreviewed singletons remain separate and contribute only their own mint. Variant volume is never summed into a louder entity. Every row labels whether it uses a radar evidence score, five-minute volume, momentum, or launch-observation recency fallback.</p></article>
+        <article><b>Missing stays missing</b><p>Included and excluded variants plus narrative, lifecycle, and volume coverage retain explicit mint counts and separate registry/token timestamps.</p></article>
+        <article><b>Proposals stay out</b><p>Unreviewed identity proposals cannot group mints, change the mint leaderboard, or affect entity trend selection.</p></article>
+        <article><b>Live weak consistency</b><p>Cursor order is stable by entity ID, but a changing live tape can add or remove singleton rows between page requests.</p></article>
+      </div>
+    </section>
+
+    <section class="help-section">
+      <span class="kicker">PUBLIC GET + STREAM SURFACE</span>
+      <h2>One contract, bounded roles.</h2>
+      <p><code>GET /api/health</code>, <code>/api/snapshot</code>, exact-mint dossiers and timelines, comparisons, frozen briefs, identity endpoints, and the OpenAPI document return sanitized read-only evidence. Snapshot-dependent reads share one immutable computed result for at most five seconds; <code>generatedAt</code> identifies that evidence time, and cross-process database commits invalidate the cache immediately. <code>GET /api/stream</code> is a non-replayable sanitized SSE surface with a process-local cap of 64 concurrent connections. <code>POST /api/agent/chat</code> runs only the local deterministic analyst over the supplied snapshot; it has no external model, wallet, or execution capability.</p>
+    </section>
+
+    <section class="help-section">
+      <span class="kicker">FILESYSTEM BOUNDARY</span>
+      <h2>HTTP writes nothing.</h2>
+      <p>Filesystem-writing vault exports are outside this public contract. Legacy daily, weekly, and coin-export HTTP routes fail closed with typed HTTP 403 in every mode before snapshot or vault access. A trusted operator can instead run <code>npm run vault:export</code> from a local shell.</p>
+    </section>
+
+    <section class="help-section">
+      <span class="kicker">RATE + ERROR CONTRACT</span>
+      <h2>Bounded public use</h2>
+      <p>Snapshot, entity-list, and resolver attempts each share separate process-global 120/minute buckets per instance; local analyst attempts share 60/minute. Successful responses include <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and <code>X-RateLimit-Reset</code>. HTTP 429 adds <code>Retry-After</code>. Readiness is not rate-limited. Buckets and aggregate-only counters reset with the process and do not coordinate across replicas.</p>
+      <div class="help-callout warning"><b>No identity or market guarantee.</b> Entity and primary labels describe reviewed identity resolution only—not authenticity, safety, common control, quality, performance, or a trade recommendation.</div>
+    </section>
+
+    <footer><span>API VERSION __APP_VERSION__</span><span><a href="/api/v1/openapi.json">OpenAPI</a> · <a href="/">Radar</a> · <a href="/terms.html">Terms</a> · <a href="/privacy.html">Privacy</a></span></footer>
+  </main>
+</body>
+</html>

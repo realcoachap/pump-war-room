@@ -7,10 +7,8 @@ const SCALAR = Symbol("public scalar");
 const SCALAR_ARRAY = Symbol("public scalar array");
 const IDENTIFIER = Symbol("public identifier");
 const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const SOLANA_SIGNATURE = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
-const RAW_SOCIAL_PROFILE = /(?:^|[\s(])(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)]+)/i;
-const SOLANA_ADDRESS_FRAGMENT = /(?:^|[^1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?=$|[^1-9A-HJ-NP-Za-km-z])/;
-const SOLANA_SIGNATURE_FRAGMENT = /(?:^|[^1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{64,88}(?=$|[^1-9A-HJ-NP-Za-km-z])/;
+const RAW_SOCIAL_PROFILE = /(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)\]}>"']+)/i;
+const SOLANA_IDENTITY_FRAGMENT = /[1-9A-HJ-NP-Za-km-z]{32,}/;
 
 const PUBLIC_RISK_FACTOR_SCHEMAS = Object.freeze({
   concentration: Object.freeze({
@@ -129,9 +127,9 @@ function plainObject(value) {
 function publicScalar(value, { identifier = false } = {}) {
   if (value === null || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) return true;
   if (typeof value !== "string" || !value || value.length > 2_048 || CONTROL.test(value)
-    || RAW_SOCIAL_PROFILE.test(value) || SOLANA_SIGNATURE.test(value) || SOLANA_SIGNATURE_FRAGMENT.test(value)) return false;
-  if (identifier) return !SOLANA_ADDRESS_FRAGMENT.test(value) || SOLANA_ADDRESS.test(value);
-  return !SOLANA_ADDRESS.test(value) && !SOLANA_ADDRESS_FRAGMENT.test(value);
+    || RAW_SOCIAL_PROFILE.test(value)) return false;
+  if (identifier) return !SOLANA_IDENTITY_FRAGMENT.test(value) || SOLANA_ADDRESS.test(value);
+  return !SOLANA_IDENTITY_FRAGMENT.test(value);
 }
 
 function projectAllowlisted(value, schema) {

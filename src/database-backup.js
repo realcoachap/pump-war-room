@@ -613,8 +613,8 @@ function normalizeSchemaSql(value) {
 }
 
 const FORBIDDEN_ACTOR_IDENTITY_KEY = /^(?:actorAddress|traderPublicKey|wallet|walletAddress|owner|signer|user|participant|address|account|accountKey|accountAddress|publicKey|creator|deployer|caller|username|handle|profile|profileId|profileUrl|signature|transactionId|txid|rawAddress|identity|identityLookup|lookupMapping|mapping|dedupeKey|integrityKey|secret|digest)$/i;
-const RAW_ACTOR_SOCIAL_VALUE = /(?:^|[\s(])(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)]+)/i;
-const RAW_ACTOR_SOLANA_VALUE = /(?:^|[^1-9A-HJ-NP-Za-km-z])(?:[1-9A-HJ-NP-Za-km-z]{64,88}|[1-9A-HJ-NP-Za-km-z]{32,44})(?=$|[^1-9A-HJ-NP-Za-km-z])/;
+const RAW_ACTOR_SOCIAL_VALUE = /(?:@[A-Za-z0-9_]{1,32}\b|(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|t\.me|telegram\.me)\/[^\s)\]}>"']+)/i;
+const RAW_ACTOR_SOLANA_VALUE = /[1-9A-HJ-NP-Za-km-z]{32,}/;
 
 function actorIdentityViolation(value, expectedMint, pathParts = [], depth = 0) {
   if (depth > 32) return `${pathParts.join(".") || "root"} exceeds the supported nesting depth`;
@@ -675,7 +675,8 @@ function verifyIdentityPrivacyRows(database) {
   for (const [table, column] of [["identity_proposals", "evidence"], ["identity_decisions", "evidence"]]) {
     for (const { payload } of database.prepare(`SELECT ${column} AS payload FROM ${table}`).all()) {
       let value;
-      try { value = JSON.parse(payload); } catch { continue; }
+      try { value = JSON.parse(payload); }
+      catch { fail(`Database ${table}.${column} contains invalid JSON`); }
       if (!value || typeof value !== "object" || Array.isArray(value)) fail(`Database ${table}.${column} is not a bounded object`);
       for (const [key, entry] of Object.entries(value)) {
         if (!allowed.has(key)) fail(`Database ${table}.${column} contains unsupported key ${key}`);

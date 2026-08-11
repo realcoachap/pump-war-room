@@ -7,7 +7,7 @@ import {
 } from "../src/canonical-registry.js";
 
 const mintA = "11111111111111111111111111111111";
-const mintB = "22222222222222222222222222222222";
+const mintB = "So11111111111111111111111111111111111111112";
 const observedAt = "2026-08-10T11:00:00.000Z";
 
 function variant(mint, kind = "official") {
@@ -25,9 +25,11 @@ test("resolves every valid unknown mint as an exact singleton without merging na
   const second = registry.resolveMint(mintB, { token: { name: "Same Name", symbol: "SAME" } });
 
   assert.equal(first.resolvedBy, "singleton-exact-mint");
-  assert.equal(first.entity.entityId, `mint:${mintA}`);
+  assert.equal(first.entity.entityId, `~mint:${mintA}`);
+  assert.equal(first.entity.reviewState, "singleton-unreviewed");
+  assert.equal(first.variant.reviewState, "unreviewed");
   assert.equal(first.primary.mint, mintA);
-  assert.equal(second.entity.entityId, `mint:${mintB}`);
+  assert.equal(second.entity.entityId, `~mint:${mintB}`);
   assert.notEqual(first.entity.entityId, second.entity.entityId);
   assert.match(first.limitations.join(" "), /never merge mints automatically/);
 });
@@ -79,6 +81,9 @@ test("withholds a primary when a multi-variant entity has no reviewed choice", (
 
 test("rejects invalid, duplicated, and cross-entity mint claims", () => {
   assert.throws(() => new CanonicalRegistry().resolveMint("not-a-mint"), /Solana base58/);
+  for (const invalidMint of ["z".repeat(44), "1".repeat(44), "2".repeat(32)]) {
+    assert.throws(() => new CanonicalRegistry().resolveMint(invalidMint), /canonical 32-byte Solana base58/);
+  }
   assert.throws(() => new CanonicalRegistry({ entities: [{
     entityId: "duplicates",
     displayName: "Duplicates",
@@ -90,4 +95,3 @@ test("rejects invalid, duplicated, and cross-entity mint claims", () => {
     { entityId: "second", displayName: "Second", reviewState: "verified", variants: [variant(mintA)] }
   ] }), /more than one entity/);
 });
-

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { projectPublicToken } from "./privacy.js";
 
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -282,17 +283,25 @@ function riskEvents(token, expectedMint) {
   return rows;
 }
 
+function timelineRowDigest(row) {
+  return createHash("sha256").update(JSON.stringify([row.at, row.kind, row.title, row.detail]), "utf8").digest("hex");
+}
+
 function encodeTimelineCursor(row) {
-  return Buffer.from(JSON.stringify([row.at, row.kind, row.title, row.detail]), "utf8").toString("base64url");
+  return Buffer.from(JSON.stringify({ v: 1, at: row.at, digest: timelineRowDigest(row) }), "utf8").toString("base64url");
 }
 
 function decodeTimelineCursor(value) {
-  if (typeof value !== "string" || value.length < 4 || value.length > 1_024 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+  if (typeof value !== "string" || value.length < 4 || value.length > 192 || !/^[A-Za-z0-9_-]+$/.test(value)) {
     throw new TypeError("before must be a valid timeline cursor");
   }
   try {
     const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
-    if (!Array.isArray(decoded) || decoded.length !== 4 || decoded.some((item) => typeof item !== "string")) throw new Error("invalid cursor");
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)
+      || Object.keys(decoded).sort().join(",") !== "at,digest,v" || decoded.v !== 1
+      || timestamp(decoded.at, "cursor at") !== decoded.at || !/^[a-f0-9]{64}$/.test(decoded.digest)) {
+      throw new Error("invalid cursor");
+    }
     return decoded;
   } catch {
     throw new TypeError("before must be a valid timeline cursor");
@@ -319,7 +328,7 @@ export function buildCoinTimeline({
   let offset = 0;
   if (before !== null) {
     const cursor = decodeTimelineCursor(before);
-    const cursorIndex = allRows.findIndex((row) => [row.at, row.kind, row.title, row.detail].every((value, index) => value === cursor[index]));
+    const cursorIndex = allRows.findIndex((row) => row.at === cursor.at && timelineRowDigest(row) === cursor.digest);
     if (cursorIndex < 0) throw new TypeError("before timeline cursor is invalid or no longer retained");
     offset = cursorIndex + 1;
   }

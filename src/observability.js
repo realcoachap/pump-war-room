@@ -3,6 +3,10 @@ import path from "node:path";
 const DEFAULT_STALE_AFTER_MS = 90_000;
 const MAX_LOG_STRING = 512;
 const SENSITIVE_FIELD_NAME = /(?:api.?key|access.?token|refresh.?token|client.?secret|private.?key|authorization|password|secret|token|credential|cookie|session.?id)/i;
+const RESPONSE_ROUTE_CLASSES = new Set([
+  "health", "snapshot", "identity-list", "identity-resolver", "openapi", "coin-timeline",
+  "coin-dossier", "compare", "briefs", "analyst", "stream", "export", "static", "api-other", "other"
+]);
 
 function timestamp(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -247,6 +251,7 @@ export function createRuntimeTelemetry({ version, mode, startedAt = Date.now(), 
   let last5xxAt = null;
   let readinessFailures = 0;
   let lastReadinessFailureAt = null;
+  const responsesByRouteClass = new Map();
 
   const currentIso = () => {
     const value = now();
@@ -281,9 +286,17 @@ export function createRuntimeTelemetry({ version, mode, startedAt = Date.now(), 
       errorsByEvent.set(eventName, (errorsByEvent.get(eventName) || 0) + 1);
       return emit("error", eventName, { ...fields, error: safeError(error) });
     },
-    recordResponse(status, { readiness = false } = {}) {
+    recordResponse(status, { readiness = false, routeClass = "other" } = {}) {
       const value = Number(status);
+      const boundedRouteClass = RESPONSE_ROUTE_CLASSES.has(routeClass) ? routeClass : "other";
+      const routeCounters = responsesByRouteClass.get(boundedRouteClass)
+        || { responses: 0, responses4xx: 0, responses429: 0, responses5xx: 0 };
       responsesTotal++;
+      routeCounters.responses++;
+      if (Number.isFinite(value) && value >= 400 && value < 500) routeCounters.responses4xx++;
+      if (value === 429) routeCounters.responses429++;
+      if (Number.isFinite(value) && value >= 500) routeCounters.responses5xx++;
+      responsesByRouteClass.set(boundedRouteClass, routeCounters);
       if (Number.isFinite(value) && value >= 500) {
         if (readiness) {
           readinessFailures++;
@@ -305,7 +318,9 @@ export function createRuntimeTelemetry({ version, mode, startedAt = Date.now(), 
         responses5xx,
         last5xxAt,
         readinessFailures,
-        lastReadinessFailureAt
+        lastReadinessFailureAt,
+        responseCounterScope: "process-local-fixed-route-classes",
+        responsesByRouteClass: Object.fromEntries([...responsesByRouteClass].sort(([left], [right]) => left.localeCompare(right)))
       };
     },
     service() {

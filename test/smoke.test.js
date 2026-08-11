@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { readFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.10.2";
+const version = "0.10.3";
+const checkedInOpenApiBody = readFileSync(new URL("../public/openapi.json", import.meta.url), "utf8")
+  .replaceAll("__APP_VERSION__", version);
 
 const outcomeWindows = () => Object.fromEntries(["5m", "15m", "1h", "6h", "24h"].map((window) => [window, {
   status: "insufficient-evidence", minimumEvidence: 3, evidenceCount: 0, missingCount: 0,
@@ -55,12 +58,66 @@ function actionHealth() {
   };
 }
 
-function identityHealth() {
+function limiter(limit, allowed) {
   return {
-    schemaVersion: 1, entityCount: 0, variantCount: 0, relationshipCount: 0, decisionCount: 0,
+    schemaVersion: 1, policy: "process-local-fixed-window-v1", limit, windowSeconds: 60, maxKeys: 1,
+    activeKeys: allowed > 0 ? 1 : 0, requests: allowed, allowed, rejected: 0, evictedKeys: 0
+  };
+}
+
+function registryProjection(prioritizedMintCount = 0) {
+  return {
+    schemaVersion: 1,
+    policy: "bounded-whole-reviewed-entities-v1",
+    capacity: { entities: 500, variants: 2_000, relationships: 5_000 },
+    eligibleCounts: { entities: 0, variants: 0, relationships: 0 },
+    publishedCounts: { entities: 0, variants: 0, relationships: 0 },
+    omittedCounts: { entities: 0, variants: 0, relationships: 0 },
+    integrityOmittedCounts: { entities: 0, variants: 0, relationships: 0 },
+    integrityOmissionReasons: { duplicateRelationships: 0 },
+    projectedEndpointRelationshipCount: 0,
+    truncated: false,
+    prioritizedMintCount,
+    reviewedMintOmissionCount: 0
+  };
+}
+
+function tokenIntegrity() {
+  return {
+    schemaVersion: 1, policy: "quarantine-invalid-retained-token-identities-v1",
+    calculatedAt: new Date().toISOString(), maxStalenessSeconds: 5,
+    basis: "cached-full-retained-token-sql-aggregate",
+    retainedCount: 120, checkedCount: 120, validCount: 120,
+    quarantinedCount: 0, unscannedCount: 0, complete: true
+  };
+}
+
+function apiLimits() {
+  return {
+    schemaVersion: 1, scope: "process-global-per-instance", key: "single-shared-bucket",
+    snapshot: limiter(120, 1)
+  };
+}
+
+function identityHealth({ prioritizedMintCount = 0 } = {}) {
+  return {
+    schemaVersion: 1, entityCount: 0, variantCount: 0, relationshipCount: 0,
+    verifiedEntityCount: 0, verifiedVariantCount: 0, verifiedRelationshipCount: 0, decisionCount: 0,
     proposalStatusCounts: {}, proposalMethod: "metadata-collision-proposals-v1", pendingProposalLimit: 500, proposalLastRunAt: null,
     automatedVerification: false, publicWrites: false,
-    primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation"
+    primaryMeaning: "identity resolution only; not a safety, quality, or trade recommendation",
+    api: {
+      schemaVersion: 1, version: "v1", list: "/api/v1/entities", resolver: "/api/v1/entities/resolve?mint={mint}",
+      specification: "/api/v1/openapi.json", documentation: "/api.html", pagination: "opaque-cursor-entity-id-order",
+      authentication: "none-read-only", externalApiKeys: "not-offered", quotaScope: "process-global-per-instance",
+      limiter: {
+        schemaVersion: 1, scope: "process-global-per-instance", key: "one-shared-bucket-per-endpoint",
+        list: limiter(120, 2), resolver: limiter(120, 1)
+      },
+      stream: { schemaVersion: 1, policy: "process-local-concurrent-connection-cap-v1", limit: 64,
+        activeConnections: 0, acceptedConnections: 0, rejectedConnections: 0, slowClientDrops: 0 }
+    },
+    projection: registryProjection(prioritizedMintCount)
   };
 }
 
@@ -75,6 +132,98 @@ function cohortMint(index) {
   }
   return `${"1".repeat(32 - suffix.length)}${suffix}`;
 }
+
+function entityAggregate(index) {
+  const mint = cohortMint(index);
+  const included = {
+    mint, kind: "unresolved", reviewState: "unreviewed", evidenceClass: "unavailable",
+    registryObservedAt: null, tokenObservedAt: "2026-08-08T11:45:00.000Z",
+    name: `Token ${index + 1}`, symbol: `T${index + 1}`, narrative: "Unclassified", lifecycle: "bonding",
+    metrics: { radarRank: null, radarScore: null, volume5m: null, momentum: null }
+  };
+  return {
+    schemaVersion: 1, entityId: `~mint:${mint}`, displayName: `Token ${index + 1}`, symbol: `T${index + 1}`,
+    reviewState: "singleton-unreviewed",
+    primary: { mint, meaning: "identity resolution only; not a safety, quality, or trade recommendation" },
+    variants: { registeredMintCount: 1, observedMintCount: 1, missingMintCount: 0, included: [included], excluded: [], reviewExcluded: [] },
+    narratives: { observedMintCount: 1, missingMintCount: 0, values: [{ name: "Unclassified", mintCount: 1 }], basis: "per-mint observations" },
+    lifecycle: { observedMintCount: 1, missingMintCount: 0, statusCounts: { bonding: 1 }, basis: "per-mint discrete lifecycle observations" },
+    volume: { availableMintCount: 0, missingMintCount: 1, contributingMintCount: 0, basis: "per-mint five-minute volume observations; entity trend uses at most one exact-mint contributor" },
+    trend: {
+      policy: "one-reviewed-primary-or-sole-mint-per-entity-v1", contributingMint: mint,
+      selectionReason: "exact-mint-singleton", orderingBasis: "token-observation-recency-fallback",
+      radarRank: null, radarScore: null, volume5m: null, momentum: null,
+      excludedObservedMintCount: 0, summedAcrossVariants: false
+    }
+  };
+}
+
+function entityIntelligence() {
+  const entities = Array.from({ length: 120 }, (_, index) => entityAggregate(index))
+    .sort((left, right) => left.entityId < right.entityId ? -1 : left.entityId > right.entityId ? 1 : 0);
+  return {
+    schemaVersion: 1, methodVersion: "reviewed-entity-intelligence-v1", generatedAt: "2026-08-08T12:00:00.000Z",
+    universe: "current public snapshot plus reviewed registry variants",
+    registryProjection: registryProjection(120),
+    denominators: {
+      observedMintCount: 120, reviewedEntityCount: 0, reviewedVariantCount: 0,
+      groupedObservedMintCount: 0, singletonObservedMintCount: 120, projectionOmittedReviewedMintCount: 0,
+      entityCount: 120, trendingEntityCount: 20
+    },
+    rankingBoundary: {
+      leaderboardChanged: false, unreviewedProposalsUsed: false, entityTrendAffectsMintRank: false,
+      unreviewedProposalImpact: "none", rankingImpact: "none", policy: "one-reviewed-primary-or-sole-mint-per-entity-v1"
+    },
+    api: {
+      list: "/api/v1/entities", resolver: "/api/v1/entities/resolve?mint={mint}",
+      specification: "/api/v1/openapi.json", documentation: "/api.html", externalApiKeys: "not-offered"
+    },
+    entities,
+    trending: entities.slice(0, 20).map((entity, index) => ({ ...entity, trendRank: index + 1 })),
+    projectionOmittedReviewed: [],
+    limitations: ["Entity aggregation preserves exact-mint denominators and uses at most one observed mint as a trend contribution."]
+  };
+}
+
+function entityCursor(entityId) {
+  return Buffer.from(JSON.stringify({ v: 1, after: entityId })).toString("base64url");
+}
+
+function entityPage(offset = 0) {
+  const intelligence = entityIntelligence();
+  const { trending, entities, ...envelope } = intelligence;
+  void trending;
+  const pageEntities = entities.slice(offset, offset + 100);
+  const nextCursor = offset + pageEntities.length < entities.length
+    ? entityCursor(pageEntities.at(-1).entityId) : null;
+  return {
+    ...envelope,
+    page: { order: "entity-id-ascending", limit: 100, count: pageEntities.length, nextCursor },
+    entities: pageEntities
+  };
+}
+
+const firstEntityPagePath = "/api/v1/entities?limit=100";
+const secondEntityPagePath = () => `${firstEntityPagePath}&cursor=${encodeURIComponent(entityPage(0).page.nextCursor)}`;
+
+function timelinePage(offset = 0) {
+  const entries = Array.from({ length: 201 }, (_, index) => ({
+    kind: "token-update",
+    at: new Date(Date.parse("2026-08-08T12:00:00.000Z") - index * 1_000).toISOString(),
+    evidenceClass: "feed-observed-processed",
+    title: `Observation ${index + 1}`,
+    detail: `Bounded exact-mint observation ${index + 1}`
+  }));
+  const pageEntries = entries.slice(offset, offset + 200);
+  return {
+    schemaVersion: 1, mint: cohortMint(0), generatedAt: "2026-08-08T12:00:00.000Z", limit: 200,
+    entries: pageEntries, nextBefore: offset + pageEntries.length < entries.length ? "timeline-cursor-200" : null,
+    historyAvailableSince: entries.at(-1).at, scope: "bounded", rawProviderPayloadsIncluded: false
+  };
+}
+
+const firstTimelinePath = () => `/api/coins/${cohortMint(0)}/timeline?limit=200`;
+const secondTimelinePath = () => `${firstTimelinePath()}&before=timeline-cursor-200`;
 
 function unavailableRiskIdentity() {
   const unavailable = () => ({ evidenceClass: "unavailable", limitation: "Evidence is unavailable." });
@@ -367,6 +516,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
       telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
+      apiLimits: apiLimits(),
+      tokenIntegrity: tokenIntegrity(),
       actionIntelligence: actionHealth(),
       identityRegistry: identityHealth(),
       outcomes: {
@@ -429,6 +580,9 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       service: { uptimeSeconds: 30 },
       storage: { mountPointVerified: true },
       feed: { state: "live", isStale: false, freshnessBasis: "verified-feed-activity" },
+      apiLimits: apiLimits(),
+      tokenIntegrity: tokenIntegrity(),
+      tokens: riskObservations(),
       leaderboard: {
         schemaVersion: 2,
         ranking: { metric: "evidence_score_or_recency_v2", scorePolicy: "withheld-without-substantive-input" },
@@ -465,7 +619,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         compare: { endpoint: "/api/compare?mints={mint},{mint}", minimumMints: 2, maximumMints: 4 },
         briefs: { daily: measuredBrief("daily"), weekly: measuredBrief("weekly") }
       },
-      identityRegistry: identityHealth(),
+      identityRegistry: identityHealth({ prioritizedMintCount: 120 }),
+      entityIntelligence: entityIntelligence(),
       riskIntelligence: {
         schemaVersion: 1,
         engine: { schemaVersion: 1, source: "geckoterminal", status: "available", queueDepth: 0 },
@@ -493,8 +648,8 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
       outcome: { windows: {} }, earlyActor: actorSummary(),
       identity: {
         schemaVersion: 1, resolvedBy: "singleton-exact-mint", mint: cohortMint(0),
-        entity: { entityId: `mint:${cohortMint(0)}`, displayName: "Token 1", symbol: "T1", reviewState: "proposed" },
-        variant: { mint: cohortMint(0), kind: "unresolved", reviewState: "proposed", evidenceClass: "unavailable" },
+        entity: { entityId: `~mint:${cohortMint(0)}`, displayName: "Token 1", symbol: "T1", reviewState: "singleton-unreviewed" },
+        variant: { mint: cohortMint(0), kind: "unresolved", reviewState: "unreviewed", evidenceClass: "unavailable" },
         primary: { mint: cohortMint(0), selectionReason: "only-exact-mint", meaning: "identity resolution only; not a safety, quality, or trade recommendation" },
         relationships: [], proposals: [], limitations: ["No reviewed cross-mint relationship is registered."]
       },
@@ -502,17 +657,23 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     }),
     [`/api/v1/entities/resolve?mint=${cohortMint(0)}`]: JSON.stringify({
       schemaVersion: 1, resolvedBy: "singleton-exact-mint", mint: cohortMint(0),
-      entity: { entityId: `mint:${cohortMint(0)}`, displayName: "Token 1", symbol: "T1", reviewState: "proposed" },
-      variant: { mint: cohortMint(0), kind: "unresolved", reviewState: "proposed", evidenceClass: "unavailable" },
+      entity: { entityId: `~mint:${cohortMint(0)}`, displayName: "Token 1", symbol: "T1", reviewState: "singleton-unreviewed" },
+      variant: { mint: cohortMint(0), kind: "unresolved", reviewState: "unreviewed", evidenceClass: "unavailable" },
       primary: { mint: cohortMint(0), selectionReason: "only-exact-mint", meaning: "identity resolution only; not a safety, quality, or trade recommendation" },
-      relationships: [], proposals: [], limitations: ["No reviewed cross-mint relationship is registered."]
+      relationships: [],
+      relationshipCoverage: {
+        eligibleCount: 0, publishableEligibleCount: 0, includedCount: 0, limitOmittedCount: 0,
+        projectionOmittedCount: 0, integrityOmittedCount: 0, truncated: false, limit: 100
+      },
+      proposalCoverage: { eligibleCount: 0, includedCount: 0, omittedInvalidCount: 0 },
+      proposals: [], limitations: ["No reviewed cross-mint relationship is registered."]
     }),
+    [firstEntityPagePath]: JSON.stringify(entityPage(0)),
+    [secondEntityPagePath()]: JSON.stringify(entityPage(100)),
+    "/api/v1/openapi.json": checkedInOpenApiBody,
     [`POST /api/v1/entities/resolve?mint=${cohortMint(0)}`]: JSON.stringify({ ok: false, error: "Method not allowed" }),
-    [`/api/coins/${cohortMint(0)}/timeline?limit=2`]: JSON.stringify({
-      schemaVersion: 1, mint: cohortMint(0), generatedAt: "2026-08-08T12:00:00.000Z", limit: 2,
-      entries: [], nextBefore: null, historyAvailableSince: "2026-08-08T11:45:00.000Z",
-      scope: "bounded", rawProviderPayloadsIncluded: false
-    }),
+    [firstTimelinePath()]: JSON.stringify(timelinePage(0)),
+    [secondTimelinePath()]: JSON.stringify(timelinePage(200)),
     [`/api/compare?mints=${encodeURIComponent(`${cohortMint(0)},${cohortMint(1)}`)}`]: JSON.stringify({
       schemaVersion: 1, generatedAt: "2026-08-08T12:00:00.000Z", requestedMints: [cohortMint(0), cohortMint(1)],
       missingMints: [], coins: [
@@ -526,16 +687,17 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
     "POST /api/export/coin/not-a-solana-mint": JSON.stringify({
       ok: false,
       code: "vault-export-disabled",
-      error: "Vault export is disabled in live mode",
+      error: "Filesystem-writing HTTP vault export is disabled",
       mode: "live",
       requestId: "00000000-0000-4000-8000-000000000001"
     }),
-    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button><nav class="section-nav"><a href="/help.html">HELP</a></nav>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section><section data-release-marker="canonical-identity-v1">NO PUBLIC WRITES · NO AUTOMATED CANONIZATION · Primary mint means identity resolution only</section></body>`,
-    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} function renderIdentityRegistry() {} function identityDetail() {} function createSnapshotRefreshScheduler() {} function vaultExportsEnabled() {} fetch('/api/compare?mints='); fetch(`/api/coins/${encodeURIComponent(mint)}`); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal; PROPOSED · NOT A FACT",
+    "/": `<meta name="application-version" content="${version}"><body data-release-marker="public-delivery-hardening-v1"><button id="export-daily" class="quiet-button" hidden>EXPORT BRIEF</button><nav class="section-nav"><a href="/help.html">HELP</a></nav>NO WALLET · NO EXECUTION <section data-release-marker="provider-observed-outcome-engine">On-chain data provided by GeckoTerminal · Powered by CoinGecko</section><section data-release-marker="risk-identity-evidence-v1">NO COMPOSITE SCORE</section><section data-release-marker="actionable-intelligence-v1">BROWSER-LOCAL WORKBENCH · MATERIALITY POLICY v1</section><section data-release-marker="anonymous-early-actor-v1">Per-installation keyed Actor numbers · CORRELATIONS WITHHELD</section><section data-release-marker="canonical-identity-v1">NO PUBLIC WRITES · NO AUTOMATED CANONIZATION · Primary mint means identity resolution only <div id="entity-trends"></div><a href="/api.html">API DOCS</a></section></body>`,
+    "/app.js": "const PREFERENCE_KEY='x'; localStorage.getItem(PREFERENCE_KEY); const entityIntelligence={}; function renderFeedObservability() {} function renderOutcomes() {} function renderRiskIntelligence() {} function renderActionIntelligence() {} function renderCoinTimeline() {} function renderEarlyActors() {} function earlyActorDetail() {} function renderIdentityRegistry() {} function identityDetail() {} function createSnapshotRefreshScheduler() {} function vaultExportsEnabled() {} fetch('/api/compare?mints='); fetch(`/api/coins/${encodeURIComponent(mint)}`); // raw candle retention off; identifier reuse only—not duplicate content; SYNTHETIC DEMO; installation-scoped, non-reversible labels; not a trade signal; PROPOSED · NOT A FACT; ENTITY TREND // ONE MINT CONTRIBUTION MAX; Each trend has at most one exact-mint contributor; variants are never summed",
     "/snapshot-refresh.js": "export const SNAPSHOT_REFRESH_COOLDOWN_MS = 15_000; export const SNAPSHOT_REFRESH_TIMEOUT_MS = 10_000; export function createSnapshotLiveUpdates() {}",
     "/preferences.js": "export const WATCHLIST_LIMIT = 50; export const PRESET_LIMIT = 12; export function normalizePreferences() {}",
-    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}.identity-registry{}.identity-detail{}.identity-edge.proposed{}@media(max-width:650px){}/* v0.10.2 compact navigation and help center */.section-nav{}.method-disclosure{}",
-    "/help.html": "<h1>The 3-minute workflow</h1><h2>Canonical identity graph</h2><p>The pending proposal backlog is hard-capped at 500.</p><h2>Common questions</h2>",
+    "/styles.css": "/* v0.9 anonymous early-actor intelligence */.outcome-source,footer{font-size:10px}.risk-intelligence-source{}.action-intelligence{}.comparison-table{}.timeline-entry{}.early-actors{}.early-actor-detail{}.identity-registry{}.identity-detail{}.identity-edge.proposed{}@media(max-width:650px){}/* v0.10.2 compact navigation and help center */.section-nav{}.method-disclosure{}/* v0.10.3 entity intelligence and API hardening */.entity-trends{}.entity-trend-row{}.api-page{}",
+    "/help.html": "<h1>The 3-minute workflow</h1><h2>Canonical identity graph</h2><p>The pending proposal backlog is hard-capped at 500.</p><h2>Common questions</h2><a href=\"/api.html\">Read-only API</a>",
+    "/api.html": `<meta name="application-version" content="${version}"><main data-release-marker="entity-api-hardening-v1"><p>Resolver envelopes cap reviewed incident edges at 100. Pages are ordered by stable code-unit entity ID and capped at 500 whole entities, 2,000 variants, and 5,000 relationships. Each entity trend has at most one exact-mint contributor. The API does not offer external API keys. Snapshot, entity-list, and resolver attempts each share separate process-global 120/minute buckets. Readiness is not rate-limited. Legacy exports fail closed with typed HTTP 403 in every mode.</p><b>Live weak consistency</b></main>`,
     "/terms.html": "<h1>Terms</h1><p>CoinGecko API Terms</p><p>provider observations, not verified prices; exact reuse does not prove duplicate content or common control; materiality policy is not calibrated risk; migration observation is not finalization</p><p>Early-actor evidence has partial and unmeasured coverage and does not establish identity or coordination and is not a trade signal.</p><p>Automated metadata collisions remain proposals. Public registry endpoints are read-only.</p>",
     "/privacy.html": "<h1>Minimal data by design</h1><p>does not persist or expose bulk GeckoTerminal responses; domain-separated hashes; browser-local preferences; Telegram Bot API delivery; opt out at any time</p><p>Per-installation keyed Actor numbers replace raw wallet addresses. Transaction signatures and mapping material are not persisted; normalized observations expire after 72 hours.</p><p>append-only review decisions. Proposed edges remain visibly separate from reviewed facts; the resolver exposes no write operation.</p>"
   };
@@ -553,7 +715,11 @@ async function fixture(t, overrides = {}, headerOverrides = {}) {
         : req.url.endsWith(".css")
           ? "text/css; charset=utf-8"
           : "text/javascript; charset=utf-8";
-    const rawHeaders = { ...headerOverrides[req.url], ...headerOverrides[requestKey] };
+    const rateHeaders = req.method === "GET" && (req.url === "/api/snapshot"
+      || req.url.startsWith("/api/v1/entities?") || req.url.startsWith("/api/v1/entities/resolve?"))
+      ? { "x-ratelimit-limit": "120", "x-ratelimit-remaining": "119", "x-ratelimit-reset": String(Math.floor(Date.now() / 1_000) + 60) }
+      : {};
+    const rawHeaders = { ...rateHeaders, ...headerOverrides[req.url], ...headerOverrides[requestKey] };
     const { status: statusOverride, disableGzip = false, ...routeHeaders } = rawHeaders;
     const shouldGzip = !disableGzip && ["/api/health", "/api/snapshot"].includes(req.url)
       && /(?:^|,)\s*gzip\s*(?:;|,|$)/i.test(req.headers["accept-encoding"] || "");
@@ -591,15 +757,15 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" });
   assert.equal(result.ok, true);
   assert.deepEqual(result.http, {
-    health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, help: 200, terms: 200, privacy: 200,
-    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200, identityResolver: 200,
+    health: 200, snapshot: 200, html: 200, appJs: 200, snapshotRefreshJs: 200, preferencesJs: 200, styles: 200, help: 200, apiDocs: 200, openapi: 200, terms: 200, privacy: 200,
+    dossier: 200, timeline: 200, compare: 200, dailyBrief: 200, weeklyBrief: 200, entityList: 200, identityResolver: 200,
     identityWriteGuard: 405,
     vaultExportGuard: 403
   });
   assert.deepEqual(result.markers, {
     version: true, readOnly: true, observability: true, outcomeEngine: true, riskIdentity: true,
     actionableIntelligence: true, measuredBriefV2: true, outcomeDemandAwareFreshness: true,
-    parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, compactHelp: true, publicDeliveryHardening: true, legalNotices: true
+    parserRevision: true, anonymousEarlyActors: true, canonicalIdentity: true, entityIntelligence: true, identityApiHardening: true, compactHelp: true, publicDeliveryHardening: true, legalNotices: true
   });
 });
 
@@ -619,11 +785,118 @@ test("fails release smoke when proposed identity edges are presented as verified
   const baseUrl = await fixture(t, {
     [path]: jsonOverride((identity) => {
       identity.proposals.push({ fromMint: cohortMint(0), toMint: cohortMint(1), kind: "name-collision", reviewState: "verified" });
+      identity.proposalCoverage.eligibleCount = 1;
+      identity.proposalCoverage.includedCount = 1;
     })
   });
   await assert.rejects(
     runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
-    (error) => error instanceof SmokeCheckError && error.check === "identity resolver" && /clearly separated/.test(error.message)
+    (error) => error instanceof SmokeCheckError && error.check === "identity resolver" && /unreviewed proposals/.test(error.message)
+  );
+});
+
+test("fails release smoke when entity trend metrics can sum reviewed variants", async (t) => {
+  const baseUrl = await fixture(t, {
+    [firstEntityPagePath]: jsonOverride((page) => {
+      page.entities[0].trend.summedAcrossVariants = true;
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "entity list" && /trend contribution policy/.test(error.message)
+  );
+});
+
+test("fails release smoke when identity API rate-limit headers are absent", async (t) => {
+  const baseUrl = await fixture(t, {}, {
+    [firstEntityPagePath]: { "x-ratelimit-limit": "", "x-ratelimit-remaining": "", "x-ratelimit-reset": "" }
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "entity list" && /rate-limit headers/.test(error.message)
+  );
+});
+
+test("fails release smoke when the public identity contract claims API-key security", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/v1/openapi.json": jsonOverride((openapi) => {
+      openapi.security = [{ ApiKeyAuth: [] }];
+      openapi.components.securitySchemes = { ApiKeyAuth: { type: "apiKey", in: "header", name: "x-api-key" } };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "openapi" && /drifted from public\/openapi\.json/.test(error.message)
+  );
+});
+
+test("fails release smoke when the registry projection truncates reviewed data", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/snapshot": jsonOverride((snapshot) => {
+      const projection = snapshot.entityIntelligence.registryProjection;
+      projection.eligibleCounts.entities = 1;
+      projection.omittedCounts.entities = 1;
+      projection.truncated = true;
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "snapshot"
+      && /truncated, omitted reviewed data/.test(error.message)
+  );
+});
+
+test("fails release smoke when entity denominators do not reconcile", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/snapshot": jsonOverride((snapshot) => {
+      snapshot.entityIntelligence.denominators.observedMintCount--;
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "snapshot"
+      && /denominator equations/.test(error.message)
+  );
+});
+
+test("fails release smoke when nested limiter counters do not reconcile", async (t) => {
+  const baseUrl = await fixture(t, {
+    "/api/health": jsonOverride((health) => {
+      health.identityRegistry.api.limiter.list.requests++;
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "health"
+      && /limiter counters/.test(error.message)
+  );
+});
+
+test("fails release smoke when followed entity pages repeat a boundary row", async (t) => {
+  const firstPage = entityPage(0);
+  const baseUrl = await fixture(t, {
+    [secondEntityPagePath()]: jsonOverride((page) => {
+      page.entities[0] = firstPage.entities.at(-1);
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "entity list"
+      && /duplicated or not in strict code-unit/.test(error.message)
+  );
+});
+
+test("fails release smoke when resolver privacy leaks a raw wallet field", async (t) => {
+  const resolverPath = `/api/v1/entities/resolve?mint=${cohortMint(0)}`;
+  const baseUrl = await fixture(t, {
+    [resolverPath]: jsonOverride((identity) => {
+      identity.audit = { walletAddress: cohortMint(15) };
+    })
+  });
+  await assert.rejects(
+    runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live" }),
+    (error) => error instanceof SmokeCheckError && error.check === "identity resolver"
+      && /raw public identity key/.test(error.message)
   );
 });
 
@@ -909,8 +1182,8 @@ test("recursively rejects hidden actor mapping or provenance material", async (t
 
 test("recursively rejects raw social profile strings outside the risk schema", async (t) => {
   const baseUrl = await fixture(t, {
-    [`/api/coins/${cohortMint(0)}/timeline?limit=2`]: jsonOverride((timeline) => {
-      timeline.entries.push({ sourceActor: "https://x.com/raw_handle" });
+    [firstTimelinePath()]: jsonOverride((timeline) => {
+      timeline.entries[0].sourceActor = "https://x.com/raw_handle";
     })
   });
   await assert.rejects(
@@ -1152,6 +1425,8 @@ test("accepts fresh persisted outcome evidence after a restart with a current-pr
     storage: { mountPointVerified: true },
     feed: { state: "live", isStale: false, staleAfterSeconds: 90 },
     telemetry: { format: "json-lines", errorsTotal: 0, responses5xx: 0 },
+    apiLimits: apiLimits(),
+    tokenIntegrity: tokenIntegrity(),
     actionIntelligence: actionHealth(),
     identityRegistry: identityHealth(),
     outcomes: {

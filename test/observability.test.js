@@ -123,9 +123,10 @@ test("emits structured redacted errors and exposes bounded counters", () => {
 
   telemetry.info("service.started", { apiKey: "do-not-print" });
   telemetry.error("feed.failure", new Error("token=super-secret https://user:pass@example.com"), { requestId: "safe-id" });
-  telemetry.recordResponse(200);
-  telemetry.recordResponse(503);
-  telemetry.recordResponse(503, { readiness: true });
+  telemetry.recordResponse(200, { routeClass: "snapshot" });
+  telemetry.recordResponse(503, { routeClass: "/api/coins/raw-client-mint" });
+  telemetry.recordResponse(503, { readiness: true, routeClass: "health" });
+  telemetry.recordResponse(429, { routeClass: "identity-list", clientIdentifier: "must-not-appear" });
 
   const records = lines.map((line) => JSON.parse(line));
   assert.equal(records[0].apiKey, "[REDACTED]");
@@ -159,10 +160,18 @@ test("emits structured redacted errors and exposes bounded counters", () => {
     errorsTotal: 4,
     lastErrorAt: "2026-08-08T22:10:00.000Z",
     errorsByEvent: { "auth.failure": 1, "escaped.failure": 1, "feed.failure": 1, "upstream.failure": 1 },
-    responsesTotal: 3,
+    responsesTotal: 4,
     responses5xx: 1,
     last5xxAt: "2026-08-08T22:10:00.000Z",
     readinessFailures: 1,
-    lastReadinessFailureAt: "2026-08-08T22:10:00.000Z"
+    lastReadinessFailureAt: "2026-08-08T22:10:00.000Z",
+    responseCounterScope: "process-local-fixed-route-classes",
+    responsesByRouteClass: {
+      health: { responses: 1, responses4xx: 0, responses429: 0, responses5xx: 1 },
+      "identity-list": { responses: 1, responses4xx: 1, responses429: 1, responses5xx: 0 },
+      other: { responses: 1, responses4xx: 0, responses429: 0, responses5xx: 1 },
+      snapshot: { responses: 1, responses4xx: 0, responses429: 0, responses5xx: 0 }
+    }
   });
+  assert.doesNotMatch(JSON.stringify(telemetry.snapshot()), /raw-client-mint|must-not-appear/);
 });

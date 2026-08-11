@@ -15,6 +15,26 @@ import {
 const createdAt = "2026-08-08T12:00:00.000Z";
 const geckoMint = "11111111111111111111111111111111";
 const secondGeckoMint = "22222222222222222222222222222222";
+const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function generatedMint(index) {
+  const bytes = Buffer.alloc(32);
+  bytes.writeUInt32BE(index + 1, 28);
+  let value = BigInt(`0x${bytes.toString("hex")}`);
+  let encoded = "";
+  while (value > 0n) {
+    encoded = base58Alphabet[Number(value % 58n)] + encoded;
+    value /= 58n;
+  }
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    encoded = `1${encoded}`;
+  }
+  return encoded || "1";
+}
+const demoMint = generatedMint(1);
+const liveMint = generatedMint(2);
+const unknownMint = generatedMint(3);
+const orphanMint = generatedMint(4);
 
 function temporaryStore(t) {
   const directory = mkdtempSync(path.join(tmpdir(), "pump-war-room-store-"));
@@ -27,21 +47,21 @@ function temporaryStore(t) {
 }
 
 function seedMixedSources(store) {
-  store.upsertToken({ mint: "demo-mint", symbol: "DEMO", source: "demo", createdAt });
-  store.upsertToken({ mint: "live-mint", symbol: "LIVE", source: "pumpportal", createdAt });
-  store.upsertToken({ mint: "unknown-mint", symbol: "UNKNOWN", createdAt });
+  store.upsertToken({ mint: demoMint, symbol: "DEMO", source: "demo", createdAt });
+  store.upsertToken({ mint: liveMint, symbol: "LIVE", source: "pumpportal", createdAt });
+  store.upsertToken({ mint: unknownMint, symbol: "UNKNOWN", createdAt });
 
-  store.addEvent("mint", { mint: "demo-mint", source: "demo" });
-  store.addEvent("update", { mint: "demo-mint", source: "demo" });
-  store.addEvent("mint", { mint: "live-mint", source: "pumpportal" });
-  store.addEvent("update", { mint: "unknown-mint" });
+  store.addEvent("mint", { mint: demoMint, source: "demo" });
+  store.addEvent("update", { mint: demoMint, source: "demo" });
+  store.addEvent("mint", { mint: liveMint, source: "pumpportal" });
+  store.addEvent("update", { mint: unknownMint });
 
-  store.addAlert({ level: "signal", title: "Demo alert", message: "synthetic", mint: "demo-mint", createdAt });
-  store.addAlert({ level: "signal", title: "Live alert", message: "verified", mint: "live-mint", createdAt });
-  store.addAlert({ level: "signal", title: "Orphan alert", message: "unknown", mint: "orphan-mint", createdAt });
+  store.addAlert({ level: "signal", title: "Demo alert", message: "synthetic", mint: demoMint, createdAt });
+  store.addAlert({ level: "signal", title: "Live alert", message: "verified", mint: liveMint, createdAt });
+  store.addAlert({ level: "signal", title: "Orphan alert", message: "unknown", mint: orphanMint, createdAt });
 
-  store.upsertCallout({ externalId: "demo-named-callout", mint: "demo-mint", source: "demo", createdAt });
-  store.upsertCallout({ externalId: "live-callout", mint: "live-mint", source: "bark", createdAt });
+  store.upsertCallout({ externalId: "demo-named-callout", mint: demoMint, source: "demo", createdAt });
+  store.upsertCallout({ externalId: "live-callout", mint: liveMint, source: "bark", createdAt });
 }
 
 test("counts token, event, and associated alert rows by JSON payload source", (t) => {
@@ -69,15 +89,118 @@ test("source operations tolerate malformed legacy JSON without treating it as de
   assert.equal(store.db.prepare("SELECT count(*) AS count FROM events WHERE mint='malformed-mint'").get().count, 1);
 });
 
+test("canonical token reads quarantine mismatched legacy keys and live atomic writes reject invalid mints", (t) => {
+  const store = temporaryStore(t);
+  const validMint = geckoMint;
+  store.upsertToken({ mint: validMint, source: "demo", createdAt });
+  const insert = store.db.prepare("INSERT INTO tokens (mint,payload,created_at,updated_at) VALUES (?,?,?,?)");
+  insert.run("legacy-invalid-key-a", JSON.stringify({ mint: validMint, source: "pumpportal", createdAt }), createdAt, createdAt);
+  insert.run("legacy-invalid-key-b", JSON.stringify({ mint: validMint, source: "pumpportal", createdAt }), createdAt, createdAt);
+  assert.deepEqual(store.canonicalTokens(10).map(({ mint }) => mint), [validMint]);
+  const integrity = store.tokenMintIntegrityCoverage();
+  assert.match(integrity.calculatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...integrity, calculatedAt: "<timestamp>" }, {
+    schemaVersion: 1,
+    policy: "quarantine-invalid-retained-token-identities-v1",
+    calculatedAt: "<timestamp>",
+    maxStalenessSeconds: 5,
+    basis: "cached-full-retained-token-sql-aggregate",
+    retainedCount: 3,
+    checkedCount: 3,
+    validCount: 1,
+    quarantinedCount: 2,
+    unscannedCount: 0,
+    complete: true
+  });
+  assert.equal(store.count(), 1);
+  assert.equal(store.countSince(createdAt), 1);
+  assert.deepEqual(store.countBySource("demo"), { tokens: 1, events: 0, alerts: 0 });
+  assert.deepEqual(store.countBySource("pumpportal"), { tokens: 0, events: 0, alerts: 0 });
+  assert.equal(store.periodActivity({
+    start: "2026-08-08T00:00:00.000Z", end: "2026-08-09T00:00:00.000Z", source: "demo"
+  }).launchesObserved, 1);
+  assert.throws(() => store.upsertTokenWithAlerts({ mint: "z".repeat(44), source: "pumpportal", createdAt }, {
+    eventKind: "mint"
+  }), /canonical 32-byte Solana mint/);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM events").get().count, 0);
+});
+
+test("canonical token limits are applied after legacy-invalid rows are quarantined", (t) => {
+  const store = temporaryStore(t);
+  store.upsertToken({ mint: geckoMint, symbol: "VALID", source: "pumpportal", createdAt });
+  const insert = store.db.prepare("INSERT INTO tokens (mint,payload,created_at,updated_at) VALUES (?,?,?,?)");
+  insert.run("newest-malformed", "{not-json", createdAt, "9999-12-31T23:59:59.999Z");
+  insert.run("newest-mismatched", JSON.stringify({ mint: geckoMint, symbol: "WRONG" }), createdAt, "9999-12-31T23:59:59.998Z");
+
+  assert.deepEqual(store.canonicalTokens(1).map(({ mint }) => mint), [geckoMint]);
+});
+
+test("cache coherence observes token integrity commits from another process connection", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "pump-war-room-store-cache-"));
+  const databasePath = path.join(directory, "war-room.db");
+  const reader = new Store(databasePath);
+  const writer = new Store(databasePath);
+  t.after(() => {
+    reader.db.close();
+    writer.db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  assert.equal(reader.tokenMintIntegrityCoverage().retainedCount, 0);
+  writer.upsertToken({ mint: geckoMint, source: "demo", createdAt });
+  writer.db.prepare("INSERT INTO tokens (mint,payload,created_at,updated_at) VALUES (?,?,?,?)")
+    .run("legacy-cross-process-key", JSON.stringify({ mint: geckoMint, source: "pumpportal", createdAt }), createdAt, createdAt);
+  const refreshed = reader.tokenMintIntegrityCoverage();
+  assert.match(refreshed.calculatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...refreshed, calculatedAt: "<timestamp>" }, {
+    schemaVersion: 1,
+    policy: "quarantine-invalid-retained-token-identities-v1",
+    calculatedAt: "<timestamp>",
+    maxStalenessSeconds: 5,
+    basis: "cached-full-retained-token-sql-aggregate",
+    retainedCount: 2,
+    checkedCount: 2,
+    validCount: 1,
+    quarantinedCount: 1,
+    unscannedCount: 0,
+    complete: true
+  });
+});
+
+test("token integrity coverage remains complete beyond ten thousand retained rows", (t) => {
+  const store = temporaryStore(t);
+  const insert = store.db.prepare("INSERT INTO tokens (mint,payload,created_at,updated_at) VALUES (?,?,?,?)");
+  store.db.exec("BEGIN IMMEDIATE");
+  try {
+    for (let index = 0; index < 10_005; index++) {
+      const mint = generatedMint(20_000 + index);
+      insert.run(mint, JSON.stringify({ mint, source: "pumpportal", createdAt }), createdAt, createdAt);
+    }
+    insert.run("legacy-invalid-overflow", "{not-json", createdAt, createdAt);
+    store.db.exec("COMMIT");
+  } catch (error) {
+    store.db.exec("ROLLBACK");
+    throw error;
+  }
+
+  const integrity = store.tokenMintIntegrityCoverage();
+  assert.equal(integrity.retainedCount, 10_006);
+  assert.equal(integrity.checkedCount, 10_006);
+  assert.equal(integrity.validCount, 10_005);
+  assert.equal(integrity.quarantinedCount, 1);
+  assert.equal(integrity.unscannedCount, 0);
+  assert.equal(integrity.complete, true);
+  assert.equal(integrity.basis, "cached-full-retained-token-sql-aggregate");
+});
+
 test("counts only source-verified token rows since an inclusive timestamp", (t) => {
   const store = temporaryStore(t);
   const before = "2026-08-08T11:59:59.999Z";
   const after = "2026-08-08T12:00:00.001Z";
-  store.upsertToken({ mint: "live-before", source: "pumpportal", createdAt: before });
-  store.upsertToken({ mint: "live-boundary", source: "pumpportal", createdAt });
-  store.upsertToken({ mint: "live-after", source: "pumpportal", createdAt: after });
-  store.upsertToken({ mint: "demo-after", source: "demo", createdAt: after });
-  store.upsertToken({ mint: "unknown-after", createdAt: after });
+  store.upsertToken({ mint: generatedMint(10), source: "pumpportal", createdAt: before });
+  store.upsertToken({ mint: generatedMint(11), source: "pumpportal", createdAt });
+  store.upsertToken({ mint: generatedMint(12), source: "pumpportal", createdAt: after });
+  store.upsertToken({ mint: generatedMint(13), source: "demo", createdAt: after });
+  store.upsertToken({ mint: generatedMint(14), createdAt: after });
   store.db.prepare("INSERT INTO tokens (mint,payload,created_at,updated_at) VALUES (?,?,?,?)")
     .run("malformed-after", "{not-json", after, after);
 
@@ -85,7 +208,7 @@ test("counts only source-verified token rows since an inclusive timestamp", (t) 
   assert.equal(store.countSinceBySource(createdAt, "demo"), 1);
   assert.equal(store.countSinceBySource(createdAt, "unknown"), 0);
   assert.equal(store.countSinceBySource(after, "pumpportal"), 1);
-  assert.equal(store.countSince(createdAt), 5);
+  assert.equal(store.countSince(createdAt), 4);
   assert.throws(() => store.countSinceBySource(createdAt, ""), /non-empty string/);
 });
 
@@ -96,7 +219,7 @@ test("purges only demo tokens, demo events, and alerts tied to demo tokens", (t)
   assert.deepEqual(store.purgeDemoData(), { alerts: 1, events: 2, tokens: 1 });
   assert.deepEqual(store.countBySource("demo"), { tokens: 0, events: 0, alerts: 0 });
 
-  assert.deepEqual(store.tokens().map((token) => token.mint).sort(), ["live-mint", "unknown-mint"]);
+  assert.deepEqual(store.tokens().map((token) => token.mint).sort(), [liveMint, unknownMint].sort());
   assert.deepEqual(store.alerts().map((alert) => alert.title).sort(), ["Live alert", "Orphan alert"]);
   assert.deepEqual(
     store.db.prepare("SELECT external_id AS externalId FROM callouts ORDER BY external_id").all().map((row) => row.externalId),
@@ -104,7 +227,7 @@ test("purges only demo tokens, demo events, and alerts tied to demo tokens", (t)
   );
 
   const remainingEvents = store.db.prepare("SELECT payload FROM events ORDER BY id").all().map((row) => JSON.parse(row.payload));
-  assert.deepEqual(remainingEvents.map((event) => event.mint), ["live-mint", "unknown-mint"]);
+  assert.deepEqual(remainingEvents.map((event) => event.mint), [liveMint, unknownMint]);
 });
 
 test("demo purge is idempotent", (t) => {

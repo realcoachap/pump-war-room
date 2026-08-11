@@ -4,8 +4,8 @@ import { classifyPumpPortalEvent, PumpPortalIngestor } from "../src/ingest.js";
 
 const FIXED_TIME = Date.parse("2026-08-08T21:00:00.000Z");
 const MINT_ONE = "11111111111111111111111111111111";
-const MINT_TWO = "22222222222222222222222222222222";
-const MINT_THREE = "33333333333333333333333333333333";
+const MINT_TWO = "SysvarRent111111111111111111111111111111111";
+const MINT_THREE = "Vote111111111111111111111111111111111111111";
 const CREATOR = "So11111111111111111111111111111111111111112";
 const USER = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
 
@@ -131,6 +131,18 @@ test("withholds malformed identities and negative or non-finite SOL quantities",
   assert.equal(observed.deployer, null);
   assert.equal(observed.curveSol, null);
   assert.equal(observed.launchSolAmount, null);
+});
+
+test("ignores lexical base58 mint frames that do not decode to 32 bytes", () => {
+  const observed = [];
+  const ingestor = new PumpPortalIngestor({
+    url: "wss://example.invalid",
+    now: () => FIXED_TIME,
+    onToken: (token) => observed.push(token)
+  });
+  ingestor.handle({ txType: "create", mint: "z".repeat(44), name: "Invalid", symbol: "BAD" });
+  assert.deepEqual(observed, []);
+  assert.equal(ingestor.getStatus().counters.ignoredMessages, 1);
 });
 
 test("classifies create frames with a pool as new tokens, not migrations", () => {

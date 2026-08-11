@@ -77,9 +77,8 @@ export function runIdentityCli(argv) {
     }
     if (command === "import") {
       const document = importDocument(required(options, "file"));
-      const entities = document.entities.map((entry) => store.saveIdentityEntity(entry));
-      const relationships = document.relationships.map((entry) => store.saveIdentityRelationship(entry));
-      return { command, database: databasePath, imported: { entities: entities.length, relationships: relationships.length }, coverage: store.identityRegistryCoverage() };
+      const imported = store.importIdentityRegistry(document);
+      return { command, database: databasePath, imported: { entities: imported.entities, relationships: imported.relationships }, coverage: imported.coverage };
     }
     throw new Error("Command must be status, proposals, decide, or import");
   } finally {
@@ -95,4 +94,3 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(im
     process.exitCode = 1;
   }
 }
-

@@ -189,6 +189,18 @@ test("coin timeline merges only sanitized, typed, bounded evidence", () => {
   assert.notEqual(firstPage.entries[0].at, secondPage.entries[0].at);
   assert.equal(secondPage.nextBefore, null);
   assert.throws(() => buildCoinTimeline({ mint: mintA, generatedAt: now, before: "not-a-real-cursor" }), /cursor/);
+
+  const multibyteEvents = [
+    { kind: "risk-evidence", mint: mintA, occurredAt: "2026-08-09T11:00:00Z", evidenceClass: "provider-observed", payload: {
+      mint: mintA, factor: "concentration", value: 51, unit: "%", limitation: "界".repeat(240)
+    } },
+    { kind: "mint", mint: mintA, createdAt: "2026-08-09T10:00:00Z", payload: { mint: mintA, source: "pumpportal" } }
+  ];
+  const multibyteFirst = buildCoinTimeline({ mint: mintA, generatedAt: now, limit: 1, events: multibyteEvents });
+  assert.ok(multibyteFirst.nextBefore.length <= 192);
+  const multibyteSecond = buildCoinTimeline({ mint: mintA, generatedAt: now, limit: 1, before: multibyteFirst.nextBefore, events: multibyteEvents });
+  assert.equal(multibyteSecond.entries.length, 1);
+  assert.equal(multibyteSecond.nextBefore, null);
 });
 
 test("comparison requires unique exact mints and keeps missing evidence explicit", () => {

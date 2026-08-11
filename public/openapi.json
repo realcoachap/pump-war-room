@@ -1,0 +1,757 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Pump War Room Public and Local-Operator API Contract",
+    "version": "__APP_VERSION__",
+    "description": "The public surface provides unauthenticated read-only intelligence over this installation's bounded observations. Filesystem-writing HTTP vault exports are disabled in every mode and excluded from this contract. Identity fields do not establish authenticity, safety, common control, quality, or a trade recommendation. Provider and feed evidence may be delayed, incomplete, revised, or missing. Public responses exclude raw wallets, private actor mappings, credentials, and provider payloads."
+  },
+  "servers": [
+    { "url": "/" }
+  ],
+  "security": [],
+  "tags": [
+    { "name": "Operations", "description": "Readiness, aggregate process-local counters, and the bounded public snapshot." },
+    { "name": "Identity", "description": "Read-only reviewed identity and exact-mint endpoints. External API keys are not offered." },
+    { "name": "Intelligence", "description": "Exact-mint dossiers, timelines, comparisons, and frozen measured briefs." },
+    { "name": "Analyst", "description": "Local deterministic analysis over one current bounded snapshot." },
+    { "name": "Stream", "description": "Process-local bounded server-sent event connections." }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read service readiness and aggregate health counters",
+        "description": "Readiness is not rate-limited. HTTP 200 means the configured feed/storage readiness basis is healthy; HTTP 503 means starting or degraded. This endpoint does not claim calibration, backup, or recovery readiness.",
+        "responses": {
+          "200": { "description": "Healthy or simulated service", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } },
+          "503": { "description": "Starting or degraded service", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/snapshot": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Read the bounded current intelligence snapshot",
+        "description": "Returns the current bounded exact-mint leaderboard and evidence envelopes, including additive entity intelligence. One immutable computed snapshot is reused for at most five seconds per process and generatedAt identifies its evidence time; a cross-process database commit invalidates it immediately. Large responses support gzip. Missing evidence stays null or explicitly unavailable. All snapshot attempts share one process-global 120 requests/minute fixed window per instance.",
+        "responses": {
+          "200": {
+            "description": "Current bounded snapshot",
+            "headers": {
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/RateLimitLimit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/RateLimitRemaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/RateLimitReset" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Snapshot" } } }
+          },
+          "405": { "$ref": "#/components/responses/GetOnly" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/v1/entities": {
+      "get": {
+        "tags": ["Identity"],
+        "summary": "List reviewed entity aggregates and exact-mint singletons",
+        "description": "Returns entity-ID-ordered live pages. Every aggregate preserves included and excluded mint denominators. Each trend has at most one exact-mint contributor: grouped entities require a reviewed primary or sole reviewed variant, while unreviewed singletons remain separate. Variant volume is never summed. Cursors are opaque and pages have live weak consistency when observations change between requests. All list attempts share one process-global 120 requests/minute fixed window per instance; it resets on restart and is not coordinated across replicas.",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string", "maxLength": 256 }, "description": "Opaque nextCursor returned by the previous page." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded entity page",
+            "headers": {
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/RateLimitLimit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/RateLimitRemaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/RateLimitReset" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EntityPage" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "405": { "$ref": "#/components/responses/GetOnly" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/v1/entities/resolve": {
+      "get": {
+        "tags": ["Identity"],
+        "summary": "Resolve one exact Solana mint",
+        "description": "Every valid mint resolves. A mint without verified registry membership remains its own singleton. Unreviewed proposals remain visibly separate and cannot become reviewed relationships. All resolver attempts share a separate process-global 120 requests/minute fixed window per instance.",
+        "parameters": [
+          { "name": "mint", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/SolanaMint" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact-mint identity envelope",
+            "headers": {
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/RateLimitLimit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/RateLimitRemaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/RateLimitReset" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityResolution" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "405": { "$ref": "#/components/responses/GetOnly" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": ["Operations"],
+        "summary": "Download this versioned OpenAPI 3.1 contract",
+        "responses": {
+          "200": { "description": "OpenAPI document", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/coins/{mint}": {
+      "get": {
+        "tags": ["Intelligence"],
+        "summary": "Read one retained exact-mint dossier",
+        "description": "Returns a sanitized dossier only for a mint observed inside this deployment's public evidence contract. No raw provider history or private identity material is returned.",
+        "parameters": [{ "$ref": "#/components/parameters/MintPath" }],
+        "responses": {
+          "200": { "description": "Exact-mint dossier", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CoinDossier" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/coins/{mint}/timeline": {
+      "get": {
+        "tags": ["Intelligence"],
+        "summary": "Page a retained exact-mint evidence timeline",
+        "description": "Cursor-paginates bounded discrete observations in reverse time order. The before cursor is opaque. Timelines are not continuous prices and do not contain interpolated or raw provider payloads.",
+        "parameters": [
+          { "$ref": "#/components/parameters/MintPath" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+          { "name": "before", "in": "query", "schema": { "type": "string", "maxLength": 192 }, "description": "Opaque versioned row-digest nextBefore returned by the previous page." }
+        ],
+        "responses": {
+          "200": { "description": "Bounded timeline page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CoinTimeline" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/compare": {
+      "get": {
+        "tags": ["Intelligence"],
+        "summary": "Compare two to four unique exact mints",
+        "description": "Returns explicit missing cells and keeps uncalibrated risk factors and entity proposals out of mint ranking.",
+        "parameters": [{ "name": "mints", "in": "query", "required": true, "description": "Two to four unique comma-separated Solana mints.", "schema": { "type": "string", "maxLength": 179 } }],
+        "responses": {
+          "200": { "description": "Exact-mint comparison", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CoinComparison" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/briefs/daily": {
+      "get": {
+        "tags": ["Intelligence"],
+        "summary": "Read the frozen last closed UTC daily brief",
+        "responses": {
+          "200": { "description": "Measured daily brief with explicit denominators and unmeasured feed coverage", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MeasuredBrief" } } } },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/briefs/weekly": {
+      "get": {
+        "tags": ["Intelligence"],
+        "summary": "Read the frozen last closed Monday-to-Monday UTC brief",
+        "responses": {
+          "200": { "description": "Measured weekly brief with explicit denominators and unmeasured feed coverage", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MeasuredBrief" } } } },
+          "405": { "$ref": "#/components/responses/GetOnly" }
+        }
+      }
+    },
+    "/api/agent/chat": {
+      "post": {
+        "tags": ["Analyst"],
+        "summary": "Run local deterministic analysis over the current snapshot",
+        "description": "Accepts one question of at most 500 characters. Uses no external model or tool and cannot execute trades. All analyst attempts share one process-global 60 requests/minute fixed window per instance.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["question"], "additionalProperties": false, "properties": { "question": { "type": "string", "minLength": 1, "maxLength": 500 } } } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Grounded local analysis",
+            "headers": {
+              "X-RateLimit-Limit": { "$ref": "#/components/headers/RateLimitLimit" },
+              "X-RateLimit-Remaining": { "$ref": "#/components/headers/RateLimitRemaining" },
+              "X-RateLimit-Reset": { "$ref": "#/components/headers/RateLimitReset" }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AnalystResponse" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "405": { "$ref": "#/components/responses/PostOnly" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/stream": {
+      "get": {
+        "tags": ["Stream"],
+        "summary": "Open the bounded server-sent event stream",
+        "description": "Emits sanitized status and token events. The process-local concurrent connection cap is 64 and resets on restart. It is not a replayable or complete historical feed.",
+        "responses": {
+          "200": { "description": "Open SSE stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+          "405": { "$ref": "#/components/responses/GetOnly" },
+          "503": { "$ref": "#/components/responses/StreamCapacity" }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "MintPath": { "name": "mint", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/SolanaMint" } }
+    },
+    "headers": {
+      "RateLimitLimit": { "description": "Maximum attempts in the active process-global per-instance fixed window.", "schema": { "type": "integer", "minimum": 1 } },
+      "RateLimitRemaining": { "description": "Attempts remaining in the active process-global per-instance fixed window.", "schema": { "type": "integer", "minimum": 0 } },
+      "RateLimitReset": { "description": "Unix timestamp in seconds when the active process-global per-instance fixed window resets.", "schema": { "type": "integer", "minimum": 1 } }
+    },
+    "schemas": {
+      "SolanaMint": { "type": "string", "pattern": "^[1-9A-HJ-NP-Za-km-z]{32,44}$", "minLength": 32, "maxLength": 44, "description": "Canonical base58 encoding that decodes to exactly 32 bytes. The pattern is only a lexical approximation; the server also validates decoded length." },
+      "Error": {
+        "type": "object",
+        "required": ["error", "requestId"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "code": { "type": "string" },
+          "error": { "type": "string" },
+          "requestId": { "type": "string", "format": "uuid" },
+          "mode": { "type": "string" }
+        }
+      },
+      "TokenIntegrity": {
+        "type": "object",
+        "required": ["schemaVersion", "policy", "calculatedAt", "maxStalenessSeconds", "basis", "retainedCount", "checkedCount", "validCount", "quarantinedCount", "unscannedCount", "complete"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "policy": { "const": "quarantine-invalid-retained-token-identities-v1" },
+          "calculatedAt": { "type": "string", "format": "date-time" },
+          "maxStalenessSeconds": { "const": 5 },
+          "basis": { "const": "cached-full-retained-token-sql-aggregate" },
+          "retainedCount": { "type": "integer", "minimum": 0 },
+          "checkedCount": { "type": "integer", "minimum": 0 },
+          "validCount": { "type": "integer", "minimum": 0 },
+          "quarantinedCount": { "type": "integer", "minimum": 0 },
+          "unscannedCount": { "type": "integer", "minimum": 0 },
+          "complete": { "type": "boolean" }
+        },
+        "description": "Cached full-table token-identity integrity aggregate. validCount plus quarantinedCount equals checkedCount; checkedCount equals retainedCount and unscannedCount is zero."
+      },
+      "Health": {
+        "type": "object",
+        "required": ["ok", "status", "version", "mode", "requestId", "telemetry", "apiLimits", "tokenIntegrity", "identityRegistry"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "status": { "enum": ["healthy", "starting", "degraded"] },
+          "version": { "const": "__APP_VERSION__" },
+          "mode": { "enum": ["live", "demo"] },
+          "requestId": { "type": "string", "format": "uuid" },
+          "telemetry": { "type": "object" },
+          "apiLimits": { "type": "object" },
+          "tokenIntegrity": { "$ref": "#/components/schemas/TokenIntegrity" },
+          "identityRegistry": { "type": "object" }
+        }
+      },
+      "Snapshot": {
+        "type": "object",
+        "required": ["version", "generatedAt", "mode", "status", "apiLimits", "tokenIntegrity", "identityRegistry", "entityIntelligence", "tokens", "leaderboard"],
+        "properties": {
+          "version": { "const": "__APP_VERSION__" },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "mode": { "enum": ["live", "demo"] },
+          "status": { "enum": ["healthy", "starting", "degraded"] },
+          "apiLimits": { "type": "object" },
+          "tokenIntegrity": { "$ref": "#/components/schemas/TokenIntegrity" },
+          "identityRegistry": { "type": "object" },
+          "entityIntelligence": { "type": "object" },
+          "tokens": { "type": "array", "maxItems": 120, "items": { "type": "object" } },
+          "leaderboard": { "type": "object" }
+        }
+      },
+      "CoinDossier": {
+        "type": "object",
+        "required": ["schemaVersion", "generatedAt", "token", "radar", "outcome", "earlyActor", "identity", "timeline", "scope", "disclaimer"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "token": { "type": "object" },
+          "radar": { "type": "object" },
+          "outcome": { "type": ["object", "null"] },
+          "earlyActor": { "type": ["object", "null"] },
+          "identity": { "$ref": "#/components/schemas/IdentityResolution" },
+          "timeline": { "type": "string", "pattern": "^/api/coins/.+/timeline$" },
+          "scope": { "type": "string" },
+          "disclaimer": { "type": "string" }
+        }
+      },
+      "TimelineEntry": {
+        "type": "object",
+        "required": ["kind", "at", "evidenceClass", "title", "detail"],
+        "properties": {
+          "kind": { "type": "string" },
+          "at": { "type": "string", "format": "date-time" },
+          "evidenceClass": { "type": "string" },
+          "title": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      },
+      "CoinTimeline": {
+        "type": "object",
+        "required": ["schemaVersion", "mint", "generatedAt", "limit", "entries", "nextBefore", "historyAvailableSince", "scope", "rawProviderPayloadsIncluded"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+          "entries": { "type": "array", "maxItems": 200, "items": { "$ref": "#/components/schemas/TimelineEntry" } },
+          "nextBefore": { "type": ["string", "null"], "maxLength": 192 },
+          "historyAvailableSince": { "type": ["string", "null"], "format": "date-time" },
+          "scope": { "type": "string" },
+          "rawProviderPayloadsIncluded": { "const": false }
+        }
+      },
+      "CoinComparison": {
+        "type": "object",
+        "required": ["schemaVersion", "generatedAt", "requestedMints", "missingMints", "coins", "rankingBoundary", "disclaimer"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "requestedMints": { "type": "array", "minItems": 2, "maxItems": 4, "items": { "$ref": "#/components/schemas/SolanaMint" } },
+          "missingMints": { "type": "array", "maxItems": 4, "items": { "$ref": "#/components/schemas/SolanaMint" } },
+          "coins": { "type": "array", "maxItems": 4, "items": { "type": "object" } },
+          "rankingBoundary": { "type": "string" },
+          "disclaimer": { "type": "string" }
+        }
+      },
+      "MeasuredBrief": {
+        "type": "object",
+        "required": ["schemaVersion", "methodVersion", "briefId", "period", "generatedAt", "windowStart", "windowEnd", "timezone", "feedCoverage", "activity", "outcomes", "priorPeriod", "rawProviderPayloadsIncluded", "disclaimer"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "methodVersion": { "enum": ["measured-closed-brief-v1", "measured-closed-brief-v2"] },
+          "briefId": { "type": "string" },
+          "period": { "enum": ["daily", "weekly"] },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "windowStart": { "type": "string", "format": "date-time" },
+          "windowEnd": { "type": "string", "format": "date-time" },
+          "timezone": { "const": "UTC" },
+          "feedCoverage": { "const": "unmeasured" },
+          "activity": { "type": "object" },
+          "outcomes": { "type": "object" },
+          "priorPeriod": { "type": "object" },
+          "rawProviderPayloadsIncluded": { "const": false },
+          "disclaimer": { "type": "string" }
+        }
+      },
+      "AnalystEvidence": {
+        "type": "object",
+        "required": ["label"],
+        "properties": {
+          "label": { "type": "string", "minLength": 1, "maxLength": 240, "description": "Sanitized human-readable grounding detail; internal snapshot citation paths are not exposed by this response." },
+          "mint": { "$ref": "#/components/schemas/SolanaMint" }
+        }
+      },
+      "AnalystResponse": {
+        "type": "object",
+        "required": ["answer", "evidence", "generatedAt", "mode"],
+        "properties": {
+          "answer": { "type": "string", "maxLength": 1600 },
+          "evidence": { "type": "array", "maxItems": 12, "items": { "$ref": "#/components/schemas/AnalystEvidence" } },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "mode": { "const": "local" }
+        }
+      },
+      "EntityDenominators": {
+        "type": "object",
+        "required": ["observedMintCount", "reviewedEntityCount", "reviewedVariantCount", "groupedObservedMintCount", "singletonObservedMintCount", "projectionOmittedReviewedMintCount", "entityCount", "trendingEntityCount"],
+        "properties": {
+          "observedMintCount": { "type": "integer", "minimum": 0 },
+          "reviewedEntityCount": { "type": "integer", "minimum": 0 },
+          "reviewedVariantCount": { "type": "integer", "minimum": 0 },
+          "groupedObservedMintCount": { "type": "integer", "minimum": 0 },
+          "singletonObservedMintCount": { "type": "integer", "minimum": 0 },
+          "projectionOmittedReviewedMintCount": { "type": "integer", "minimum": 0 },
+          "entityCount": { "type": "integer", "minimum": 0 },
+          "trendingEntityCount": { "type": "integer", "minimum": 0, "maximum": 20 }
+        },
+        "description": "observedMintCount equals groupedObservedMintCount plus singletonObservedMintCount plus projectionOmittedReviewedMintCount. entityCount is the complete unpaginated envelope count, not this page count."
+      },
+      "RankingBoundary": {
+        "type": "object",
+        "required": ["leaderboardChanged", "unreviewedProposalsUsed", "entityTrendAffectsMintRank", "unreviewedProposalImpact", "rankingImpact", "policy"],
+        "properties": {
+          "leaderboardChanged": { "const": false },
+          "unreviewedProposalsUsed": { "const": false },
+          "entityTrendAffectsMintRank": { "const": false },
+          "unreviewedProposalImpact": { "const": "none" },
+          "rankingImpact": { "const": "none" },
+          "policy": { "const": "one-reviewed-primary-or-sole-mint-per-entity-v1" }
+        }
+      },
+      "EntityApiLinks": {
+        "type": "object",
+        "required": ["list", "resolver", "specification", "documentation", "externalApiKeys"],
+        "properties": {
+          "list": { "const": "/api/v1/entities" },
+          "resolver": { "const": "/api/v1/entities/resolve?mint={mint}" },
+          "specification": { "const": "/api/v1/openapi.json" },
+          "documentation": { "const": "/api.html" },
+          "externalApiKeys": { "const": "not-offered" }
+        }
+      },
+      "RegistryCounts": {
+        "type": "object",
+        "required": ["entities", "variants", "relationships"],
+        "properties": {
+          "entities": { "type": "integer", "minimum": 0 },
+          "variants": { "type": "integer", "minimum": 0 },
+          "relationships": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "RegistryCapacity": {
+        "type": "object",
+        "required": ["entities", "variants", "relationships"],
+        "properties": { "entities": { "const": 500 }, "variants": { "const": 2000 }, "relationships": { "const": 5000 } }
+      },
+      "IntegrityOmissionCounts": {
+        "type": "object",
+        "required": ["entities", "variants", "relationships"],
+        "properties": {
+          "entities": { "type": "integer", "minimum": 0 },
+          "variants": { "type": "integer", "minimum": 0 },
+          "relationships": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "EntityPage": {
+        "type": "object",
+        "required": ["schemaVersion", "methodVersion", "generatedAt", "universe", "registryProjection", "denominators", "rankingBoundary", "api", "page", "entities", "projectionOmittedReviewed", "limitations"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "methodVersion": { "const": "reviewed-entity-intelligence-v1" },
+          "generatedAt": { "type": "string", "format": "date-time" },
+          "universe": { "type": "string" },
+          "registryProjection": { "$ref": "#/components/schemas/RegistryProjection" },
+          "denominators": { "$ref": "#/components/schemas/EntityDenominators" },
+          "rankingBoundary": { "$ref": "#/components/schemas/RankingBoundary" },
+          "api": { "$ref": "#/components/schemas/EntityApiLinks" },
+          "page": {
+            "type": "object",
+            "required": ["order", "limit", "count", "nextCursor"],
+            "properties": {
+              "order": { "const": "entity-id-ascending" },
+              "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+              "count": { "type": "integer", "minimum": 0, "maximum": 100 },
+              "nextCursor": { "type": ["string", "null"] }
+            }
+          },
+          "entities": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/EntityAggregate" } },
+          "projectionOmittedReviewed": { "type": "array", "items": { "$ref": "#/components/schemas/ProjectionOmittedReviewedMint" } },
+          "limitations": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "RegistryProjection": {
+        "type": "object",
+        "required": ["schemaVersion", "policy", "capacity", "eligibleCounts", "publishedCounts", "omittedCounts", "integrityOmittedCounts", "integrityOmissionReasons", "projectedEndpointRelationshipCount", "truncated", "prioritizedMintCount", "reviewedMintOmissionCount"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "policy": { "const": "bounded-whole-reviewed-entities-v1" },
+          "capacity": { "$ref": "#/components/schemas/RegistryCapacity" },
+          "eligibleCounts": { "$ref": "#/components/schemas/RegistryCounts" },
+          "publishedCounts": { "$ref": "#/components/schemas/RegistryCounts" },
+          "omittedCounts": { "$ref": "#/components/schemas/RegistryCounts" },
+          "integrityOmittedCounts": { "$ref": "#/components/schemas/IntegrityOmissionCounts" },
+          "integrityOmissionReasons": {
+            "type": "object",
+            "required": ["duplicateRelationships"],
+            "properties": { "duplicateRelationships": { "type": "integer", "minimum": 0 } }
+          },
+          "projectedEndpointRelationshipCount": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" },
+          "prioritizedMintCount": { "type": "integer", "minimum": 0 },
+          "reviewedMintOmissionCount": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "ProjectionOmittedReviewedMint": {
+        "type": "object",
+        "required": ["mint", "entityId", "displayName", "symbol", "reviewState", "reason", "registeredVariantCount"],
+        "properties": {
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "entityId": { "type": ["string", "null"] },
+          "displayName": { "type": ["string", "null"] },
+          "symbol": { "type": ["string", "null"] },
+          "reviewState": { "const": "verified-projection-omitted" },
+          "reason": { "enum": ["legacy-entity-variant-cap-exceeded", "projection-capacity-exhausted", "legacy-invalid-variant", "legacy-invalid-primary"] },
+          "registeredVariantCount": { "type": ["integer", "null"], "minimum": 1 }
+        }
+      },
+      "EntityAggregate": {
+        "type": "object",
+        "required": ["schemaVersion", "entityId", "displayName", "symbol", "reviewState", "primary", "variants", "narratives", "lifecycle", "volume", "trend"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "entityId": { "type": "string" },
+          "displayName": { "type": "string" },
+          "symbol": { "type": ["string", "null"] },
+          "reviewState": { "enum": ["verified", "singleton-unreviewed"] },
+          "primary": {
+            "type": "object",
+            "required": ["mint", "meaning"],
+            "properties": { "mint": { "anyOf": [{ "$ref": "#/components/schemas/SolanaMint" }, { "type": "null" }] }, "meaning": { "type": "string" } }
+          },
+          "variants": { "$ref": "#/components/schemas/EntityVariants" },
+          "narratives": { "$ref": "#/components/schemas/EntityNarratives" },
+          "lifecycle": { "$ref": "#/components/schemas/EntityLifecycle" },
+          "volume": { "$ref": "#/components/schemas/EntityVolume" },
+          "trend": { "$ref": "#/components/schemas/EntityTrend" }
+        }
+      },
+      "IncludedVariant": {
+        "type": "object",
+        "required": ["mint", "kind", "reviewState", "evidenceClass", "registryObservedAt", "tokenObservedAt", "name", "symbol", "narrative", "lifecycle", "metrics"],
+        "properties": {
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "kind": { "type": "string" },
+          "reviewState": { "type": "string" },
+          "evidenceClass": { "type": "string" },
+          "registryObservedAt": { "type": ["string", "null"], "format": "date-time" },
+          "tokenObservedAt": { "type": ["string", "null"], "format": "date-time" },
+          "name": { "type": ["string", "null"] },
+          "symbol": { "type": ["string", "null"] },
+          "narrative": { "type": ["string", "null"] },
+          "lifecycle": { "type": ["string", "null"] },
+          "metrics": {
+            "type": "object",
+            "required": ["radarRank", "radarScore", "volume5m", "momentum"],
+            "properties": {
+              "radarRank": { "type": ["integer", "null"] },
+              "radarScore": { "type": ["number", "null"] },
+              "volume5m": { "type": ["number", "null"] },
+              "momentum": { "type": ["number", "null"] }
+            }
+          }
+        }
+      },
+      "ExcludedVariant": {
+        "type": "object",
+        "required": ["mint", "kind", "reviewState", "evidenceClass", "registryObservedAt", "reason"],
+        "properties": {
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "kind": { "type": "string" },
+          "reviewState": { "type": "string" },
+          "evidenceClass": { "type": "string" },
+          "registryObservedAt": { "type": ["string", "null"], "format": "date-time" },
+          "reason": { "const": "not-observed-in-current-tape" }
+        }
+      },
+      "ReviewExcludedVariant": {
+        "type": "object",
+        "description": "A registered but unverified row disclosed outside every entity denominator. Its observed mint, if any, remains a separate exact-mint singleton.",
+        "required": ["mint", "kind", "reviewState", "evidenceClass", "registryObservedAt", "reason", "denominatorImpact"],
+        "properties": {
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "kind": { "type": "string" },
+          "reviewState": { "type": "string" },
+          "evidenceClass": { "type": "string" },
+          "registryObservedAt": { "type": ["string", "null"], "format": "date-time" },
+          "reason": { "const": "variant-review-not-verified" },
+          "denominatorImpact": { "const": "none" }
+        }
+      },
+      "EntityVariants": {
+        "type": "object",
+        "description": "registeredMintCount equals observedMintCount plus missingMintCount; included/excluded carry separate registry and token observation timestamps.",
+        "required": ["registeredMintCount", "observedMintCount", "missingMintCount", "included", "excluded", "reviewExcluded"],
+        "properties": {
+          "registeredMintCount": { "type": "integer", "minimum": 1 },
+          "observedMintCount": { "type": "integer", "minimum": 0 },
+          "missingMintCount": { "type": "integer", "minimum": 0 },
+          "included": { "type": "array", "items": { "$ref": "#/components/schemas/IncludedVariant" } },
+          "excluded": { "type": "array", "items": { "$ref": "#/components/schemas/ExcludedVariant" } },
+          "reviewExcluded": { "type": "array", "items": { "$ref": "#/components/schemas/ReviewExcludedVariant" } }
+        }
+      },
+      "EntityNarratives": {
+        "type": "object",
+        "required": ["observedMintCount", "missingMintCount", "values", "basis"],
+        "properties": {
+          "observedMintCount": { "type": "integer", "minimum": 0 },
+          "missingMintCount": { "type": "integer", "minimum": 0 },
+          "values": { "type": "array", "items": { "type": "object", "required": ["name", "mintCount"], "properties": { "name": { "type": "string" }, "mintCount": { "type": "integer", "minimum": 1 } } } },
+          "basis": { "type": "string" }
+        }
+      },
+      "EntityLifecycle": {
+        "type": "object",
+        "description": "A missing or invalid mint lifecycle remains missing and is not counted as an observed status.",
+        "required": ["observedMintCount", "missingMintCount", "statusCounts", "basis"],
+        "properties": {
+          "observedMintCount": { "type": "integer", "minimum": 0 },
+          "missingMintCount": { "type": "integer", "minimum": 0 },
+          "statusCounts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 } },
+          "basis": { "type": "string" }
+        }
+      },
+      "EntityVolume": {
+        "type": "object",
+        "description": "availableMintCount plus missingMintCount equals the entity registered-mint denominator. contributingMintCount is zero or one and does not imply that other available variants were summed.",
+        "required": ["availableMintCount", "missingMintCount", "contributingMintCount", "basis"],
+        "properties": {
+          "availableMintCount": { "type": "integer", "minimum": 0 },
+          "missingMintCount": { "type": "integer", "minimum": 0 },
+          "contributingMintCount": { "type": "integer", "minimum": 0, "maximum": 1 },
+          "basis": { "type": "string" }
+        }
+      },
+      "EntityTrend": {
+        "type": "object",
+        "required": ["policy", "contributingMint", "selectionReason", "orderingBasis", "radarRank", "radarScore", "volume5m", "momentum", "excludedObservedMintCount", "summedAcrossVariants"],
+        "properties": {
+          "policy": { "const": "one-reviewed-primary-or-sole-mint-per-entity-v1" },
+          "contributingMint": { "anyOf": [{ "$ref": "#/components/schemas/SolanaMint" }, { "type": "null" }] },
+          "selectionReason": { "type": "string" },
+          "orderingBasis": { "enum": ["radar-evidence-score", "five-minute-volume", "momentum", "token-observation-recency-fallback", null], "description": "The exact evidence used to order this entity trend. Null means the entity is omitted from the trending collection." },
+          "radarRank": { "type": ["integer", "null"] },
+          "radarScore": { "type": ["number", "null"] },
+          "volume5m": { "type": ["number", "null"] },
+          "momentum": { "type": ["number", "null"] },
+          "excludedObservedMintCount": { "type": "integer", "minimum": 0 },
+          "summedAcrossVariants": { "const": false }
+        }
+      },
+      "IdentityEntity": {
+        "type": "object",
+        "required": ["entityId", "displayName", "symbol", "reviewState"],
+        "properties": {
+          "entityId": { "type": "string", "maxLength": 96 },
+          "displayName": { "type": "string", "maxLength": 120 },
+          "symbol": { "type": ["string", "null"], "maxLength": 24 },
+          "reviewState": { "enum": ["verified", "singleton-unreviewed"] }
+        }
+      },
+      "IdentityVariant": {
+        "type": "object",
+        "required": ["mint", "kind", "reviewState", "evidenceClass"],
+        "properties": {
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "kind": { "enum": ["official", "migration", "relaunch", "unresolved"] },
+          "reviewState": { "enum": ["verified", "unreviewed"] },
+          "evidenceClass": { "enum": ["on-chain-finalized", "provider-observed", "feed-observed-processed", "locally-derived", "unavailable"] },
+          "observedAt": { "type": "string", "format": "date-time" },
+          "entityId": { "type": "string", "maxLength": 96 }
+        }
+      },
+      "IdentityPrimary": {
+        "type": "object",
+        "required": ["mint", "selectionReason", "meaning"],
+        "properties": {
+          "mint": { "anyOf": [{ "$ref": "#/components/schemas/SolanaMint" }, { "type": "null" }] },
+          "selectionReason": { "type": "string", "maxLength": 80 },
+          "meaning": { "type": "string" }
+        }
+      },
+      "IdentityRelationship": {
+        "type": "object",
+        "required": ["relationshipId", "fromMint", "toMint", "kind", "reviewState", "evidenceClass", "observedAt"],
+        "properties": {
+          "relationshipId": { "type": "string", "maxLength": 128 },
+          "fromMint": { "$ref": "#/components/schemas/SolanaMint" },
+          "toMint": { "$ref": "#/components/schemas/SolanaMint" },
+          "kind": { "enum": ["same-creator", "same-narrative", "probable-copycat", "name-collision"] },
+          "reviewState": { "const": "verified" },
+          "evidenceClass": { "enum": ["on-chain-finalized", "provider-observed", "feed-observed-processed", "locally-derived", "unavailable"] },
+          "observedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "IdentityProposal": {
+        "type": "object",
+        "required": ["fromMint", "toMint", "kind", "reviewState", "evidenceClass", "methodVersion", "observedAt"],
+        "properties": {
+          "fromMint": { "$ref": "#/components/schemas/SolanaMint" },
+          "toMint": { "$ref": "#/components/schemas/SolanaMint" },
+          "kind": { "enum": ["same-narrative", "name-collision"] },
+          "reviewState": { "const": "proposed" },
+          "evidenceClass": { "const": "locally-derived" },
+          "methodVersion": { "type": "string" },
+          "observedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RelationshipCoverage": {
+        "type": "object",
+        "required": ["eligibleCount", "publishableEligibleCount", "includedCount", "limitOmittedCount", "projectionOmittedCount", "integrityOmittedCount", "truncated", "limit"],
+        "properties": {
+          "eligibleCount": { "type": "integer", "minimum": 0 },
+          "publishableEligibleCount": { "type": "integer", "minimum": 0 },
+          "includedCount": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "limitOmittedCount": { "type": "integer", "minimum": 0 },
+          "projectionOmittedCount": { "type": "integer", "minimum": 0 },
+          "integrityOmittedCount": { "type": "integer", "minimum": 0 },
+          "truncated": { "type": "boolean" },
+          "limit": { "const": 100 }
+        },
+        "description": "Semantic-distinct reviewed incident-edge coverage. eligibleCount equals publishableEligibleCount plus projectionOmittedCount plus integrityOmittedCount. publishableEligibleCount equals includedCount plus limitOmittedCount. truncated is true exactly when limitOmittedCount is positive; projection or integrity omissions remain separately labeled."
+      },
+      "ProposalCoverage": {
+        "type": "object",
+        "required": ["eligibleCount", "includedCount", "omittedInvalidCount"],
+        "properties": {
+          "eligibleCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+          "includedCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+          "omittedInvalidCount": { "type": "integer", "minimum": 0, "maximum": 500 }
+        },
+        "description": "includedCount plus omittedInvalidCount equals eligibleCount. Legacy malformed proposal rows are never published or accepted."
+      },
+      "IdentityResolution": {
+        "type": "object",
+        "required": ["schemaVersion", "resolvedBy", "mint", "entity", "variant", "primary", "relationships", "relationshipCoverage", "proposalCoverage", "proposals", "limitations"],
+        "properties": {
+          "schemaVersion": { "const": 1 },
+          "resolvedBy": { "enum": ["singleton-exact-mint", "reviewed-registry-variant", "reviewed-registry-capacity-omitted", "reviewed-registry-integrity-omitted"] },
+          "mint": { "$ref": "#/components/schemas/SolanaMint" },
+          "entity": { "$ref": "#/components/schemas/IdentityEntity" },
+          "variant": { "$ref": "#/components/schemas/IdentityVariant" },
+          "primary": { "$ref": "#/components/schemas/IdentityPrimary" },
+          "relationships": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/IdentityRelationship" } },
+          "relationshipCoverage": { "$ref": "#/components/schemas/RelationshipCoverage" },
+          "proposalCoverage": { "$ref": "#/components/schemas/ProposalCoverage" },
+          "proposals": { "type": "array", "maxItems": 500, "items": { "$ref": "#/components/schemas/IdentityProposal" } },
+          "limitations": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": { "description": "Invalid, ambiguous, or unsupported request shape", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "NotFound": { "description": "The requested retained resource was not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "GetOnly": { "description": "Method not allowed; inspect the Allow header", "headers": { "Allow": { "schema": { "const": "GET" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "PostOnly": { "description": "Method not allowed; inspect the Allow header", "headers": { "Allow": { "schema": { "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "RateLimited": {
+        "description": "Process-global per-instance fixed-window quota exceeded; limits reset on restart and are not coordinated across replicas",
+        "headers": {
+          "Retry-After": { "description": "Delta seconds before another attempt.", "schema": { "type": "integer", "minimum": 1 } },
+          "X-RateLimit-Limit": { "$ref": "#/components/headers/RateLimitLimit" },
+          "X-RateLimit-Remaining": { "$ref": "#/components/headers/RateLimitRemaining" },
+          "X-RateLimit-Reset": { "$ref": "#/components/headers/RateLimitReset" }
+        },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "PayloadTooLarge": { "description": "JSON request body exceeded 2048 bytes", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "UnsupportedMediaType": { "description": "Content-Type must be application/json", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "StreamCapacity": { "description": "The process-local SSE connection cap is full", "headers": { "Retry-After": { "description": "Delta seconds before a reconnect attempt.", "schema": { "type": "integer", "minimum": 1 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  }
+}

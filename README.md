@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.10.2**
+Current release: **v0.10.3**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, reports bounded anonymous early-actor observations, and resolves exact mints through a review-gated canonical identity graph without presenting an uncalibrated probability or trade signal.
 
@@ -14,7 +14,7 @@ This repository is configured for Railway with a health check and Railway-provid
 2. Keep `PUMP_MODE=demo` for the safe visual demo, or set `PUMP_MODE=live` to capture every new launch and migration observed on the public PumpPortal feed.
 3. Generate a public domain in the service's **Networking** settings.
 
-Optional variables are documented in `.env.example`. Railway's local filesystem is ephemeral; attach a volume at `/app/data` and set `DB_PATH=/app/data/pump-war-room.db` if you want SQLite history to survive redeploys. `VAULT_PATH` is only for a local demo/operator process; public live mode deliberately disables every filesystem-writing vault export.
+Optional variables are documented in `.env.example`. Railway's local filesystem is ephemeral; attach a volume at `/app/data` and set `DB_PATH=/app/data/pump-war-room.db` if you want SQLite history to survive redeploys. Filesystem-writing HTTP vault exports are disabled in every mode.
 
 ## Database backup and restore verification
 
@@ -95,7 +95,13 @@ Evidence classes are explicit: `on-chain-finalized`, `provider-observed`, `feed-
 
 ### Canonical Identity Graph
 
-v0.10.2 includes the schema 902 reviewed-identity release and its v0.10.1 durability cap. It also tightens the public dashboard layout, adds persistent section navigation, collapsible method disclosures, and a dedicated `/help.html` tutorial and FAQ. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
+v0.10.3 includes the schema 902 reviewed-identity release and its v0.10.1 durability cap. It also retains the v0.10.2 dashboard layout, persistent section navigation, collapsible method disclosures, and dedicated `/help.html` tutorial and FAQ. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
+
+Entity intelligence is additive and denominator-preserving. Only reviewed variants can group, while every pending or unreviewed proposal remains an exact-mint singleton with no ranking impact. Each entity trend has at most one exact-mint contributor: a grouped entity requires the explicitly reviewed primary when observed or the sole reviewed registered variant when observed; an unreviewed singleton contributes only its own exact mint and remains separate. Ambiguous multi-variant entities with no primary withhold trend metrics; variant volume is never summed and a high-volume clone is never selected merely because it is high volume. Each envelope publishes included and excluded exact mints, missing narrative/lifecycle/volume counts, the representative-selection reason, and explicit proposal/ranking boundaries. The dashboard and analyst use these entity envelopes while legacy mint-level leaderboard, outcome, and snapshot records remain intact.
+
+The unauthenticated read-only identity API now has stable entity-ID cursor pages, strict decoded-32-byte mint validation, process-global per-instance fixed-window limits, standard limit headers, aggregate health counters, and no external API keys. See `/api.html` or the same-origin OpenAPI 3.1 document at `/api/v1/openapi.json`. Snapshot, list, resolver, and local-analyst attempts use separate shared buckets. Limits reset on process restart and do not coordinate across replicas; they are service abuse bounds rather than authentication or per-user quotas.
+
+The reviewed projection publishes at most 500 whole entities, 2,000 variants, and 5,000 semantic-distinct relationships. It never splits an entity to fit a cap, never relabels a known reviewed mint as an unreviewed singleton, and exposes eligible, published, omitted, integrity-omission, and observed-mint omission counts. Current observed reviewed owners are prioritized. The resolver independently caps semantic-distinct incident relationships at 100 and reports included/eligible coverage. Legacy malformed identity or token rows are quarantined from public projections and surfaced as integrity counters; new writes reject them transactionally.
 
 The bounded proposal worker compares metadata already present in the authorized local feed. Exact normalized name/symbol or narrative matches become deterministic, locally derived proposals; they never mutate reviewed facts, select a primary mint, affect ranking, or appear as verified edges. Each refresh and the persisted pending backlog are capped at 500; stale pending rows are pruned while accepted, rejected, and superseded review records remain retained. Public surfaces are read-only. Operator review requires direct local access to an existing SQLite database:
 
@@ -178,19 +184,21 @@ The [v0.9 connector plan](V0.9_CONNECTOR_PLAN.md) records each source's permissi
 - Optional restart-safe, rate-limited Telegram Bot API delivery with aggregate-only public health; no bot credentials or destination identifiers are persisted
 - Browser-local watchlists and saved URL filter lenses with bounded JSON portability; no anonymous server-side or cross-device account claim
 - Deep-linkable retained coin dossiers, typed cursor timelines, and explicit 2–4 mint evidence comparison
-- Frozen closed-UTC daily and weekly measured briefs with current/prior denominators, suppression gates, unmeasured feed coverage, and local demo/operator Markdown export under `vault/`
+- Frozen closed-UTC daily and weekly measured briefs with current/prior denominators, suppression gates, and unmeasured feed coverage
 - Mobile and desktop command-center UI
 - Read-only deep links from every token dossier to Pump.fun, Dex Screener, and Fomo
 - SSE browser updates and JSON health/snapshot APIs
-- Coalesced single-flight snapshot refreshes plus gzip negotiation for large JSON responses; live vault-writing routes and controls are disabled
+- Coalesced browser refreshes plus a process-local immutable five-second computed-snapshot cache and gzip negotiation for large JSON responses; filesystem-writing HTTP vault routes and controls are disabled in every mode
 
 ## API
 
 - `GET /api/health`
 - `GET /api/snapshot`
+- `GET /api/v1/entities?limit=20&cursor=<opaque-cursor>` (`limit` 1–100)
 - `GET /api/v1/entities/resolve?mint=<mint>`
+- `GET /api/v1/openapi.json` and human-readable `/api.html`
 
-The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `actionIntelligence`, `earlyActorIntelligence`, and aggregate `identityRegistry` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability. Canonical resolution returns the exact mint, entity/variant, primary-selection reason, reviewed relationships, separate pending proposals, and explicit limitations. Action intelligence exposes browser-local preference limits, materiality rules, aggregate outbox health, timeline/compare contracts, and the frozen daily/weekly models without secrets or raw provider histories. Early-actor intelligence exposes only aggregate prospective-cohort acquisition state and gated per-mint summaries; there is no actor lookup endpoint.
+The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `actionIntelligence`, `earlyActorIntelligence`, aggregate `identityRegistry`, and additive `entityIntelligence` envelopes. In live mode the leaderboard admits only validated PumpPortal mints and caps results at 100. Its numeric score is `null` when a row has no substantive momentum or buyer-breadth input, with `orderingBasis` disclosing recency fallback. Outcome records expose provider, fixed pool, baseline/target timestamps, staleness, returns, missing reasons, aggregate evidence thresholds, cohort summaries, retention policy, and the data-quality disclaimer. Returns remain `unavailable` until timely completed provider observations exist; the service never substitutes missing prices or inferred returns. Risk/identity rows expose normalized factor values, evidence classes, source fields, bounded failure states, duplicate counts, scope, and limitations without public fingerprints or a composite probability. Canonical resolution returns the exact mint, entity/variant, primary-selection reason, reviewed relationships, separate pending proposals, and explicit limitations. Entity intelligence discloses exact-mint denominators and a no-sum contributor policy without changing mint ranking. Action intelligence exposes browser-local preference limits, materiality rules, aggregate outbox health, timeline/compare contracts, and the frozen daily/weekly models without secrets or raw provider histories. Early-actor intelligence exposes only aggregate prospective-cohort acquisition state and gated per-mint summaries; there is no actor lookup endpoint.
 - `GET /api/stream` (server-sent events)
 - `GET /api/coins/:mint`
 - `GET /api/coins/:mint/timeline?limit=50&before=<cursor>` (`limit` 1–200)
@@ -198,18 +206,21 @@ The snapshot includes versioned `leaderboard`, `outcomes`, `riskIntelligence`, `
 - `GET /api/briefs/daily`
 - `GET /api/briefs/weekly`
 - `POST /api/agent/chat` with JSON `{ "question": "What is moving?" }`
-- `POST /api/export/daily` (local demo/operator mode only)
-- `POST /api/export/weekly` (local demo/operator mode only)
-- `POST /api/export/coin/:mint` (local demo/operator mode only)
+Legacy `POST /api/export/daily`, `/api/export/weekly`, and `/api/export/coin` requests fail closed with HTTP `403` and the bounded JSON code `vault-export-disabled` before snapshot lookup or vault access in every mode. They are deliberately excluded from the public OpenAPI contract.
 
-Vault exports are filesystem-writing operator actions, not public live API capabilities. In `PUMP_MODE=live`, all three routes fail closed with HTTP `403` and the bounded JSON code `vault-export-disabled` before snapshot lookup or vault access. Demo-mode success responses identify their `local-demo-operator-vault` scope without returning filesystem paths. Do not expose a demo-mode service publicly merely to make these operator actions remote; this patch deliberately adds no authentication claim.
+Trusted local operators can still render retained public coin data or a frozen measured brief without an HTTP write surface:
+
+```bash
+npm run vault:export -- coin --database ./data/pump-war-room.db --vault ./vault --mint SOLANA_MINT
+npm run vault:export -- brief --database ./data/pump-war-room.db --vault ./vault --period daily
+```
 
 ## Verify
 
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.2 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.3 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

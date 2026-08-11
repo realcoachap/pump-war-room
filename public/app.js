@@ -15,7 +15,7 @@ import {
 
 void PREFERENCE_KEY;
 
-let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, identityRegistry: {}, publicDelivery: { vaultExports: "disabled" }, mode: "live", feedStatus: "connecting" };
+let state = { tokens: [], alerts: [], callouts: [], narratives: [], stats: {}, leaderboard: { top100: [] }, outcomes: {}, riskIntelligence: {}, actionIntelligence: {}, earlyActorIntelligence: {}, identityRegistry: {}, entityIntelligence: {}, publicDelivery: { vaultExports: "disabled" }, mode: "live", feedStatus: "connecting" };
 let dashboardStreamState = "connecting";
 let snapshotFailed = false;
 let caesarRequestPending = false;
@@ -708,17 +708,44 @@ function renderEarlyActors() {
 }
 
 function narrativeRows() {
+  const entities = Array.isArray(state.entityIntelligence?.entities) ? state.entityIntelligence.entities : [];
+  if (entities.length) {
+    return Object.values(entities.reduce((rows, entity) => {
+      const included = Array.isArray(entity.variants?.included) ? entity.variants.included : [];
+      const contributor = included.find(({ mint }) => mint === entity.trend?.contributingMint) || null;
+      const values = Array.isArray(entity.narratives?.values) && entity.narratives.values.length
+        ? entity.narratives.values : [{ name: "Unclassified", mintCount: 0 }];
+      for (const value of values) {
+        const name = value?.name || "Unclassified";
+        const row = rows[name] ||= { name, entities: 0, narrativeMints: 0, observedMints: 0, registeredMints: 0, volume: null, volumeEvidenceCount: 0 };
+        row.entities += 1;
+        row.narrativeMints += number(value?.mintCount);
+        row.observedMints += number(entity.variants?.observedMintCount);
+        row.registeredMints += number(entity.variants?.registeredMintCount);
+        if ((contributor?.narrative || "Unclassified") === name
+          && hasNumber(entity.trend?.volume5m) && number(entity.trend.volume5m) >= 0) {
+          row.volume = (row.volume ?? 0) + number(entity.trend.volume5m);
+          row.volumeEvidenceCount++;
+        }
+      }
+      return rows;
+    }, Object.create(null))).sort((a, b) => b.volumeEvidenceCount - a.volumeEvidenceCount
+      || number(b.volume) - number(a.volume) || b.narrativeMints - a.narrativeMints || b.entities - a.entities || a.name.localeCompare(b.name));
+  }
   return Object.values(rankedTokens().reduce((rows, token) => {
     const name = token.narrative || "Unclassified";
-    const row = rows[name] ||= { name, coins: 0, volume: null, volumeEvidenceCount: 0 };
-    row.coins += 1;
+    const row = rows[name] ||= { name, entities: 0, narrativeMints: 0, observedMints: 0, registeredMints: 0, volume: null, volumeEvidenceCount: 0 };
+    row.entities += 1;
+    row.narrativeMints += 1;
+    row.observedMints += 1;
+    row.registeredMints += 1;
     if (hasNumber(token.volume5m) && number(token.volume5m) >= 0) {
       row.volume = (row.volume ?? 0) + number(token.volume5m);
       row.volumeEvidenceCount++;
     }
     return rows;
-  }, {})).sort((a, b) => b.volumeEvidenceCount - a.volumeEvidenceCount
-    || number(b.volume) - number(a.volume) || b.coins - a.coins || a.name.localeCompare(b.name));
+  }, Object.create(null))).sort((a, b) => b.volumeEvidenceCount - a.volumeEvidenceCount
+    || number(b.volume) - number(a.volume) || b.entities - a.entities || a.name.localeCompare(b.name));
 }
 
 function renderNarratives() {
@@ -733,7 +760,7 @@ function renderNarratives() {
     const measured = narrative.volumeEvidenceCount > 0;
     const volume = measured ? money(narrative.volume) : "volume —";
     const width = measured ? Math.max(5, narrative.volume / max * 100) : 0;
-    return `<div class="narrative"><div class="narrative-top"><span>${esc(narrative.name)}</span><span>${narrative.coins} coins · ${volume}</span></div><div class="bar"><i style="width:${width}%"></i></div></div>`;
+    return `<div class="narrative"><div class="narrative-top"><span>${esc(narrative.name)}</span><span>${nf.format(number(narrative.entities))} entities · ${nf.format(number(narrative.narrativeMints))} labeled mints · ${nf.format(number(narrative.observedMints))}/${nf.format(number(narrative.registeredMints))} envelope coverage · ${nf.format(number(narrative.volumeEvidenceCount))}/${nf.format(number(narrative.entities))} entity trend volumes · ${volume}</span></div><div class="bar"><i style="width:${width}%"></i></div></div>`;
   }).join("");
 }
 
@@ -946,7 +973,7 @@ function render() {
 }
 
 function vaultExportsEnabled() {
-  return state.mode === "demo" && state.publicDelivery?.vaultExports === "local-demo-only";
+  return false;
 }
 
 async function refresh({ signal } = {}) {
@@ -967,7 +994,8 @@ async function refresh({ signal } = {}) {
       riskIntelligence: snapshot.riskIntelligence && typeof snapshot.riskIntelligence === "object" ? snapshot.riskIntelligence : {},
       actionIntelligence: snapshot.actionIntelligence && typeof snapshot.actionIntelligence === "object" ? snapshot.actionIntelligence : {},
       earlyActorIntelligence: snapshot.earlyActorIntelligence && typeof snapshot.earlyActorIntelligence === "object" ? snapshot.earlyActorIntelligence : {},
-      identityRegistry: snapshot.identityRegistry && typeof snapshot.identityRegistry === "object" ? snapshot.identityRegistry : {}
+      identityRegistry: snapshot.identityRegistry && typeof snapshot.identityRegistry === "object" ? snapshot.identityRegistry : {},
+      entityIntelligence: snapshot.entityIntelligence && typeof snapshot.entityIntelligence === "object" ? snapshot.entityIntelligence : {}
     };
     snapshotFailed = false;
     render();
@@ -1018,14 +1046,43 @@ function renderIdentityRegistry() {
   const registry = state.identityRegistry || {};
   const proposals = registry.proposalStatusCounts || {};
   const cards = [
-    ["REVIEWED ENTITIES", number(registry.entityCount), "stable project or meme identities"],
-    ["REGISTERED MINTS", number(registry.variantCount), "exact official / migration / relaunch variants"],
-    ["REVIEWED EDGES", number(registry.relationshipCount), "typed cross-mint relationships"],
+    ["REVIEWED ENTITIES", number(registry.verifiedEntityCount), "verified project or meme identities"],
+    ["REVIEWED MINTS", number(registry.verifiedVariantCount), "verified official / migration / relaunch variants"],
+    ["REVIEWED EDGES", number(registry.verifiedRelationshipCount), "verified typed cross-mint relationships"],
     ["PENDING PROPOSALS", number(proposals.pending), "locally derived; never facts without review"],
     ["DECISIONS", number(registry.decisionCount), "append-only review history"]
   ];
-  target.innerHTML = cards.map(([label, value, note]) => `<article><span>${label}</span><strong>${nf.format(value)}</strong><small>${note}</small></article>`).join("");
+  const intelligence = state.entityIntelligence && typeof state.entityIntelligence === "object" ? state.entityIntelligence : {};
+  const projection = intelligence.registryProjection || registry.projection || {};
+  const projectionOmittedReviewed = Array.isArray(intelligence.projectionOmittedReviewed) ? intelligence.projectionOmittedReviewed.length : 0;
+  const projectionOmitted = Object.values(projection.omittedCounts || {}).reduce((sum, value) => sum + number(value), 0);
+  const integrityOmitted = Object.values(projection.integrityOmittedCounts || {}).reduce((sum, value) => sum + number(value), 0);
+  const projectionWarning = projection.truncated || projectionOmittedReviewed || integrityOmitted
+    ? `<div class="identity-registry-warning"><b>PUBLIC PROJECTION INCOMPLETE</b><span>${nf.format(projectionOmitted)} bounded registry rows omitted · ${nf.format(projectionOmittedReviewed)} observed reviewed mints omitted · ${nf.format(integrityOmitted)} integrity omissions · exact-mint singletons are not substituted</span></div>` : "";
+  target.innerHTML = cards.map(([label, value, note]) => `<article><span>${label}</span><strong>${nf.format(value)}</strong><small>${note}</small></article>`).join("") + projectionWarning;
   $("#identity-registry-status").textContent = registry.automatedVerification === false ? "REVIEW-GATED" : "REGISTRY DEGRADED";
+  const trending = Array.isArray(intelligence.trending) ? intelligence.trending.slice(0, 5) : [];
+  const trendTarget = $("#entity-trends");
+  if (!trendTarget) return;
+  if (!trending.length) {
+    trendTarget.innerHTML = '<div class="entity-trends-head"><span class="kicker">ENTITY TREND // ONE MINT CONTRIBUTION MAX</span><small>No observed entity trend is available. Missing registry variants remain explicit.</small></div><div class="action-empty">Waiting for denominator-safe observed-mint evidence.</div>';
+    return;
+  }
+  trendTarget.innerHTML = `<div class="entity-trends-head"><span class="kicker">ENTITY TREND // ONE MINT CONTRIBUTION MAX</span><small>${nf.format(number(intelligence.denominators?.observedMintCount))} observed mints · unreviewed proposals excluded · <a href="/api.html">API contract</a></small></div><div class="entity-trend-list">${trending.map((entity) => {
+    const trend = entity.trend || {};
+    const variants = entity.variants || {};
+    const included = Array.isArray(variants.included) ? variants.included : [];
+    const contributor = included.find(({ mint }) => mint === trend.contributingMint) || null;
+    const narrative = contributor?.narrative || "Contributor narrative unavailable";
+    const basis = trend.orderingBasis === "radar-evidence-score" ? "RADAR EVIDENCE SCORE"
+      : trend.orderingBasis === "five-minute-volume" ? "5M VOLUME"
+        : trend.orderingBasis === "momentum" ? "MOMENTUM" : "RECENCY FALLBACK";
+    const basisValue = trend.orderingBasis === "radar-evidence-score" ? Number(trend.radarScore).toFixed(1)
+      : trend.orderingBasis === "five-minute-volume" ? money(trend.volume5m)
+        : trend.orderingBasis === "momentum" ? Number(trend.momentum).toFixed(1) : ago(contributor?.tokenObservedAt);
+    return `<button type="button" class="entity-trend-row" data-entity-mint="${esc(trend.contributingMint || "")}" ${trend.contributingMint ? "" : "disabled"}><span class="entity-trend-rank">${number(entity.trendRank)}</span><span><b>${esc(entity.displayName || entity.entityId || "Unresolved entity")}</b><small>${esc(entity.reviewState === "verified" ? "REVIEWED ENTITY" : "EXACT-MINT SINGLETON")} · ${esc(narrative)}</small></span><span><b>${esc(basisValue)}</b><small>${esc(basis)} · ${esc(shortMint(trend.contributingMint || ""))}</small></span><span><b>${nf.format(number(variants.observedMintCount))}/${nf.format(number(variants.registeredMintCount))}</b><small>OBSERVED MINTS</small></span></button>`;
+  }).join("")}</div><p class="entity-trend-note">Each row names its ordering evidence; RECENCY FALLBACK is launch-observation recency, not measured market momentum. Each trend has at most one exact-mint contributor; grouped entities require a reviewed primary or sole reviewed variant, unreviewed singletons remain separate, variants are never summed, and the exact-mint leaderboard remains unchanged.</p>`;
+  trendTarget.querySelectorAll("[data-entity-mint]").forEach((button) => button.addEventListener("click", () => void openCoin(button.dataset.entityMint)));
 }
 
 function identityDetail(identity) {
@@ -1033,12 +1090,29 @@ function identityDetail(identity) {
   const entity = identity.entity || {};
   const primary = identity.primary || {};
   const relationships = Array.isArray(identity.relationships) ? identity.relationships : [];
+  const relationshipCoverage = identity.relationshipCoverage && typeof identity.relationshipCoverage === "object"
+    ? identity.relationshipCoverage : {
+      eligibleCount: relationships.length, publishableEligibleCount: relationships.length, includedCount: relationships.length,
+      limitOmittedCount: 0, projectionOmittedCount: 0, integrityOmittedCount: 0, truncated: false, limit: relationships.length
+    };
   const proposals = Array.isArray(identity.proposals) ? identity.proposals : [];
+  const proposalCoverage = identity.proposalCoverage && typeof identity.proposalCoverage === "object"
+    ? identity.proposalCoverage : { eligibleCount: proposals.length, includedCount: proposals.length, omittedInvalidCount: 0 };
   const edge = (item, proposed = false) => {
     const other = item.fromMint === identity.mint ? item.toMint : item.fromMint;
     return `<div class="identity-edge ${proposed ? "proposed" : "reviewed"}"><span><b>${esc(item.kind || "unresolved")}</b><small>${proposed ? "PROPOSED · NOT A FACT" : esc(item.reviewState || "reviewed").toUpperCase()}</small></span><code>${esc(shortMint(other))}</code><em>${esc(item.evidenceClass || "unavailable")}</em></div>`;
   };
-  return `<section class="identity-detail"><div class="identity-detail-head"><div><span class="kicker">CANONICAL IDENTITY // ${esc(identity.resolvedBy || "unresolved")}</span><h3>${esc(entity.displayName || "Unresolved exact mint")}</h3></div><span class="identity-review-state">${esc(entity.reviewState || "proposed").toUpperCase()}</span></div><div class="identity-detail-grid"><div><b>ENTITY</b><strong>${esc(entity.entityId || `mint:${identity.mint}`)}</strong></div><div><b>PRIMARY MINT</b><strong>${primary.mint ? esc(shortMint(primary.mint)) : "WITHHELD"}</strong><small>${esc(primary.selectionReason || "unavailable")}</small></div><div><b>REVIEWED EDGES</b><strong>${relationships.length}</strong></div><div><b>OPEN PROPOSALS</b><strong>${proposals.length}</strong></div></div><div class="identity-edges">${relationships.map((item) => edge(item)).join("")}${proposals.map((item) => edge(item, true)).join("") || '<div class="action-empty">No reviewed or proposed cross-mint edges for this exact mint.</div>'}</div><p>${esc(primary.meaning || "Identity resolution only; not a trade recommendation.")}</p></section>`;
+  const edgeOmissions = [
+    ["LIMIT", number(relationshipCoverage.limitOmittedCount)],
+    ["PROJECTION", number(relationshipCoverage.projectionOmittedCount)],
+    ["INTEGRITY", number(relationshipCoverage.integrityOmittedCount)]
+  ].filter(([, count]) => count > 0);
+  const edgeCoverageState = edgeOmissions.length
+    ? `INCOMPLETE · ${edgeOmissions.map(([kind, count]) => `${count} ${kind}`).join(" · ")} OMITTED`
+    : "COMPLETE FOR THIS QUERY";
+  const proposalCoverageState = number(proposalCoverage.omittedInvalidCount) > 0
+    ? `${number(proposalCoverage.omittedInvalidCount)} INVALID OMITTED` : "VALIDATED FOR DISPLAY";
+  return `<section class="identity-detail"><div class="identity-detail-head"><div><span class="kicker">CANONICAL IDENTITY // ${esc(identity.resolvedBy || "unresolved")}</span><h3>${esc(entity.displayName || "Unresolved exact mint")}</h3></div><span class="identity-review-state">${esc(entity.reviewState || "proposed").toUpperCase()}</span></div><div class="identity-detail-grid"><div><b>ENTITY</b><strong>${esc(entity.entityId || `~mint:${identity.mint}`)}</strong></div><div><b>PRIMARY MINT</b><strong>${primary.mint ? esc(shortMint(primary.mint)) : "WITHHELD"}</strong><small>${esc(primary.selectionReason || "unavailable")}</small></div><div><b>REVIEWED EDGES</b><strong>${number(relationshipCoverage.includedCount)}/${number(relationshipCoverage.eligibleCount)}</strong><small>${esc(edgeCoverageState)}</small></div><div><b>OPEN PROPOSALS</b><strong>${number(proposalCoverage.includedCount)}/${number(proposalCoverage.eligibleCount)}</strong><small>${esc(proposalCoverageState)}</small></div></div><div class="identity-edges">${relationships.map((item) => edge(item)).join("")}${proposals.map((item) => edge(item, true)).join("") || '<div class="action-empty">No published reviewed or proposed cross-mint edges for this exact mint. Check the edge and proposal coverage denominators above.</div>'}</div><p>${esc(primary.meaning || "Identity resolution only; not a trade recommendation.")}</p></section>`;
 }
 
 function openToken(mint, dossier = null) {

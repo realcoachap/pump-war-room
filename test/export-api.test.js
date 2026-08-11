@@ -90,7 +90,7 @@ async function postJson(baseUrl, pathname) {
   return { response, body: await response.json() };
 }
 
-function assertLiveDisabled(result) {
+function assertHttpDisabled(result, mode) {
   assert.equal(result.response.status, 403);
   assert.deepEqual(Object.keys(result.body).sort(), ["code", "error", "mode", "ok", "requestId"]);
   assert.deepEqual({
@@ -101,8 +101,8 @@ function assertLiveDisabled(result) {
   }, {
     ok: false,
     code: "vault-export-disabled",
-    error: "Vault export is disabled in live mode",
-    mode: "live"
+    error: "Filesystem-writing HTTP vault export is disabled",
+    mode
   });
   assert.match(result.body.requestId, /^[0-9a-f-]{36}$/);
 }
@@ -126,7 +126,7 @@ test("live export routes fail closed before creating or overwriting vault files"
     "/api/export/coin/not-a-solana-mint"
   ];
 
-  for (const route of routes) assertLiveDisabled(await postJson(baseUrl, route));
+  for (const route of routes) assertHttpDisabled(await postJson(baseUrl, route), "live");
   assert.equal(existsSync(vaultPath), false, "live export requests must not create the configured vault root");
 
   const daily = await (await fetch(`${baseUrl}/api/briefs/daily`)).json();
@@ -142,7 +142,7 @@ test("live export routes fail closed before creating or overwriting vault files"
     writeFileSync(target, `sentinel-${index}`, "utf8");
   }
 
-  for (const route of routes) assertLiveDisabled(await postJson(baseUrl, route));
+  for (const route of routes) assertHttpDisabled(await postJson(baseUrl, route), "live");
   for (const [index, target] of targets.entries()) {
     assert.equal(readFileSync(target, "utf8"), `sentinel-${index}`, `${path.basename(target)} must not be overwritten`);
   }
@@ -152,27 +152,14 @@ test("live export routes fail closed before creating or overwriting vault files"
   assert.deepEqual(readdirSync(path.join(vaultPath, "Narratives")), ["Other.md"]);
 });
 
-test("demo mode keeps explicit local operator vault exports", async (t) => {
+test("demo mode also fails closed on filesystem-writing HTTP exports", async (t) => {
   const { baseUrl, vaultPath } = await startServer(t, "demo");
   const snapshot = await (await fetch(`${baseUrl}/api/snapshot`)).json();
   const mint = snapshot.tokens[0].mint;
+  assert.equal(snapshot.publicDelivery.vaultExports, "disabled");
 
-  for (const [route, expected] of [
-    ["/api/export/daily", { period: "daily" }],
-    ["/api/export/weekly", { period: "weekly" }],
-    [`/api/export/coin/${mint}`, { resource: "coin" }]
-  ]) {
-    const { response, body } = await postJson(baseUrl, route);
-    assert.equal(response.status, 200);
-    assert.equal(body.ok, true);
-    assert.equal(body.mode, "demo");
-    assert.equal(body.scope, "local-demo-operator-vault");
-    assert.match(body.requestId, /^[0-9a-f-]{36}$/);
-    assert.deepEqual(Object.fromEntries(Object.keys(expected).map((key) => [key, body[key]])), expected);
+  for (const route of ["/api/export/daily", "/api/export/weekly", `/api/export/coin/${mint}`]) {
+    assertHttpDisabled(await postJson(baseUrl, route), "demo");
   }
-
-  assert.ok(readdirSync(path.join(vaultPath, "Daily Briefs")).some((file) => file.endsWith("Pump Daily Brief.md")));
-  assert.ok(readdirSync(path.join(vaultPath, "Weekly Briefs")).some((file) => file.endsWith("Pump Weekly Brief.md")));
-  assert.ok(readdirSync(path.join(vaultPath, "Coins")).some((file) => file.endsWith(".md")));
-  assert.ok(readdirSync(path.join(vaultPath, "Narratives")).some((file) => file.endsWith(".md")));
+  assert.equal(existsSync(vaultPath), false);
 });

@@ -7,6 +7,8 @@ import { CanonicalRegistry, validateCanonicalEntity, validateCanonicalRelationsh
 
 export const STORE_SCHEMA_VERSION = 902;
 export const IDENTITY_PENDING_PROPOSAL_LIMIT = 500;
+export const IDENTITY_REGISTRY_CAPACITY = Object.freeze({ entities: 500, variants: 2_000, relationships: 5_000 });
+export const IDENTITY_RESOLVER_RELATIONSHIP_LIMIT = 100;
 const LEGACY_ACTOR_SCHEMA_VERSION = 900;
 export const ACTOR_OBSERVATION_MAX_RETENTION_MS = 72 * 60 * 60 * 1_000;
 
@@ -95,6 +97,10 @@ const MATERIAL_ALERT_KINDS = Object.freeze([
   "score-rise", "score-drop", "risk-concentration", "risk-developer-holding",
   "risk-identity-reuse", "risk-creator-history", "migration-observed"
 ]);
+const canonicalTokenRowPredicate = (alias = "tokens") => `(CASE WHEN json_valid(${alias}.payload) THEN
+  json_type(${alias}.payload,'$.mint')='text'
+  AND json_extract(${alias}.payload,'$.mint')=${alias}.mint
+  AND is_canonical_solana_address(${alias}.mint)=1 ELSE 0 END)`;
 const RFC3339_MILLIS_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z";
 const canonicalTimestampSql = (column) => `(${column} GLOB '${RFC3339_MILLIS_GLOB}'
   AND strftime('%Y-%m-%dT%H:%M:%fZ',${column})=${column})`;
@@ -714,8 +720,30 @@ function identityDecision(value, { subjectType, subjectId, defaultEvidence } = {
   };
 }
 
+function requireEntityDecisionState(entity, decision) {
+  if (decision.decision === "accept") {
+    if (entity.reviewState !== "verified" || entity.variants.some(({ reviewState }) => reviewState !== "verified")) {
+      throw new TypeError("accepted identity entities and variants must be verified");
+    }
+    return;
+  }
+  if (entity.reviewState !== "rejected" || entity.primaryMint !== null
+    || entity.variants.some(({ reviewState }) => reviewState !== "rejected")) {
+    throw new TypeError("rejected, split, or superseded identity entities must be fully rejected with no primary mint");
+  }
+}
+
+function requireRelationshipDecisionState(relationship, decision) {
+  const expected = decision.decision === "accept" ? "verified" : "rejected";
+  if (relationship.reviewState !== expected) {
+    throw new TypeError(`${decision.decision} identity relationships must be ${expected}`);
+  }
+}
+
 function rowIdentityProposal(row) {
   if (!row) return null;
+  let evidence = null;
+  try { evidence = JSON.parse(row.evidence); } catch {}
   return {
     proposalKey: row.proposal_key,
     fromMint: row.from_mint,
@@ -723,11 +751,28 @@ function rowIdentityProposal(row) {
     kind: row.kind,
     evidenceClass: row.evidence_class,
     methodVersion: row.method_version,
-    evidence: JSON.parse(row.evidence),
+    evidence,
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+export function isPublishableIdentityProposal(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !isCanonicalSolanaAddress(value.fromMint) || !isCanonicalSolanaAddress(value.toMint)
+    || value.fromMint === value.toMint
+    || !["same-narrative", "name-collision"].includes(value.kind)
+    || value.evidenceClass !== "locally-derived"
+    || typeof value.methodVersion !== "string" || value.methodVersion.length < 1 || value.methodVersion.length > 80
+    || !/^[a-z0-9][a-z0-9._:-]*$/.test(value.methodVersion)) return false;
+  try { identityEvidence(value.evidence, "identity proposal evidence"); }
+  catch { return false; }
+  for (const candidate of [value.createdAt, value.updatedAt].filter((entry) => entry !== undefined)) {
+    const parsed = typeof candidate === "string" ? Date.parse(candidate) : NaN;
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== candidate) return false;
+  }
+  return true;
 }
 
 export class Store {
@@ -735,6 +780,8 @@ export class Store {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     this.dbPath = dbPath;
     this.db = new DatabaseSync(dbPath);
+    this.db.function("is_canonical_solana_address", { deterministic: true, directOnly: true },
+      (value) => isCanonicalSolanaAddress(value) ? 1 : 0);
     restrictDatabasePermissions(dbPath);
     try {
       this.db.exec("PRAGMA journal_mode = WAL");
@@ -1068,18 +1115,18 @@ export class Store {
       ORDER BY risk_identity_enrichment.next_attempt_at ASC,risk_identity_enrichment.mint ASC LIMIT ?`);
     this.sourceCountStmts = {
       tokens: this.db.prepare(`SELECT count(*) AS count FROM tokens
-        WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?`),
+        WHERE ${canonicalTokenRowPredicate()} AND json_extract(payload, '$.source') = ?`),
       events: this.db.prepare(`SELECT count(*) AS count FROM events
         WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?`),
       alerts: this.db.prepare(`SELECT count(*) AS count FROM alerts
         WHERE mint IN (
           SELECT mint FROM tokens
-          WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?
+          WHERE ${canonicalTokenRowPredicate()} AND json_extract(payload, '$.source') = ?
         )`)
     };
     this.sourceTokenCountSinceStmt = this.db.prepare(`SELECT count(*) AS count FROM tokens
       WHERE created_at >= ?
-        AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = ?`);
+        AND ${canonicalTokenRowPredicate()} AND json_extract(payload, '$.source') = ?`);
     this.deleteDemoStmts = {
       alerts: this.db.prepare(`DELETE FROM alerts
         WHERE mint IN (
@@ -1091,6 +1138,11 @@ export class Store {
       tokens: this.db.prepare(`DELETE FROM tokens
         WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.source') END = 'demo'`)
     };
+    this.identityRegistrySnapshotCache = new Map();
+    this.identityResolverSnapshotCache = new Map();
+    this.identityRegistryCoverageCache = null;
+    this.tokenIntegrityCoverageCache = new Map();
+    this.cacheDataVersion = Number(this.db.prepare("PRAGMA data_version").get().data_version);
   }
   upsertToken(token) {
     const now = new Date().toISOString();
@@ -1101,8 +1153,8 @@ export class Store {
     this.eventStmt.run(kind, payload.mint || null, JSON.stringify(payload), new Date().toISOString());
   }
   upsertTokenWithAlerts(token, { eventKind, alerts = [], queueTelegram = false } = {}) {
-    if (!token || typeof token !== "object" || Array.isArray(token) || typeof token.mint !== "string") {
-      throw new TypeError("token must be an object with a mint");
+    if (!token || typeof token !== "object" || Array.isArray(token) || !isCanonicalSolanaAddress(token.mint)) {
+      throw new TypeError("token must be an object with a canonical 32-byte Solana mint");
     }
     const normalizedEventKind = text(eventKind, "event kind", { max: 64, code: true }).toLowerCase();
     if (!Array.isArray(alerts) || alerts.length > 20) throw new RangeError("alerts must be an array of at most 20 entries");
@@ -1499,11 +1551,229 @@ export class Store {
       throw new Error(`Provider purge requires exclusive database access and verified SQLite cleanup: ${error.message}`, { cause: error });
     }
   }
-  identityRegistrySnapshot() {
-    const entityRows = this.db.prepare(`SELECT entity_id,display_name,symbol,review_state,primary_mint,created_at,updated_at
-      FROM identity_entities WHERE review_state<>'rejected' ORDER BY entity_id`).all();
-    const variantRows = this.db.prepare(`SELECT mint,entity_id,kind,review_state,evidence_class,observed_at,created_at,updated_at
-      FROM identity_variants WHERE review_state<>'rejected' ORDER BY entity_id,mint`).all();
+  #publishedIdentityCounts() {
+    const entities = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_entities e
+      WHERE e.review_state='verified' AND EXISTS (
+        SELECT 1 FROM identity_variants v WHERE v.entity_id=e.entity_id AND v.review_state='verified'
+      ) AND (
+        SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+      )='accept'`).get().count);
+    const variants = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_variants v
+      JOIN identity_entities e ON e.entity_id=v.entity_id
+      WHERE v.review_state<>'rejected' AND e.review_state='verified' AND (
+        SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+      )='accept'`).get().count);
+    const relationships = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_relationships r
+      CROSS JOIN identity_variants vf ON vf.mint=r.from_mint
+      CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+      CROSS JOIN identity_variants vt ON vt.mint=r.to_mint
+      CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+      WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+        AND ef.review_state='verified' AND et.review_state='verified'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'`).get().count);
+    return { entities, variants, relationships };
+  }
+  #assertIdentityCapacity(before) {
+    const after = this.#publishedIdentityCounts();
+    for (const key of Object.keys(IDENTITY_REGISTRY_CAPACITY)) {
+      const maximum = Math.max(IDENTITY_REGISTRY_CAPACITY[key], before[key]);
+      if (after[key] > maximum) {
+        throw new RangeError(`identity registry ${key} capacity ${IDENTITY_REGISTRY_CAPACITY[key]} would be exceeded`);
+      }
+    }
+    return after;
+  }
+  identityRegistrySnapshot({ prioritizeMint = null, prioritizeMints = [] } = {}) {
+    this.#refreshCacheCoherence();
+    if (prioritizeMint !== null && !isCanonicalSolanaAddress(prioritizeMint)) throw new TypeError("identity registry prioritized mint is invalid");
+    if (!Array.isArray(prioritizeMints) || prioritizeMints.length > 500
+      || prioritizeMints.some((mint) => !isCanonicalSolanaAddress(mint))) {
+      throw new TypeError("identity registry prioritized mints are invalid");
+    }
+    const requestedPriorityMints = [...new Set([...(prioritizeMint === null ? [] : [prioritizeMint]), ...prioritizeMints])];
+    if (prioritizeMint !== null) {
+      const cachedResolverSnapshot = this.identityResolverSnapshotCache.get(prioritizeMint);
+      if (cachedResolverSnapshot && cachedResolverSnapshot.expiresAt > Date.now()) return cachedResolverSnapshot.value;
+      if (cachedResolverSnapshot) this.identityResolverSnapshotCache.delete(prioritizeMint);
+    }
+    const snapshotCacheKey = prioritizeMint === null ? JSON.stringify(requestedPriorityMints) : null;
+    if (snapshotCacheKey !== null && this.identityRegistrySnapshotCache.has(snapshotCacheKey)) {
+      return this.identityRegistrySnapshotCache.get(snapshotCacheKey);
+    }
+    const eligibleCounts = this.#publishedIdentityCounts();
+    const legacyInvalidEntityCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_entities e
+      WHERE e.review_state='verified' AND (SELECT d.decision FROM identity_decisions d
+        WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (EXISTS (SELECT 1 FROM identity_variants v WHERE v.entity_id=e.entity_id
+          AND v.review_state<>'rejected' AND is_canonical_solana_address(v.mint)=0)
+          OR (e.primary_mint IS NOT NULL AND is_canonical_solana_address(e.primary_mint)=0))`).get().count);
+    const legacyInvalidVariantCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_variants v
+      JOIN identity_entities e ON e.entity_id=v.entity_id
+      WHERE v.review_state<>'rejected' AND e.review_state='verified'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (EXISTS (SELECT 1 FROM identity_variants invalidv WHERE invalidv.entity_id=e.entity_id
+          AND invalidv.review_state<>'rejected' AND is_canonical_solana_address(invalidv.mint)=0)
+          OR (e.primary_mint IS NOT NULL AND is_canonical_solana_address(e.primary_mint)=0))`).get().count);
+    const entityRows = this.db.prepare(`WITH eligible AS (
+        SELECT e.entity_id,e.display_name,e.symbol,e.review_state,e.primary_mint,e.created_at,e.updated_at,
+          (SELECT count(*) FROM identity_variants v WHERE v.entity_id=e.entity_id AND v.review_state<>'rejected') AS variant_count
+        FROM identity_entities e WHERE e.review_state='verified' AND EXISTS (
+          SELECT 1 FROM identity_variants v WHERE v.entity_id=e.entity_id AND v.review_state='verified'
+        ) AND NOT EXISTS (SELECT 1 FROM identity_variants invalidv
+          WHERE invalidv.entity_id=e.entity_id AND invalidv.review_state<>'rejected'
+            AND is_canonical_solana_address(invalidv.mint)=0)
+        AND (e.primary_mint IS NULL OR is_canonical_solana_address(e.primary_mint)=1)
+        AND (SELECT d.decision FROM identity_decisions d
+          WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+      ), bounded AS (
+        SELECT *,sum(variant_count) OVER (ORDER BY entity_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_variants
+        FROM eligible WHERE variant_count BETWEEN 1 AND 100
+      ) SELECT entity_id,display_name,symbol,review_state,primary_mint,created_at,updated_at,variant_count
+        FROM bounded WHERE cumulative_variants<=? ORDER BY entity_id LIMIT ?`)
+      .all(IDENTITY_REGISTRY_CAPACITY.variants, IDENTITY_REGISTRY_CAPACITY.entities);
+    let exactOmission = null;
+    const reviewedMintOmissions = [];
+    const priorityEntityIds = new Set();
+    const exactRowsByMint = new Map();
+    const exactEntity = this.db.prepare(`SELECT e.entity_id,e.display_name,e.symbol,e.review_state,e.primary_mint,e.created_at,e.updated_at,
+          v.kind AS exact_kind,v.review_state AS exact_review_state,v.evidence_class AS exact_evidence_class,
+          v.observed_at AS exact_observed_at,
+          (SELECT count(*) FROM identity_variants invalidv WHERE invalidv.entity_id=e.entity_id
+            AND invalidv.review_state<>'rejected' AND is_canonical_solana_address(invalidv.mint)=0) AS invalid_variant_count,
+          CASE WHEN e.primary_mint IS NOT NULL AND is_canonical_solana_address(e.primary_mint)=0 THEN 1 ELSE 0 END AS invalid_primary,
+          (SELECT count(*) FROM identity_variants allv WHERE allv.entity_id=e.entity_id AND allv.review_state<>'rejected') AS variant_count
+        FROM identity_variants v JOIN identity_entities e ON e.entity_id=v.entity_id
+        WHERE v.mint=? AND v.review_state='verified' AND e.review_state='verified' AND (
+          SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+        )='accept'`);
+    for (const requestedMint of requestedPriorityMints) {
+      const exact = exactEntity.get(requestedMint);
+      if (!exact) continue;
+      exactRowsByMint.set(requestedMint, exact);
+      if (entityRows.some(({ entity_id }) => entity_id === exact.entity_id)) {
+        priorityEntityIds.add(exact.entity_id);
+        continue;
+      }
+      if (exact) {
+        if (exact.invalid_variant_count > 0 || exact.invalid_primary > 0) {
+          const omission = {
+            mint: requestedMint,
+            entityId: exact.entity_id,
+            displayName: exact.display_name,
+            symbol: exact.symbol,
+            variant: {
+              mint: requestedMint,
+              kind: exact.exact_kind,
+              reviewState: exact.exact_review_state,
+              evidenceClass: exact.exact_evidence_class,
+              observedAt: exact.exact_observed_at
+            },
+            isPrimary: exact.primary_mint === requestedMint,
+            hasReviewedPrimary: exact.primary_mint !== null && exact.invalid_primary === 0,
+            reason: exact.invalid_variant_count > 0 ? "legacy-invalid-variant" : "legacy-invalid-primary",
+            registeredVariantCount: Number(exact.variant_count)
+          };
+          reviewedMintOmissions.push(omission);
+          if (prioritizeMint === requestedMint) exactOmission = omission;
+        } else if (exact.variant_count < 1 || exact.variant_count > 100) {
+          const omission = {
+            mint: requestedMint,
+            entityId: exact.entity_id,
+            displayName: exact.display_name,
+            symbol: exact.symbol,
+            variant: {
+              mint: requestedMint,
+              kind: exact.exact_kind,
+              reviewState: exact.exact_review_state,
+              evidenceClass: exact.exact_evidence_class,
+              observedAt: exact.exact_observed_at
+            },
+            isPrimary: exact.primary_mint === requestedMint,
+            hasReviewedPrimary: exact.primary_mint !== null,
+            reason: "legacy-entity-variant-cap-exceeded",
+            registeredVariantCount: Number(exact.variant_count)
+          };
+          reviewedMintOmissions.push(omission);
+          if (prioritizeMint === requestedMint) exactOmission = omission;
+        } else {
+          while (entityRows.length >= IDENTITY_REGISTRY_CAPACITY.entities
+            || entityRows.reduce((sum, row) => sum + Number(row.variant_count), 0) + Number(exact.variant_count) > IDENTITY_REGISTRY_CAPACITY.variants) {
+            const removableIndex = entityRows.findLastIndex(({ entity_id }) => !priorityEntityIds.has(entity_id));
+            if (removableIndex < 0) break;
+            entityRows.splice(removableIndex, 1);
+          }
+          if (entityRows.length >= IDENTITY_REGISTRY_CAPACITY.entities
+            || entityRows.reduce((sum, row) => sum + Number(row.variant_count), 0) + Number(exact.variant_count) > IDENTITY_REGISTRY_CAPACITY.variants) {
+            const omission = {
+              mint: requestedMint,
+              entityId: exact.entity_id,
+              displayName: exact.display_name,
+              symbol: exact.symbol,
+              variant: {
+                mint: requestedMint,
+                kind: exact.exact_kind,
+                reviewState: exact.exact_review_state,
+                evidenceClass: exact.exact_evidence_class,
+                observedAt: exact.exact_observed_at
+              },
+              isPrimary: exact.primary_mint === requestedMint,
+              hasReviewedPrimary: exact.primary_mint !== null,
+              reason: "projection-capacity-exhausted",
+              registeredVariantCount: Number(exact.variant_count)
+            };
+            reviewedMintOmissions.push(omission);
+            if (prioritizeMint === requestedMint) exactOmission = omission;
+            continue;
+          }
+          entityRows.push(exact);
+          priorityEntityIds.add(exact.entity_id);
+        }
+      }
+    }
+    entityRows.sort((left, right) => left.entity_id < right.entity_id ? -1 : left.entity_id > right.entity_id ? 1 : 0);
+    const entityIds = entityRows.map(({ entity_id }) => entity_id);
+    const rawVariantRows = entityIds.length ? this.db.prepare(`SELECT v.mint,v.entity_id,v.kind,v.review_state,v.evidence_class,v.observed_at,v.created_at,v.updated_at
+      FROM identity_variants v WHERE v.review_state<>'rejected' AND v.entity_id IN (${entityIds.map(() => "?").join(",")})
+      ORDER BY v.entity_id,v.mint`).all(...entityIds) : [];
+    const invalidEntityIds = new Set(rawVariantRows.flatMap((row) => isCanonicalSolanaAddress(row.mint) ? [] : [row.entity_id]));
+    const invalidEntityMints = new Set(rawVariantRows
+      .filter(({ entity_id }) => invalidEntityIds.has(entity_id)).map(({ mint }) => mint));
+    const publishedEntityRows = entityRows.filter(({ entity_id }) => !invalidEntityIds.has(entity_id));
+    const variantRows = rawVariantRows.filter(({ entity_id }) => !invalidEntityIds.has(entity_id));
+    for (const [requestedMint, exact] of exactRowsByMint) {
+      if (!invalidEntityIds.has(exact.entity_id)
+        || reviewedMintOmissions.some(({ mint }) => mint === requestedMint)) continue;
+      const omission = {
+        mint: requestedMint,
+        entityId: exact.entity_id,
+        displayName: exact.display_name,
+        symbol: exact.symbol,
+        variant: {
+          mint: requestedMint,
+          kind: exact.exact_kind,
+          reviewState: exact.exact_review_state,
+          evidenceClass: exact.exact_evidence_class,
+          observedAt: exact.exact_observed_at
+        },
+        isPrimary: exact.primary_mint === requestedMint,
+        hasReviewedPrimary: exact.primary_mint !== null,
+        reason: "legacy-invalid-variant",
+        registeredVariantCount: Number(exact.variant_count)
+      };
+      reviewedMintOmissions.push(omission);
+      if (prioritizeMint === requestedMint) exactOmission = omission;
+    }
     const variantsByEntity = new Map();
     for (const row of variantRows) {
       const variants = variantsByEntity.get(row.entity_id) || [];
@@ -1516,7 +1786,7 @@ export class Store {
       });
       variantsByEntity.set(row.entity_id, variants);
     }
-    const entities = entityRows.flatMap((row) => {
+    const entities = publishedEntityRows.flatMap((row) => {
       const variants = variantsByEntity.get(row.entity_id) || [];
       return variants.length ? [{
         entityId: row.entity_id,
@@ -1528,9 +1798,131 @@ export class Store {
       }] : [];
     });
     const registeredMints = new Set(variantRows.map(({ mint }) => mint));
-    const relationships = this.db.prepare(`SELECT relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at
-      FROM identity_relationships WHERE review_state<>'rejected' ORDER BY relationship_id`).all().flatMap((row) => (
-        registeredMints.has(row.from_mint) && registeredMints.has(row.to_mint) ? [{
+    const registeredMintList = [...registeredMints];
+    const registeredMintPlaceholders = registeredMintList.map(() => "?").join(",");
+    const globalRelationshipRows = prioritizeMint !== null || registeredMintList.length === 0 ? [] : this.db.prepare(`WITH eligible AS (
+      SELECT r.relationship_id,r.from_mint,r.to_mint,r.kind,r.review_state,r.evidence_class,r.observed_at,
+        row_number() OVER (PARTITION BY r.kind,
+          CASE WHEN r.from_mint<r.to_mint THEN r.from_mint ELSE r.to_mint END,
+          CASE WHEN r.from_mint<r.to_mint THEN r.to_mint ELSE r.from_mint END
+          ORDER BY r.relationship_id) AS semantic_rank
+      FROM identity_relationships r
+      CROSS JOIN identity_variants vf ON vf.mint=r.from_mint CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+      CROSS JOIN identity_variants vt ON vt.mint=r.to_mint CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+      WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+        AND ef.review_state='verified' AND et.review_state='verified' AND (
+        SELECT d.decision FROM identity_decisions d
+        WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+      )='accept' AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND r.from_mint IN (${registeredMintPlaceholders})
+        AND r.to_mint IN (${registeredMintPlaceholders})
+      ) SELECT relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at
+        FROM eligible WHERE semantic_rank=1 ORDER BY relationship_id LIMIT ?`)
+      .all(...registeredMintList, ...registeredMintList, IDENTITY_REGISTRY_CAPACITY.relationships + 1);
+    const relationshipRows = prioritizeMint === null ? globalRelationshipRows : registeredMintList.length === 0 ? [] : this.db.prepare(`WITH eligible AS (
+        SELECT r.relationship_id,r.from_mint,r.to_mint,r.kind,r.review_state,r.evidence_class,r.observed_at,
+          row_number() OVER (PARTITION BY r.kind,
+            CASE WHEN r.from_mint<r.to_mint THEN r.from_mint ELSE r.to_mint END,
+            CASE WHEN r.from_mint<r.to_mint THEN r.to_mint ELSE r.from_mint END
+            ORDER BY r.relationship_id) AS semantic_rank
+        FROM identity_relationships r
+        CROSS JOIN identity_variants vf ON vf.mint=r.from_mint CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+        CROSS JOIN identity_variants vt ON vt.mint=r.to_mint CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+        WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+          AND ef.review_state='verified' AND et.review_state='verified'
+          AND (r.from_mint=? OR r.to_mint=?)
+          AND r.from_mint IN (${registeredMintPlaceholders})
+          AND r.to_mint IN (${registeredMintPlaceholders})
+          AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+            ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+          AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+            ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+          AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+            ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+      ) SELECT relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at
+        FROM eligible WHERE semantic_rank=1 ORDER BY relationship_id LIMIT ?`)
+      .all(prioritizeMint, prioritizeMint, ...registeredMintList, ...registeredMintList,
+        IDENTITY_RESOLVER_RELATIONSHIP_LIMIT + 1);
+    const seenRelationshipFacts = new Set();
+    const duplicateRelationshipCount = prioritizeMint === null ? Number(this.db.prepare(`WITH eligible AS (
+      SELECT row_number() OVER (PARTITION BY r.kind,
+        CASE WHEN r.from_mint<r.to_mint THEN r.from_mint ELSE r.to_mint END,
+        CASE WHEN r.from_mint<r.to_mint THEN r.to_mint ELSE r.from_mint END
+        ORDER BY r.relationship_id) AS semantic_rank
+      FROM identity_relationships r
+      CROSS JOIN identity_variants vf ON vf.mint=r.from_mint CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+      CROSS JOIN identity_variants vt ON vt.mint=r.to_mint CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+      WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+        AND ef.review_state='verified' AND et.review_state='verified'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+      ) SELECT count(*) AS count FROM eligible WHERE semantic_rank>1`).get().count) : 0;
+    const publishedSemanticRelationshipCount = prioritizeMint === null && registeredMintList.length > 0
+      ? Number(this.db.prepare(`SELECT count(*) AS count FROM (
+          SELECT r.kind,
+            CASE WHEN r.from_mint<r.to_mint THEN r.from_mint ELSE r.to_mint END AS first_mint,
+            CASE WHEN r.from_mint<r.to_mint THEN r.to_mint ELSE r.from_mint END AS second_mint
+          FROM identity_relationships r
+          CROSS JOIN identity_variants vf ON vf.mint=r.from_mint CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+          CROSS JOIN identity_variants vt ON vt.mint=r.to_mint CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+          WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+            AND ef.review_state='verified' AND et.review_state='verified'
+            AND r.from_mint IN (${registeredMintPlaceholders})
+            AND r.to_mint IN (${registeredMintPlaceholders})
+            AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+              ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+            AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+              ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+            AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+              ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+          GROUP BY r.kind,first_mint,second_mint)`)
+        .get(...registeredMintList, ...registeredMintList).count) : 0;
+    const invalidEndpointRelationshipCount = prioritizeMint === null ? Number(this.db.prepare(`SELECT count(*) AS count FROM (
+        SELECT r.kind,
+          CASE WHEN r.from_mint<r.to_mint THEN r.from_mint ELSE r.to_mint END AS first_mint,
+          CASE WHEN r.from_mint<r.to_mint THEN r.to_mint ELSE r.from_mint END AS second_mint
+        FROM identity_relationships r
+        CROSS JOIN identity_variants vf ON vf.mint=r.from_mint CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+        CROSS JOIN identity_variants vt ON vt.mint=r.to_mint CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+        WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+          AND ef.review_state='verified' AND et.review_state='verified'
+          AND (EXISTS (SELECT 1 FROM identity_variants invalidv WHERE invalidv.entity_id=ef.entity_id
+              AND invalidv.review_state<>'rejected' AND is_canonical_solana_address(invalidv.mint)=0)
+            OR (ef.primary_mint IS NOT NULL AND is_canonical_solana_address(ef.primary_mint)=0)
+            OR EXISTS (SELECT 1 FROM identity_variants invalidv WHERE invalidv.entity_id=et.entity_id
+              AND invalidv.review_state<>'rejected' AND is_canonical_solana_address(invalidv.mint)=0)
+            OR (et.primary_mint IS NOT NULL AND is_canonical_solana_address(et.primary_mint)=0))
+          AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+            ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+          AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+            ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+          AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+            ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        GROUP BY r.kind,first_mint,second_mint)`).get().count) : 0;
+    const semanticRelationshipCount = prioritizeMint === null
+      ? Math.max(0, eligibleCounts.relationships - duplicateRelationshipCount) : 0;
+    const projectedEndpointRelationshipCount = prioritizeMint === null
+      ? Math.max(0, semanticRelationshipCount - publishedSemanticRelationshipCount - invalidEndpointRelationshipCount) : 0;
+    let relationships = relationshipRows.slice(0, IDENTITY_REGISTRY_CAPACITY.relationships).flatMap((row) => {
+      if (!registeredMints.has(row.from_mint) || !registeredMints.has(row.to_mint)) {
+        return [];
+      }
+      const [first, second] = row.from_mint < row.to_mint
+        ? [row.from_mint, row.to_mint] : [row.to_mint, row.from_mint];
+      const semanticKey = `${row.kind}\u0000${first}\u0000${second}`;
+      if (seenRelationshipFacts.has(semanticKey)) {
+        return [];
+      }
+      seenRelationshipFacts.add(semanticKey);
+      return [{
           relationshipId: row.relationship_id,
           fromMint: row.from_mint,
           toMint: row.to_mint,
@@ -1538,10 +1930,113 @@ export class Store {
           reviewState: row.review_state,
           evidenceClass: row.evidence_class,
           observedAt: row.observed_at
-        }] : []
-      ));
+        }];
+    });
+    const integrityOmittedRelationshipCount = invalidEndpointRelationshipCount + duplicateRelationshipCount;
+    if (prioritizeMint !== null) {
+      relationships = relationships.filter(({ fromMint, toMint }) => fromMint === prioritizeMint || toMint === prioritizeMint)
+        .slice(0, IDENTITY_RESOLVER_RELATIONSHIP_LIMIT);
+    }
+    const exactRelationshipMetrics = prioritizeMint === null ? null : this.db.prepare(`WITH semantic AS (
+      SELECT r.kind,
+        CASE WHEN r.from_mint<r.to_mint THEN r.from_mint ELSE r.to_mint END AS first_mint,
+        CASE WHEN r.from_mint<r.to_mint THEN r.to_mint ELSE r.from_mint END AS second_mint,
+        ${registeredMintList.length > 0 ? `CASE WHEN r.from_mint IN (${registeredMintPlaceholders})
+          AND r.to_mint IN (${registeredMintPlaceholders}) THEN 1 ELSE 0 END` : "0"} AS publishable,
+        CASE WHEN EXISTS (SELECT 1 FROM identity_variants invalidv WHERE invalidv.entity_id=ef.entity_id
+              AND invalidv.review_state<>'rejected' AND is_canonical_solana_address(invalidv.mint)=0)
+            OR (ef.primary_mint IS NOT NULL AND is_canonical_solana_address(ef.primary_mint)=0)
+            OR EXISTS (SELECT 1 FROM identity_variants invalidv WHERE invalidv.entity_id=et.entity_id
+              AND invalidv.review_state<>'rejected' AND is_canonical_solana_address(invalidv.mint)=0)
+            OR (et.primary_mint IS NOT NULL AND is_canonical_solana_address(et.primary_mint)=0)
+          THEN 1 ELSE 0 END AS integrity_omitted
+      FROM identity_relationships r
+      CROSS JOIN identity_variants vf ON vf.mint=r.from_mint CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+      CROSS JOIN identity_variants vt ON vt.mint=r.to_mint CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+      WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+        AND ef.review_state='verified' AND et.review_state='verified' AND (r.from_mint=? OR r.to_mint=?)
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+      GROUP BY r.kind,first_mint,second_mint
+    ) SELECT count(*) AS eligible_count,coalesce(sum(publishable),0) AS publishable_count,
+        coalesce(sum(integrity_omitted),0) AS integrity_omitted_count FROM semantic`)
+      .get(...(registeredMintList.length > 0 ? [...registeredMintList, ...registeredMintList] : []), prioritizeMint, prioritizeMint);
+    const exactRelationshipEligibleCount = prioritizeMint === null ? null : Number(exactRelationshipMetrics.eligible_count);
+    const exactRelationshipPublishableEligibleCount = prioritizeMint === null ? null : Number(exactRelationshipMetrics.publishable_count);
+    const exactRelationshipIntegrityOmittedCount = prioritizeMint === null ? null : Number(exactRelationshipMetrics.integrity_omitted_count);
+    const exactRelationshipPublishedCount = prioritizeMint === null ? null
+      : relationships.filter(({ fromMint, toMint }) => fromMint === prioritizeMint || toMint === prioritizeMint).length;
+    const exactRelationshipProjectionOmittedCount = prioritizeMint === null ? null : Math.max(0,
+      exactRelationshipEligibleCount - exactRelationshipPublishableEligibleCount - exactRelationshipIntegrityOmittedCount);
+    const exactRelationshipLimitOmittedCount = prioritizeMint === null ? null
+      : Math.max(0, exactRelationshipPublishableEligibleCount - exactRelationshipPublishedCount);
+    const publishedCounts = { entities: entities.length, variants: variantRows.length, relationships: relationships.length };
+    const omittedCounts = Object.fromEntries(Object.keys(eligibleCounts)
+      .map((key) => [key, Math.max(0, eligibleCounts[key] - publishedCounts[key])]));
+    const projection = {
+      schemaVersion: 1,
+      policy: "bounded-whole-reviewed-entities-v1",
+      capacity: { ...IDENTITY_REGISTRY_CAPACITY },
+      eligibleCounts,
+      publishedCounts,
+      omittedCounts,
+      integrityOmittedCounts: {
+        entities: legacyInvalidEntityCount,
+        variants: legacyInvalidVariantCount,
+        relationships: integrityOmittedRelationshipCount
+      },
+      integrityOmissionReasons: { duplicateRelationships: duplicateRelationshipCount },
+      projectedEndpointRelationshipCount,
+      truncated: Object.values(omittedCounts).some((count) => count > 0),
+      prioritizedMintCount: requestedPriorityMints.length,
+      reviewedMintOmissionCount: reviewedMintOmissions.length,
+      ...(prioritizeMint === null ? {} : {
+        prioritizedMint: prioritizeMint,
+        exactRelationshipEligibleCount,
+        exactRelationshipPublishableEligibleCount,
+        exactRelationshipPublishedCount,
+        exactRelationshipLimitOmittedCount,
+        exactRelationshipProjectionOmittedCount,
+        exactRelationshipIntegrityOmittedCount,
+        exactRelationshipTruncated: exactRelationshipLimitOmittedCount > 0
+      })
+    };
     new CanonicalRegistry({ entities, relationships });
-    return { schemaVersion: 1, entities, relationships };
+    const result = {
+      schemaVersion: 1,
+      entities,
+      relationships,
+      projection,
+      reviewedMintOmissions,
+      ...(exactOmission ? { exactOmission } : {})
+    };
+    if (snapshotCacheKey !== null) {
+      this.identityRegistrySnapshotCache.set(snapshotCacheKey, result);
+      while (this.identityRegistrySnapshotCache.size > 4) {
+        const evictionKey = [...this.identityRegistrySnapshotCache.keys()].find((key) => key !== "[]");
+        if (evictionKey === undefined) break;
+        this.identityRegistrySnapshotCache.delete(evictionKey);
+      }
+    }
+    if (prioritizeMint !== null) {
+      this.identityResolverSnapshotCache.set(prioritizeMint, { value: result, expiresAt: Date.now() + 15_000 });
+      while (this.identityResolverSnapshotCache.size > 8) {
+        this.identityResolverSnapshotCache.delete(this.identityResolverSnapshotCache.keys().next().value);
+      }
+    }
+    return result;
+  }
+  hasReviewedIdentityMint(mint) {
+    if (!isCanonicalSolanaAddress(mint)) throw new TypeError("identity mint is invalid");
+    return Boolean(this.db.prepare(`SELECT 1 AS found FROM identity_variants v
+      JOIN identity_entities e ON e.entity_id=v.entity_id
+      WHERE v.mint=? AND v.review_state='verified' AND e.review_state='verified'
+        AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept' LIMIT 1`).get(mint));
   }
   saveIdentityEntity({ entity, decision } = {}) {
     const normalized = validateCanonicalEntity(entity);
@@ -1551,10 +2046,14 @@ export class Store {
       defaultEvidence: { scope: "entity-and-variants", variantCount: normalized.variants.length }
     });
     if (!["accept", "reject", "split", "supersede"].includes(reviewed.decision)) throw new TypeError("identity entity decision is invalid");
+    requireEntityDecisionState(normalized, reviewed);
     let transactionStarted = false;
     try {
-      this.db.exec("BEGIN IMMEDIATE");
-      transactionStarted = true;
+      if (!this.db.isTransaction) {
+        this.db.exec("BEGIN IMMEDIATE");
+        transactionStarted = true;
+      }
+      const capacityBefore = this.#publishedIdentityCounts();
       const now = reviewed.decidedAt;
       const existing = this.db.prepare("SELECT created_at FROM identity_entities WHERE entity_id=?").get(normalized.entityId);
       this.db.prepare(`INSERT INTO identity_entities
@@ -1564,7 +2063,12 @@ export class Store {
         .run(normalized.entityId, normalized.displayName, normalized.symbol, normalized.reviewState,
           normalized.primaryMint, existing?.created_at ?? now, now);
       for (const variant of normalized.variants) {
-        const existingVariant = this.db.prepare("SELECT created_at FROM identity_variants WHERE mint=?").get(variant.mint);
+        const existingVariant = this.db.prepare(`SELECT v.created_at,v.entity_id,v.review_state,e.review_state AS entity_review_state
+          FROM identity_variants v JOIN identity_entities e ON e.entity_id=v.entity_id WHERE v.mint=?`).get(variant.mint);
+        if (existingVariant && existingVariant.entity_id !== normalized.entityId
+          && existingVariant.review_state !== "rejected" && existingVariant.entity_review_state !== "rejected") {
+          throw new TypeError(`identity variant ${variant.mint} must be explicitly released before reassignment`);
+        }
         this.db.prepare(`INSERT INTO identity_variants
           (mint,entity_id,kind,review_state,evidence_class,observed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)
           ON CONFLICT(mint) DO UPDATE SET entity_id=excluded.entity_id,kind=excluded.kind,review_state=excluded.review_state,
@@ -1577,28 +2081,56 @@ export class Store {
         if (!keep.has(mint)) this.db.prepare("UPDATE identity_variants SET review_state='rejected',updated_at=? WHERE mint=?").run(now, mint);
       }
       this.#insertIdentityDecision(reviewed);
-      this.db.exec("COMMIT");
-      transactionStarted = false;
-      return this.identityRegistrySnapshot().entities.find(({ entityId }) => entityId === normalized.entityId) ?? null;
+      this.#assertIdentityCapacity(capacityBefore);
+      const saved = reviewed.decision === "accept" && normalized.reviewState === "verified"
+        ? normalized : null;
+      if (transactionStarted) {
+        this.db.exec("COMMIT");
+        transactionStarted = false;
+      }
+      this.#invalidateIdentityRegistryCaches();
+      return saved;
     } catch (error) {
       if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
       throw error;
     }
   }
   saveIdentityRelationship({ relationship, decision } = {}) {
-    const snapshot = this.identityRegistrySnapshot();
-    const registeredMints = new Set(snapshot.entities.flatMap(({ variants }) => variants.map(({ mint }) => mint)));
+    const registeredMints = new Set();
+    for (const candidate of [relationship?.fromMint, relationship?.toMint]) {
+      if (!isCanonicalSolanaAddress(candidate)) continue;
+      const found = this.db.prepare(`SELECT 1 AS found FROM identity_variants v JOIN identity_entities e ON e.entity_id=v.entity_id
+        WHERE v.mint=? AND v.review_state='verified' AND e.review_state='verified' AND (
+          SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+        )='accept'`).get(candidate);
+      if (found) registeredMints.add(candidate);
+    }
     const normalized = validateCanonicalRelationship(relationship, registeredMints);
     const reviewed = identityDecision(decision, {
       subjectType: "relationship",
       subjectId: normalized.relationshipId,
       defaultEvidence: { scope: "reviewed-cross-mint-edge" }
     });
+    requireRelationshipDecisionState(normalized, reviewed);
     let transactionStarted = false;
     try {
-      this.db.exec("BEGIN IMMEDIATE");
-      transactionStarted = true;
+      if (!this.db.isTransaction) {
+        this.db.exec("BEGIN IMMEDIATE");
+        transactionStarted = true;
+      }
+      const capacityBefore = this.#publishedIdentityCounts();
       const now = reviewed.decidedAt;
+      if (reviewed.decision === "accept") {
+        const duplicate = this.db.prepare(`SELECT r.relationship_id FROM identity_relationships r
+          WHERE r.relationship_id<>? AND r.kind=? AND r.review_state='verified'
+            AND ((r.from_mint=? AND r.to_mint=?) OR (r.from_mint=? AND r.to_mint=?))
+            AND (SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship'
+              AND d.subject_id=r.relationship_id ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1)='accept'
+          LIMIT 1`).get(normalized.relationshipId, normalized.kind,
+          normalized.fromMint, normalized.toMint, normalized.toMint, normalized.fromMint);
+        if (duplicate) throw new TypeError("identity relationship endpoint and kind fact is already reviewed");
+      }
       const existing = this.db.prepare("SELECT created_at FROM identity_relationships WHERE relationship_id=?").get(normalized.relationshipId);
       this.db.prepare(`INSERT INTO identity_relationships
         (relationship_id,from_mint,to_mint,kind,review_state,evidence_class,observed_at,created_at,updated_at)
@@ -1608,9 +2140,38 @@ export class Store {
         .run(normalized.relationshipId, normalized.fromMint, normalized.toMint, normalized.kind,
           normalized.reviewState, normalized.evidenceClass, normalized.observedAt, existing?.created_at ?? now, now);
       this.#insertIdentityDecision(reviewed);
+      this.#assertIdentityCapacity(capacityBefore);
+      const saved = reviewed.decision === "accept" && normalized.reviewState === "verified"
+        ? normalized : null;
+      if (transactionStarted) {
+        this.db.exec("COMMIT");
+        transactionStarted = false;
+      }
+      this.#invalidateIdentityRegistryCaches();
+      return saved;
+    } catch (error) {
+      if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
+      throw error;
+    }
+  }
+  importIdentityRegistry({ entities, relationships } = {}) {
+    if (!Array.isArray(entities) || !Array.isArray(relationships) || entities.length > 100 || relationships.length > 500) {
+      throw new RangeError("identity registry import exceeds bounded document limits");
+    }
+    if (this.db.isTransaction) throw new Error("identity registry import requires its own transaction");
+    let transactionStarted = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
+      const savedEntities = entities.map((entry) => this.saveIdentityEntity(entry));
+      const savedRelationships = relationships.map((entry) => this.saveIdentityRelationship(entry));
       this.db.exec("COMMIT");
       transactionStarted = false;
-      return this.identityRegistrySnapshot().relationships.find(({ relationshipId }) => relationshipId === normalized.relationshipId) ?? null;
+      return {
+        entities: savedEntities.length,
+        relationships: savedRelationships.length,
+        coverage: this.identityRegistryCoverage()
+      };
     } catch (error) {
       if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
       throw error;
@@ -1646,6 +2207,7 @@ export class Store {
       )`).run(IDENTITY_PENDING_PROPOSAL_LIMIT).changes);
       this.db.exec("COMMIT");
       transactionStarted = false;
+      this.identityRegistryCoverageCache = null;
       return { observedAt: now, supplied: proposals.length, written, pruned, pendingLimit: IDENTITY_PENDING_PROPOSAL_LIMIT };
     } catch (error) {
       if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
@@ -1672,6 +2234,9 @@ export class Store {
       : reviewed.decision === "reject" ? "rejected"
         : reviewed.decision === "supersede" ? "superseded" : null;
     if (!status) throw new TypeError("identity proposal decisions support accept, reject, or supersede");
+    if (status === "accepted" && !isPublishableIdentityProposal(rowIdentityProposal(proposal))) {
+      throw new TypeError("invalid legacy identity proposal can only be rejected or superseded");
+    }
     let transactionStarted = false;
     try {
       this.db.exec("BEGIN IMMEDIATE");
@@ -1681,6 +2246,7 @@ export class Store {
       this.#insertIdentityDecision(reviewed);
       this.db.exec("COMMIT");
       transactionStarted = false;
+      this.identityRegistryCoverageCache = null;
       return rowIdentityProposal(this.db.prepare("SELECT * FROM identity_proposals WHERE proposal_key=?").get(normalizedKey));
     } catch (error) {
       if (transactionStarted) try { this.db.exec("ROLLBACK"); } catch {}
@@ -1697,14 +2263,86 @@ export class Store {
       ORDER BY decided_at DESC,decision_id DESC LIMIT ?`).all(normalizedType, normalizedType, normalizedId, normalizedId, normalizedLimit)
       .map((row) => ({ ...row, evidence: JSON.parse(row.evidence) }));
   }
-  identityRegistryCoverage() {
+  identityRegistryCoverage({ projection: suppliedProjection = null } = {}) {
+    this.#refreshCacheCoherence();
+    if (this.identityRegistryCoverageCache) {
+      return {
+        ...this.identityRegistryCoverageCache,
+        projection: suppliedProjection ?? this.identityRegistrySnapshot().projection
+      };
+    }
     const entityCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_entities WHERE review_state<>'rejected'").get().count);
-    const variantCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_variants WHERE review_state<>'rejected'").get().count);
-    const relationshipCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_relationships WHERE review_state<>'rejected'").get().count);
+    const variantCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_variants v
+      JOIN identity_entities e ON e.entity_id=v.entity_id
+      WHERE v.review_state<>'rejected' AND e.review_state<>'rejected'`).get().count);
+    const relationshipCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_relationships r
+      CROSS JOIN identity_variants vf ON vf.mint=r.from_mint
+      CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+      CROSS JOIN identity_variants vt ON vt.mint=r.to_mint
+      CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+      WHERE r.review_state<>'rejected' AND vf.review_state<>'rejected' AND vt.review_state<>'rejected'
+        AND ef.review_state<>'rejected' AND et.review_state<>'rejected'`).get().count);
+    const verifiedEntityCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_entities e
+      WHERE e.review_state='verified' AND EXISTS (
+        SELECT 1 FROM identity_variants v WHERE v.entity_id=e.entity_id AND v.review_state='verified'
+      ) AND (
+        SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+      )='accept'`).get().count);
+    const verifiedVariantCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_variants v
+      JOIN identity_entities e ON e.entity_id=v.entity_id
+      WHERE v.review_state='verified' AND e.review_state='verified' AND (
+        SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=e.entity_id
+        ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+      )='accept'`).get().count);
+    const verifiedRelationshipCount = Number(this.db.prepare(`SELECT count(*) AS count FROM identity_relationships r
+      CROSS JOIN identity_variants vf ON vf.mint=r.from_mint
+      CROSS JOIN identity_entities ef ON ef.entity_id=vf.entity_id
+      CROSS JOIN identity_variants vt ON vt.mint=r.to_mint
+      CROSS JOIN identity_entities et ON et.entity_id=vt.entity_id
+      WHERE r.review_state='verified' AND vf.review_state='verified' AND vt.review_state='verified'
+        AND ef.review_state='verified' AND et.review_state='verified'
+        AND (
+          SELECT d.decision FROM identity_decisions d WHERE d.subject_type='relationship' AND d.subject_id=r.relationship_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+        )='accept'
+        AND (
+          SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=ef.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+        )='accept'
+        AND (
+          SELECT d.decision FROM identity_decisions d WHERE d.subject_type='entity' AND d.subject_id=et.entity_id
+          ORDER BY d.decided_at DESC,d.decision_id DESC LIMIT 1
+        )='accept'`).get().count);
     const decisionCount = Number(this.db.prepare("SELECT count(*) AS count FROM identity_decisions").get().count);
     const proposalStatusCounts = Object.fromEntries(this.db.prepare("SELECT status,count(*) AS count FROM identity_proposals GROUP BY status ORDER BY status")
       .all().map(({ status, count }) => [status, Number(count)]));
-    return { entityCount, variantCount, relationshipCount, decisionCount, proposalStatusCounts };
+    const projection = suppliedProjection ?? this.identityRegistrySnapshot().projection;
+    const coverage = {
+      entityCount, variantCount, relationshipCount,
+      verifiedEntityCount, verifiedVariantCount, verifiedRelationshipCount,
+      decisionCount, proposalStatusCounts
+    };
+    this.identityRegistryCoverageCache = coverage;
+    return { ...coverage, projection };
+  }
+  #invalidateIdentityRegistryCaches() {
+    this.identityRegistrySnapshotCache.clear();
+    this.identityResolverSnapshotCache.clear();
+    this.identityRegistryCoverageCache = null;
+  }
+  #refreshCacheCoherence() {
+    const dataVersion = Number(this.db.prepare("PRAGMA data_version").get().data_version);
+    if (dataVersion !== this.cacheDataVersion) {
+      this.identityRegistrySnapshotCache.clear();
+      this.identityResolverSnapshotCache.clear();
+      this.identityRegistryCoverageCache = null;
+      this.tokenIntegrityCoverageCache.clear();
+      this.cacheDataVersion = dataVersion;
+    }
+  }
+  databaseChangeVersion() {
+    return Number(this.db.prepare("PRAGMA data_version").get().data_version);
   }
   #insertIdentityDecision(decision) {
     this.db.prepare(`INSERT INTO identity_decisions
@@ -1714,6 +2352,47 @@ export class Store {
   }
   tokens(limit = 100) {
     return parsePayloadRows(this.db.prepare("SELECT payload FROM tokens ORDER BY updated_at DESC LIMIT ?").all(limit));
+  }
+  canonicalTokens(limit = 100) {
+    const normalizedLimit = boundedInteger(limit, "canonical token limit", { min: 1, max: 10_000 });
+    return this.db.prepare(`SELECT mint,payload FROM tokens
+      WHERE ${canonicalTokenRowPredicate()}
+      ORDER BY updated_at DESC LIMIT ?`).all(normalizedLimit)
+      .flatMap((row) => {
+        try {
+          const payload = JSON.parse(row.payload);
+          return payload && typeof payload === "object" && !Array.isArray(payload)
+            && payload.mint === row.mint && isCanonicalSolanaAddress(row.mint) ? [payload] : [];
+        } catch { return []; }
+      });
+  }
+  tokenMintIntegrityCoverage() {
+    this.#refreshCacheCoherence();
+    const cacheKey = "full-retained-table";
+    const cached = this.tokenIntegrityCoverageCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.coverage;
+    }
+    if (cached) this.tokenIntegrityCoverageCache.delete(cacheKey);
+    const aggregate = this.db.prepare(`SELECT count(*) AS retainedCount,
+      coalesce(sum(${canonicalTokenRowPredicate()}),0) AS validCount FROM tokens`).get();
+    const retainedCount = Number(aggregate.retainedCount);
+    const validCount = Number(aggregate.validCount);
+    const coverage = {
+      schemaVersion: 1,
+      policy: "quarantine-invalid-retained-token-identities-v1",
+      calculatedAt: new Date().toISOString(),
+      maxStalenessSeconds: 5,
+      basis: "cached-full-retained-token-sql-aggregate",
+      retainedCount,
+      checkedCount: retainedCount,
+      validCount,
+      quarantinedCount: retainedCount - validCount,
+      unscannedCount: 0,
+      complete: true
+    };
+    this.tokenIntegrityCoverageCache.set(cacheKey, { coverage, expiresAt: Date.now() + 5_000 });
+    return coverage;
   }
   token(mint) {
     const row = this.db.prepare("SELECT payload FROM tokens WHERE mint=?").get(mint);
@@ -1792,14 +2471,17 @@ export class Store {
     const normalizedSource = text(source, "source", { max: 64, code: true });
     const bindings = [normalizedStart, normalizedEnd, normalizedSource];
     const launchesObserved = Number(this.db.prepare(`SELECT count(*) AS count FROM tokens
-      WHERE created_at>=? AND created_at<? AND json_valid(payload) AND json_extract(payload,'$.source')=?`).get(...bindings).count);
+      WHERE created_at>=? AND created_at<? AND ${canonicalTokenRowPredicate()}
+        AND json_extract(payload,'$.source')=?`).get(...bindings).count);
     const migrationObservations = Number(this.db.prepare(`SELECT count(DISTINCT mint) AS count FROM events
       WHERE created_at>=? AND created_at<? AND json_valid(payload) AND json_extract(payload,'$.source')=?
-        AND json_extract(payload,'$.status')='migration-observed'`).get(...bindings).count);
+        AND json_extract(payload,'$.status')='migration-observed' AND mint IN (
+          SELECT mint FROM tokens WHERE ${canonicalTokenRowPredicate()}
+            AND json_extract(payload,'$.source')=?)`).get(...bindings, normalizedSource).count);
     const materialKindPlaceholders = MATERIAL_ALERT_KINDS.map(() => "?").join(",");
     const materialBindings = [normalizedStart, normalizedEnd, ...MATERIAL_ALERT_KINDS, normalizedSource];
     const materialPredicate = `created_at>=? AND created_at<? AND kind IN (${materialKindPlaceholders}) AND mint IN (
-      SELECT mint FROM tokens WHERE json_valid(payload) AND json_extract(payload,'$.source')=?)`;
+      SELECT mint FROM tokens WHERE ${canonicalTokenRowPredicate()} AND json_extract(payload,'$.source')=?)`;
     const materialAlerts = Number(this.db.prepare(`SELECT count(*) AS count FROM alerts
       WHERE ${materialPredicate}`).get(...materialBindings).count);
     const thirdPartyCallouts = Number(this.db.prepare(`SELECT count(*) AS count FROM callouts
@@ -1814,9 +2496,11 @@ export class Store {
       FROM alerts WHERE ${materialPredicate} GROUP BY coalesce(telegram_status,'not-queued') ORDER BY status`)
       .all(...materialBindings).map(({ status, count }) => [status, Number(count)]));
     const outcomeCohortAdmissions = Number(this.db.prepare(`SELECT count(*) AS count FROM outcome_enrichment
-      JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?`).get(normalizedStart, normalizedEnd).count);
+      JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?
+        AND ${canonicalTokenRowPredicate("tokens")}`).get(normalizedStart, normalizedEnd).count);
     const riskCohortAdmissions = Number(this.db.prepare(`SELECT count(*) AS count FROM risk_identity_enrichment
-      JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?`).get(normalizedStart, normalizedEnd).count);
+      JOIN tokens USING(mint) WHERE tokens.created_at>=? AND tokens.created_at<?
+        AND ${canonicalTokenRowPredicate("tokens")}`).get(normalizedStart, normalizedEnd).count);
     return {
       start: normalizedStart,
       end: normalizedEnd,
@@ -2058,6 +2742,7 @@ export class Store {
       };
       this.db.exec("COMMIT");
       transactionStarted = false;
+      this.tokenIntegrityCoverageCache.clear();
       return removed;
     } catch (error) {
       if (transactionStarted) {
@@ -2067,8 +2752,8 @@ export class Store {
     }
   }
   calloutCountSince(iso) { return this.db.prepare("SELECT count(*) AS count FROM callouts WHERE created_at >= ?").get(iso).count; }
-  count() { return this.db.prepare("SELECT count(*) AS count FROM tokens").get().count; }
-  countSince(iso) { return this.db.prepare("SELECT count(*) AS count FROM tokens WHERE created_at >= ?").get(iso).count; }
+  count() { return this.db.prepare(`SELECT count(*) AS count FROM tokens WHERE ${canonicalTokenRowPredicate()}`).get().count; }
+  countSince(iso) { return this.db.prepare(`SELECT count(*) AS count FROM tokens WHERE created_at >= ? AND ${canonicalTokenRowPredicate()}`).get(iso).count; }
   countSinceBySource(iso, source) {
     if (typeof source !== "string" || source.length === 0) throw new TypeError("source must be a non-empty string");
     return this.sourceTokenCountSinceStmt.get(iso, source).count;

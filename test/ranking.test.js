@@ -162,3 +162,24 @@ test("early-actor observations are byte-invariant to ranking inputs and output",
   assert.equal(JSON.stringify(actorDecorated), JSON.stringify(baseline));
   assert.equal(JSON.stringify(actorDecorated).includes("Actor 7"), false);
 });
+
+test("unreviewed identity proposals are byte-invariant to mint ranking", () => {
+  const baselineTokens = [
+    token(mint(1), { momentum: 72, uniqueBuyers: 10 }),
+    token(mint(2), { momentum: 55, uniqueBuyers: 6 })
+  ];
+  const proposal = {
+    proposalKey: "identity-proposal:ranking-boundary",
+    fromMint: mint(1), toMint: mint(2), kind: "name-collision",
+    reviewState: "proposed", evidenceClass: "locally-derived", methodVersion: "metadata-collision-proposals-v1"
+  };
+  const decorated = baselineTokens.map((row) => ({
+    ...row,
+    identityProposals: [proposal],
+    canonicalIdentity: { proposedEntityId: "unreviewed-collision", proposal }
+  }));
+  const baseline = createTop100(baselineTokens, { now, mode: "live" });
+  const proposed = createTop100(decorated, { now, mode: "live" });
+  assert.deepEqual(proposed, baseline);
+  assert.equal(JSON.stringify(proposed).includes("identity-proposal"), false);
+});

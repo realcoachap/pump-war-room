@@ -1,13 +1,13 @@
 import { classifyNarrative, momentumScore } from "./signals.js";
+import { isCanonicalSolanaAddress } from "./early-actors.js";
 
 const NEW_TOKEN_TYPES = new Set(["create", "creation", "new-token", "new_token", "newtoken"]);
 const MIGRATION_TYPES = new Set(["migrate", "migrated", "migration"]);
-const SOLANA_ADDRESS_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const eventType = (value) => typeof value === "string" ? value.trim().toLowerCase() : "";
 const publicKey = (value) => {
   const normalized = typeof value === "string" ? value.trim() : "";
-  return SOLANA_ADDRESS_PATTERN.test(normalized) ? normalized : null;
+  return isCanonicalSolanaAddress(normalized) ? normalized : null;
 };
 const nonNegativeNumber = (value) => {
   if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
