@@ -1,6 +1,6 @@
 # Pump War Room
 
-Current release: **v0.10.3**
+Current release: **v0.10.4**
 
 A read-only Pump.fun intelligence radar for OpenCaesar. It indexes observed launches, orders them by supported evidence or observation recency, measures provider-observed outcomes, exposes risk-factor evidence, reports bounded anonymous early-actor observations, and resolves exact mints through a review-gated canonical identity graph without presenting an uncalibrated probability or trade signal.
 
@@ -95,7 +95,9 @@ Evidence classes are explicit: `on-chain-finalized`, `provider-observed`, `feed-
 
 ### Canonical Identity Graph
 
-v0.10.3 includes the schema 902 reviewed-identity release and its v0.10.1 durability cap. It also retains the v0.10.2 dashboard layout, persistent section navigation, collapsible method disclosures, and dedicated `/help.html` tutorial and FAQ. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
+v0.10.4 includes the schema 902 reviewed-identity release and its v0.10.1 durability cap. It also retains the v0.10.2 dashboard layout, persistent section navigation, collapsible method disclosures, and dedicated `/help.html` tutorial and FAQ. Every valid mint resolves immediately through `GET /api/v1/entities/resolve?mint=...`; an unreviewed mint remains its own singleton. Reviewed entities can name `official`, `migration`, or `relaunch` variants, while reviewed relationships are limited to `same-creator`, `same-narrative`, `probable-copycat`, or `name-collision`. A primary mint can be explicitly reviewed or withheld when ambiguous. It always means identity resolution only—not authenticity, safety, quality, or a recommendation.
+
+v0.10.4 is a release-verification patch. Strict smoke checks measure cached token-integrity calculations and rate-limit reset windows against the time each HTTP response was received, so later endpoint traversal cannot make earlier valid evidence appear stale or expired. Regression tests advance the verifier clock between paginated and post-call responses, and smoke fixtures now derive their expected version from the canonical package metadata instead of a duplicate release literal. This changes no provider, dependency, schema, intelligence, ranking, alert, connector, execution, promotion, wallet, or retention scope.
 
 Entity intelligence is additive and denominator-preserving. Only reviewed variants can group, while every pending or unreviewed proposal remains an exact-mint singleton with no ranking impact. Each entity trend has at most one exact-mint contributor: a grouped entity requires the explicitly reviewed primary when observed or the sole reviewed registered variant when observed; an unreviewed singleton contributes only its own exact mint and remains separate. Ambiguous multi-variant entities with no primary withhold trend metrics; variant volume is never summed and a high-volume clone is never selected merely because it is high volume. Each envelope publishes included and excluded exact mints, missing narrative/lifecycle/volume counts, the representative-selection reason, and explicit proposal/ranking boundaries. The dashboard and analyst use these entity envelopes while legacy mint-level leaderboard, outcome, and snapshot records remain intact.
 
@@ -220,7 +222,7 @@ npm run vault:export -- brief --database ./data/pump-war-room.db --vault ./vault
 ```bash
 npm test
 npm run screenshot
-npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.3 --mode live
+npm run smoke -- --url https://pump-war-room-production.up.railway.app --version 0.10.4 --mode live
 ```
 
 Supply the expected release version explicitly for production smoke checks so a stale deployment cannot validate itself from its own package metadata.

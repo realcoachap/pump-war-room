@@ -6,7 +6,7 @@ import { gzipSync } from "node:zlib";
 import { runSmokeChecks, SmokeCheckError } from "../scripts/smoke.js";
 import { SOLANA_ACTOR_PARSER_REVISION } from "../src/solana-rpc.js";
 
-const version = "0.10.3";
+const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const checkedInOpenApiBody = readFileSync(new URL("../public/openapi.json", import.meta.url), "utf8")
   .replaceAll("__APP_VERSION__", version);
 
@@ -789,6 +789,33 @@ test("measures snapshot integrity freshness when the response is received", asyn
 
   const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live", fetchImpl });
   assert.equal(result.ok, true);
+  assert.equal(healthRequests, 2);
+});
+
+test("measures each rate-limit reset window when its response is received", async (t) => {
+  const actualNow = Date.now.bind(Date);
+  let offsetMs = 0;
+  t.mock.method(Date, "now", () => actualNow() + offsetMs);
+  const baseUrl = await fixture(t);
+  let healthRequests = 0;
+  const fetchImpl = async (url, options) => {
+    const parsedUrl = new URL(url);
+    if (parsedUrl.pathname === "/api/v1/entities" && parsedUrl.searchParams.has("cursor")) {
+      offsetMs = 70_000;
+    }
+    const response = await fetch(url, options);
+    if (parsedUrl.pathname !== "/api/health" || ++healthRequests !== 2) return response;
+    const health = await response.json();
+    health.tokenIntegrity.calculatedAt = new Date(actualNow() + offsetMs).toISOString();
+    const headers = new Headers(response.headers);
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    return new Response(JSON.stringify(health), { status: response.status, headers });
+  };
+
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live", fetchImpl });
+  assert.equal(result.ok, true);
+  assert.equal(offsetMs, 70_000);
   assert.equal(healthRequests, 2);
 });
 

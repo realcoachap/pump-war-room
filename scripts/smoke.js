@@ -414,11 +414,12 @@ function canonicalJsonEqual(left, right) {
 function validateRateHeaders(result, expectedLimit, check) {
   const remaining = Number(result.rateRemaining);
   const reset = Number(result.rateReset);
-  const nowUnix = Math.floor(Date.now() / 1_000);
-  requireValue(result.rateLimit === String(expectedLimit)
+  const receivedAtUnix = Math.floor(result.receivedAtMs / 1_000);
+  requireValue(Number.isFinite(result.receivedAtMs)
+    && result.rateLimit === String(expectedLimit)
     && /^\d+$/.test(result.rateRemaining) && isNonNegativeInteger(remaining) && remaining <= expectedLimit
     && /^\d+$/.test(result.rateReset) && Number.isSafeInteger(reset)
-    && reset >= nowUnix - 5 && reset <= nowUnix + 65,
+    && reset >= receivedAtUnix - 5 && reset <= receivedAtUnix + 65,
   check, `rate-limit headers did not expose the ${expectedLimit}/minute endpoint bucket`);
 }
 
