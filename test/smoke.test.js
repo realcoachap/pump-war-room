@@ -769,6 +769,29 @@ test("verifies health, snapshot, assets, hardening telemetry, and safety markers
   });
 });
 
+test("measures snapshot integrity freshness when the response is received", async (t) => {
+  const baseUrl = await fixture(t);
+  const actualNow = Date.now.bind(Date);
+  let offsetMs = 0;
+  t.mock.method(Date, "now", () => actualNow() + offsetMs);
+  let healthRequests = 0;
+  const fetchImpl = async (url, options) => {
+    const response = await fetch(url, options);
+    if (new URL(url).pathname !== "/api/health" || ++healthRequests !== 2) return response;
+    offsetMs = 20_000;
+    const health = await response.json();
+    health.tokenIntegrity.calculatedAt = new Date(actualNow() + offsetMs).toISOString();
+    const headers = new Headers(response.headers);
+    headers.delete("content-encoding");
+    headers.delete("content-length");
+    return new Response(JSON.stringify(health), { status: response.status, headers });
+  };
+
+  const result = await runSmokeChecks({ baseUrl, expectedVersion: version, expectedMode: "live", fetchImpl });
+  assert.equal(result.ok, true);
+  assert.equal(healthRequests, 2);
+});
+
 test("fails release smoke when automated identity verification or public writes are enabled", async (t) => {
   const baseUrl = await fixture(t, {
     "/api/health": jsonOverride((health) => { health.identityRegistry.automatedVerification = true; }),

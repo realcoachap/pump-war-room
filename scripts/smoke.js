@@ -372,9 +372,11 @@ async function request(baseUrl, pathname, {
     throw new SmokeCheckError(pathname, `request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   const body = await response.text();
+  const receivedAtMs = Date.now();
   requireValue(response.status === expectedStatus, pathname, `expected HTTP ${expectedStatus}, received ${response.status}`);
   return {
     body,
+    receivedAtMs,
     contentType: response.headers.get("content-type") || "",
     contentEncoding: response.headers.get("content-encoding") || "",
     contentLength: response.headers.get("content-length") || "",
@@ -433,12 +435,12 @@ function validateLimiterCounters(limiter, expectedLimit, minimumAllowed, path) {
   "health", `${path} limiter counters were missing or inconsistent`);
 }
 
-function validateTokenIntegrity(integrity, path, check) {
+function validateTokenIntegrity(integrity, path, check, observedAtMs = Date.now()) {
   const calculatedAt = Date.parse(integrity?.calculatedAt);
-  const ageSeconds = (Date.now() - calculatedAt) / 1_000;
+  const ageSeconds = (observedAtMs - calculatedAt) / 1_000;
   requireValue(integrity?.schemaVersion === 1
     && integrity.policy === "quarantine-invalid-retained-token-identities-v1"
-    && Number.isFinite(calculatedAt) && ageSeconds >= -5
+    && Number.isFinite(observedAtMs) && Number.isFinite(calculatedAt) && ageSeconds >= -5
     && integrity.maxStalenessSeconds === 5 && ageSeconds <= integrity.maxStalenessSeconds + 5
     && integrity.basis === "cached-full-retained-token-sql-aggregate"
     && isNonNegativeInteger(integrity.retainedCount)
@@ -1528,8 +1530,8 @@ export async function runSmokeChecks({ baseUrl, expectedVersion, expectedMode, t
   requireValue(Array.isArray(snapshot.tokens)
     && new Set(snapshot.tokens.map(({ mint }) => mint)).size === snapshot.tokens.length,
   "snapshot", "snapshot token inventory contained duplicate exact mints");
-  validateTokenIntegrity(snapshot.tokenIntegrity, "snapshot.tokenIntegrity", "snapshot");
-  validateTokenIntegrity(health.tokenIntegrity, "health.tokenIntegrity", "health");
+  validateTokenIntegrity(snapshot.tokenIntegrity, "snapshot.tokenIntegrity", "snapshot", snapshotResult.receivedAtMs);
+  validateTokenIntegrity(health.tokenIntegrity, "health.tokenIntegrity", "health", healthAfterCallsResult.receivedAtMs);
   validateEntityEnvelope(snapshot.entityIntelligence,
     { path: "snapshot.entityIntelligence", check: "snapshot", complete: true });
   requireValue(snapshot.entityIntelligence.denominators.observedMintCount === snapshot.tokens.length,
